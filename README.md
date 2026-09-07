@@ -140,8 +140,9 @@ flowchart TB
 
 | 用途 | 选型 |
 | --- | --- |
-| 服务端 | Python 3.11+ · FastAPI(接企微回调) |
-| 调度 | APScheduler |
+| 服务端 | Python 3.11+ · FastAPI([ADR-016](docs/04-tech-decisions.md#adr-016--服务端用-python--fastapi)) |
+| 客户端 | 安卓原生 Kotlin,不做 iOS([ADR-015](docs/04-tech-decisions.md#adr-015--app-用原生-kotlin只做安卓)) |
+| 调度 | APScheduler(进程内,不引入消息队列) |
 | 存储 | PostgreSQL + pgvector(单库,不引入独立向量库) |
 | 模型 | 外部 LLM API 直调(OpenAI 兼容接口,换 base_url + model 即切换厂商),**P0 不套 agent 框架** |
 | 入口 | 企业微信(推送 + 审批卡片)· 安卓 App(采集 + 查看,**不接收推送**) |

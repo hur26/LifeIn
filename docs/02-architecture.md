@@ -32,6 +32,22 @@
 必须经过治理层的分权网关。这一条在代码结构上强制(工具注册表 + 统一调用入口),
 不靠约定。
 
+### 1.1 技术栈与语言选型
+
+| 位置 | 选型 | 决策记录 |
+| --- | --- | --- |
+| 服务端语言 | **Python 3.11+** | [ADR-016](04-tech-decisions.md#adr-016--服务端用-python--fastapi) |
+| Web 框架 | **FastAPI** —— 企微回调、采集上报、App 查询 API | ADR-016 |
+| 调度 | **APScheduler**,进程内,不引入消息队列 | ADR-016 |
+| 数据访问 | CRUD 用 SQLAlchemy,分析查询直接写 SQL | ADR-016 |
+| 存储 | **PostgreSQL + pgvector**,单库 | [ADR-006](04-tech-decisions.md#adr-006--存储用单一-postgresql--pgvector) |
+| 模型 | **外部 LLM API**,OpenAI 兼容接口,不绑厂商 | [ADR-002](04-tech-decisions.md#adr-002--p0p2-不引入-agent-编排框架) |
+| 客户端 | **安卓原生 Kotlin**,不做 iOS | [ADR-015](04-tech-decisions.md#adr-015--app-用原生-kotlin只做安卓) |
+| 编排 | 无框架。按领域分工的 agent,同进程 | [ADR-013](04-tech-decisions.md#adr-013--agent-按领域分工同进程运行) |
+
+选型的共同标准:**性能不是本项目的约束**(QPS 个位数,瓶颈在 LLM 侧),
+真正的约束是胶水库的厚度和单人维护的负担。
+
 ---
 
 ## 2. 记忆层(本项目的重心)
