@@ -63,7 +63,7 @@
 | --- | --- |
 | `id` | |
 | `user_id` | **P0 只有一个用户也必须带**,见 §6 |
-| `source` | `email` / `calendar` / `note` / `transaction` |
+| `source` | `email` / `calendar` / `note` / `notification` / `transaction` |
 | `external_id` | 源系统 ID,用于去重,与 source 组成唯一键 |
 | `occurred_at` | 事件真实发生时间(非摄入时间) |
 | `ingested_at` | |
@@ -381,6 +381,7 @@ interface Channel:
     send(user_id, card) -> delivery_id
 ```
 
-企微、邮件、Web 控制台实现同一个接口。**当前只实现企微和邮件** ——
-接口留出来是为了平台政策变动时能换([R6](05-risks.md#r6--平台政策变动)),
-不是为了现在就做多通道。
+企微与邮件实现同一个接口。**安卓 App 不是推送通道** ——
+它不接收推送([ADR-014](04-tech-decisions.md#adr-014--客户端做完整-app-但不接收推送))。
+接口留出来是为了平台政策变动时能换成飞书或其他
+([R6](05-risks.md#r6--平台政策变动)),不是为了现在就做多通道。
