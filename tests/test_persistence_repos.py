@@ -72,7 +72,19 @@ class TestAudit:
         """约束会挡下它,但审计不该把这次失败变成业务失败。"""
         record_tool_call(user_id, pg_session, entry(level=ToolLevel.L2))
         # 没有抛异常就是这条用例的全部主张
-        pg_session.rollback()
+
+    def test_a_failed_audit_leaves_the_transaction_usable(self, pg_session, user_id):
+        """光捕获异常不够 —— 这条是连真库跑一次才会发现的。
+
+        PostgreSQL 里一条语句失败会把整个事务置为 aborted,之后同一事务里的
+        任何语句都报 current transaction is aborted。吞掉异常之后调用方看起来
+        没事,下一句写入却必然失败,比直接抛出去还糟。SAVEPOINT 才是解法。
+        """
+        record_tool_call(user_id, pg_session, entry(level=ToolLevel.L2))  # 必然违反约束
+
+        # 外层事务还能继续用:这才是"不影响调用方"的真正含义
+        record_tool_call(user_id, pg_session, entry())
+        assert pg_session.execute(text("SELECT count(*) FROM tool_calls")).scalar_one() == 1
 
     def test_sink_writes_in_the_caller_transaction(self, pg_session, user_id):
         # 审计要和业务写入同一个事务,否则会出现"业务回滚了,审计说做过"

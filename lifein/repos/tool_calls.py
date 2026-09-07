@@ -5,9 +5,14 @@
 发生过的事",此刻抛异常不会让那件事没发生,只会让一次成功的工具调用看起来
 像失败,进而触发重试 —— 而重试会把副作用做第二遍。
 
-例外是 L2:表上的 `l2_needs_rollback` 约束会挡下没有回滚信息的记录。
-那种情况网关已经先炸过了(gateway.py),真到这里说明有人绕过了网关,
-异常照样吞掉但日志级别是 exception,查得到。
+**但光捕获异常是不够的**,这是连真库跑一次才会发现的事:PostgreSQL 里
+一条语句失败会把**整个事务**置为 aborted,之后同一事务里的任何语句都报
+`current transaction is aborted`。也就是说吞掉异常之后,调用方看起来没事,
+下一句写入却必然失败 —— 比直接抛出去还糟。
+
+所以插入包在 `begin_nested()`(SAVEPOINT)里:失败只回滚到保存点,
+外层事务毫发无损。`l2_needs_rollback` 那条约束是最可能触发它的场景 ——
+网关已经先炸过一次,真走到这里说明有人绕过了网关。
 """
 
 from __future__ import annotations
@@ -37,27 +42,29 @@ _INSERT = text("""
 def record_tool_call(user_id: str, session: Session, entry: ToolCallRecord) -> None:
     """写一条审计。失败只记日志,不往上抛 —— 理由见模块文档。"""
     try:
-        session.execute(
-            _INSERT,
-            {
-                "user_id": user_id,
-                "agent": entry.agent,
-                "tool_name": entry.tool_name,
-                "level": entry.level.value,
-                "args_digest": json.dumps(entry.args_digest, ensure_ascii=False, default=str),
-                "llm_fields_sent": list(entry.llm_fields_sent),
-                "result_status": entry.result_status,
-                "duration_ms": entry.duration_ms,
-                "prompt_tokens": entry.prompt_tokens,
-                "completion_tokens": entry.completion_tokens,
-                "cost_cny": entry.cost_cny,
-                "rollback_info": (
-                    json.dumps(entry.rollback_info, ensure_ascii=False, default=str)
-                    if entry.rollback_info is not None
-                    else None
-                ),
-            },
-        )
+        # SAVEPOINT:失败只回滚到这里,不把外层事务拖成 aborted
+        with session.begin_nested():
+            session.execute(
+                _INSERT,
+                {
+                    "user_id": user_id,
+                    "agent": entry.agent,
+                    "tool_name": entry.tool_name,
+                    "level": entry.level.value,
+                    "args_digest": json.dumps(entry.args_digest, ensure_ascii=False, default=str),
+                    "llm_fields_sent": list(entry.llm_fields_sent),
+                    "result_status": entry.result_status,
+                    "duration_ms": entry.duration_ms,
+                    "prompt_tokens": entry.prompt_tokens,
+                    "completion_tokens": entry.completion_tokens,
+                    "cost_cny": entry.cost_cny,
+                    "rollback_info": (
+                        json.dumps(entry.rollback_info, ensure_ascii=False, default=str)
+                        if entry.rollback_info is not None
+                        else None
+                    ),
+                },
+            )
     except Exception:  # noqa: BLE001
         log.exception(
             "审计写入失败:agent=%s tool=%s status=%s",
