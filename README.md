@@ -11,7 +11,8 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](#技术栈-p0)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?style=flat-square&logo=postgresql&logoColor=white)](docs/04-tech-decisions.md#adr-006--存储用单一-postgresql--pgvector)
 [![LLM](https://img.shields.io/badge/LLM-OpenAI%20兼容接口-6E56CF?style=flat-square)](#技术栈-p0)
-[![WeCom](https://img.shields.io/badge/企业微信-主入口-07C160?style=flat-square&logo=wechat&logoColor=white)](docs/04-tech-decisions.md#adr-001--主入口选企业微信)
+[![WeCom](https://img.shields.io/badge/企业微信-推送与审批-07C160?style=flat-square&logo=wechat&logoColor=white)](docs/04-tech-decisions.md#adr-001--推送与审批入口选企业微信)
+[![Android](https://img.shields.io/badge/Android-采集与查看-3DDC84?style=flat-square&logo=android&logoColor=white)](docs/04-tech-decisions.md#adr-014--客户端做完整-app-但不接收推送)
 
 [产品定义](docs/01-product-spec.md) ·
 [架构设计](docs/02-architecture.md) ·
@@ -40,8 +41,8 @@
 
 ```mermaid
 flowchart TB
-    M["手机端采集器(P1)<br/><sub>短信 · 通知监听 —— 唯一跑在服务器外的组件</sub>"]
-    A["接入层<br/><sub>企业微信 · Web 控制台(P3) · 邮件兜底</sub>"]
+    M["安卓 App(P1)<br/><sub>采集:短信 · 通知监听 ｜ 查看:账本 · 报表 · 待确认<br/><b>不接收推送</b></sub>"]
+    A["接入层<br/><sub>企业微信(推送/审批)· 邮件兜底 · Web 控制台(P4)</sub>"]
     B["触发层<br/><sub>定时调度 · 数据源轮询 · 规则扫描 · 用户消息</sub>"]
     C["编排层<br/><sub>按领域分工的 agent 集,同进程 · P3+ 引入状态机</sub>"]
     D["治理层 —— 强制通道<br/><sub>分权网关 · 审批队列 · 审计日志 · 成本核算</sub>"]
@@ -50,7 +51,8 @@ flowchart TB
     G[("PostgreSQL + pgvector")]
 
     A --> B --> C --> D --> E --> F --> G
-    M -.->|HTTPS webhook| B
+    M -.->|采集上报| B
+    M -.->|查询 API| D
 
     style D stroke:#d97706,stroke-width:3px
     style M stroke:#0891b2,stroke-width:2px,stroke-dasharray:4 3
@@ -117,10 +119,10 @@ flowchart TB
 | | 阶段 | 主题 | 验收标准 | 估计 |
 | :---: | :---: | --- | --- | :---: |
 | 🔨 | **P0** | 邮箱 + 日历 → 每日摘要 | 你自己每天真的会打开它 | 2–3 周 |
-| ⬜ | **P1** | 记忆层 + 主动触发 | 它开始"记得你",且提醒不烦人 | 3–4 周 |
-| ⬜ | **P2** | 财务与账单 | 你不再逐笔记账 | 3–4 周 |
-| ⬜ | **P3** | 审批执行 + Web 控制台 | 你敢让它代发一条真实消息 | 4–6 周 |
-| ⬜ | **P4** | 多用户托管 | **朋友才在这一步进来** | 4–6 周 |
+| ⬜ | **P1** | 记忆层 + 安卓 App + 主动触发 | 它开始"记得你",且提醒不烦人 | 6–8 周 |
+| ⬜ | **P2** | 财务与账单 + App 账本 | 你不再逐笔记账 | 6–8 周 |
+| ⬜ | **P3** | 审批执行 | 你敢让它代发一条真实消息 | 4–5 周 |
+| ⬜ | **P4** | 多用户托管 + Web 控制台 | **朋友才在这一步进来** | 5–7 周 |
 
 > [!IMPORTANT]
 > **朋友接入推迟到 P4 是硬约束,不是排期偷懒。**
@@ -142,7 +144,7 @@ flowchart TB
 | 调度 | APScheduler |
 | 存储 | PostgreSQL + pgvector(单库,不引入独立向量库) |
 | 模型 | 外部 LLM API 直调(OpenAI 兼容接口,换 base_url + model 即切换厂商),**P0 不套 agent 框架** |
-| 入口 | 企业微信自建应用(推送 + 交互卡片) |
+| 入口 | 企业微信(推送 + 审批卡片)· 安卓 App(采集 + 查看,**不接收推送**) |
 | 数据源 | 邮箱 IMAP + 授权码(QQ / 163)· 企业微信日程 API · 交易通知 webhook(P2) |
 
 <details>
