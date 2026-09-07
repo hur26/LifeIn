@@ -159,6 +159,6 @@ def get_settings() -> Settings:
     except Exception as exc:  # noqa: BLE001
         raise ConfigError(f"配置校验未通过:{exc}") from exc
     if s.app_host not in _LOOPBACK:
-        # 不阻止,但要留痕:公网暴露应当走反向代理 + TLS(07 §5)
+        # 不阻止,但要留痕:公网暴露应当走反向代理 + TLS(07 §5 部署步骤)
         log.warning("APP_HOST=%s 不是回环地址,确认前面有反向代理与 TLS", s.app_host)
     return s

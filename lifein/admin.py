@@ -9,7 +9,7 @@
 
     python -m lifein.admin create-user --name 白杨 --wecom-userid BaiYang
     python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username me@163.com
-    python -m lifein.admin test-imap --user <uuid>       # 07 §5 那条"IMAP 实测能登录"
+    python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
 """

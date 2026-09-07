@@ -196,6 +196,41 @@ flowchart TB
 
 ---
 
+## 跑起来
+
+代码全在 `dev` 分支,`main` 只放正式版本。
+
+```bash
+git checkout dev
+pip install -e ".[dev]"
+cp .env.example .env          # 填 DATABASE_URL / MASTER_KEY / LLM_* / WECOM_*
+alembic upgrade head
+
+python -m lifein.admin create-user --name 你的名字 --wecom-userid YourWecomId
+python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username you@163.com
+python -m lifein.admin test-imap --user <uuid>   # 真连一次,别等到早上才发现登不上
+
+python -m lifein --once       # 立刻跑一遍完整链路
+python -m lifein              # 起服务(默认只监听 127.0.0.1)
+```
+
+完整步骤与每一项配置的含义见 [07 配置清单](docs/07-config.md)。
+
+**跑测试**:
+
+```bash
+pytest                        # 不需要数据库
+
+docker run -d --name lifein-pg -e POSTGRES_PASSWORD=lifein     -e POSTGRES_USER=lifein -e POSTGRES_DB=lifein_test     -p 55432:5432 pgvector/pgvector:pg16
+export TEST_DATABASE_URL=postgresql+psycopg://lifein:lifein@127.0.0.1:55432/lifein_test
+pytest                        # 连上真库,含迁移与约束
+```
+
+**只跑不带库的那批不算跑过测试** —— 第一次接上真实 PostgreSQL 就抓出三个
+单元测试发现不了的问题,原因见 [AGENTS.md](AGENTS.md#本地跑测试)。
+
+---
+
 ## 开发约定
 
 - **一个可独立描述的改动 = 一次提交 = 一次推送**,不攒批
