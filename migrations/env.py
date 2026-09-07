@@ -23,7 +23,14 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", MigrationSettings().database_url)  # type: ignore[call-arg]
+# 只在没人设过的时候才从 DATABASE_URL 取。
+# 无条件覆盖会把程序化传入的 url 吃掉 —— 测试夹具要指向另一个库,
+# 而"配置被静默忽略"是那种能耗掉一小时才想明白的问题。
+if not config.get_main_option("sqlalchemy.url", None):
+    config.set_main_option(
+        "sqlalchemy.url",
+        MigrationSettings().database_url,  # type: ignore[call-arg]
+    )
 
 # 不设 target_metadata:本项目的 DDL 由迁移脚本手写,不用 autogenerate。
 # 原因见 lifein/db.py —— 06 里那几条 CHECK 约束是安全机制,
