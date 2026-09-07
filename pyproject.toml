@@ -43,3 +43,6 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 需要真实 PostgreSQL 的用例。没设 TEST_DATABASE_URL 时自动跳过,
+# 所以日常 pytest 不需要装数据库。见 tests/conftest.py
+markers = ["integration: 需要真实 PostgreSQL"]
