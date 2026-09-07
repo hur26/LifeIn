@@ -31,3 +31,7 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
