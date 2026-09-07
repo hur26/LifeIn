@@ -187,7 +187,7 @@ APScheduler 08:00 触发
     ↓
 构造 prompt,直调外部 LLM API 生成摘要
     ↓
-渲染企业微信模板卡片
+渲染企业微信 markdown 消息(模板卡片随审批在 P3,见 03)
     ↓
 推送 → 写 push_log + tool_calls(含 token 成本)
 ```
