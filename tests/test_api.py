@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 from lifein.api.app import create_app
 from lifein.bootstrap import Services
 from lifein.channels.wecom_callback import WecomCallback
+from tests.test_wecom_callback import AES_KEY as CB_AES_KEY
+from tests.test_wecom_callback import CORP_ID as CB_CORP_ID
 from tests.test_wecom_callback import (
     MESSAGE_XML,
     TOKEN,
@@ -22,8 +24,6 @@ from tests.test_wecom_callback import (
     compute_signature,
     encrypt_for,
 )
-from tests.test_wecom_callback import AES_KEY as CB_AES_KEY
-from tests.test_wecom_callback import CORP_ID as CB_CORP_ID
 
 
 class Recorder:
