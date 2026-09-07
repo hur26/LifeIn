@@ -373,6 +373,25 @@ CREATE INDEX ON tool_calls (user_id, created_at DESC);
 ### 2.10 其余表
 
 ```sql
+-- 用户:所有表的 user_id 指向这里
+-- P0 只有一行,但它必须存在 —— 没有它,user_id 就只是个从配置里抄来的字符串,
+-- 而"摘要该推给哪个企微用户"也没有地方记(wecom_userid 就是那个地方)。
+CREATE TABLE users (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    display_name TEXT NOT NULL,
+    wecom_userid TEXT NOT NULL,   -- 推送目标,企微自建应用里的成员 UserID
+    tz           TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    disabled_at  TIMESTAMPTZ,     -- 停用不删除:历史事件仍要能追溯到人
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (wecom_userid)
+);
+```
+
+**为什么不给其他表加 `user_id` 外键**:`raw_events` 是只追加的事件流,量最大
+写入最频繁,每行一次外键检查不划算;而租户隔离本来就要靠数据访问层强制(铁律 1),
+外键给不了那个保证。`users` 表的作用是**让 `user_id` 有出处**,不是替代那道检查。
+
+```sql
 -- 推送日志:频率闸门与影子模式靠它计数
 CREATE TABLE push_log (
     id         BIGSERIAL PRIMARY KEY,
