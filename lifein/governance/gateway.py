@@ -138,9 +138,7 @@ class Gateway:
         try:
             result = spec.func(parsed)
         except Exception:
-            self._record(
-                ctx, spec.name, spec.level, digest, "error", self._elapsed_ms(started)
-            )
+            self._record(ctx, spec.name, spec.level, digest, "error", self._elapsed_ms(started))
             raise
 
         elapsed = self._elapsed_ms(started)
@@ -151,9 +149,7 @@ class Gateway:
                 # 因为没有回滚信息的 L2 调用是不可收拾的状态。
                 self._record(ctx, spec.name, spec.level, digest, "error", elapsed)
                 raise Denied(f"{spec.name} 是 L2,必须返回 ToolOutcome(带 rollback)")
-            self._record(
-                ctx, spec.name, spec.level, digest, "allowed", elapsed, result.rollback
-            )
+            self._record(ctx, spec.name, spec.level, digest, "allowed", elapsed, result.rollback)
             return result.value
 
         self._record(ctx, spec.name, spec.level, digest, "allowed", elapsed)
