@@ -140,7 +140,7 @@ flowchart TB
 | 存储 | PostgreSQL + pgvector(单库,不引入独立向量库) |
 | 模型 | 外部 LLM API 直调(OpenAI 兼容接口,换 base_url + model 即切换厂商),**P0 不套 agent 框架** |
 | 入口 | 企业微信自建应用(推送 + 交互卡片) |
-| 数据源 | 邮箱 IMAP + 授权码(QQ / 163)· 企业微信日程 API |
+| 数据源 | 邮箱 IMAP + 授权码(QQ / 163)· 企业微信日程 API · 交易通知 webhook(P2) |
 
 <details>
 <summary><b>为什么没有 LangGraph / MCP / hook / 多 agent?</b></summary>
