@@ -21,6 +21,7 @@ from lifein.channels.base import Card, Delivery
 from lifein.jobs.daily_digest import JOB_NAME, DigestDeps, run_once
 from lifein.llm.client import LLMClient
 from lifein.models.normalized import EventKind, ExternalRef, NormalizedEvent, Trust
+from lifein.repos import job_runs
 from lifein.sources.base import IngestedEvent
 
 pytestmark = pytest.mark.integration
@@ -200,13 +201,37 @@ def test_push_failure_is_still_logged(pg_session, user_id):
 
 
 def test_running_twice_does_not_push_twice(pg_session, user_id):
-    """窗口是幂等键。补跑几次都是同一个结果。"""
+    """调度器同一天触发两次,第二次什么都不该做。
+
+    注意它走的不是"窗口被占"那条路 —— 上一次已经成功,窗口区间整个在过去,
+    windows_to_run 直接算出没有窗口要跑。压根不进 job。
+    """
     d, handles = deps()
     run_once(user_id, pg_session, deps=d, now=NOW)
-    [second] = run_once(user_id, pg_session, deps=d, now=NOW)
+    second = run_once(user_id, pg_session, deps=d, now=NOW)
 
-    assert second.skipped is True
+    assert second == []
     assert len(handles["channel"].sent) == 1
+
+
+def test_a_crashed_run_is_not_pushed_twice_either(pg_session, user_id):
+    """真正会走 skipped 的是这条路:上次认领了窗口但没跑完(进程被 kill)。
+
+    窗口还在,会被重新算出来;但它已经被认领过,所以不会再推一遍。
+    这是"窗口是幂等键"那句话唯一真实生效的场景。
+    """
+    d, handles = deps()
+    job_runs.claim_window(
+        user_id,
+        pg_session,
+        job_name=JOB_NAME,
+        window_start=NOW - DAY,
+        window_end=NOW,
+    )
+    [result] = run_once(user_id, pg_session, deps=d, now=NOW)
+
+    assert result.skipped is True
+    assert handles["channel"].sent == []
 
 
 def test_llm_fields_sent_is_recorded(pg_session, user_id):
