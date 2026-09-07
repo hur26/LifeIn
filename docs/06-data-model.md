@@ -442,6 +442,25 @@ CREATE TABLE credentials (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 定时任务执行窗口:补偿的依据
+-- ADR-016 说补偿"靠数据库记录上次执行窗口实现,不依赖调度器自身的持久化"。
+-- 这张表就是那个记录。唯一键让同一个窗口不会被跑第二次 ——
+-- 进程半夜重启后按"最后一个成功窗口"往前补,补几次都是同一个结果。
+CREATE TABLE job_runs (
+    id           BIGSERIAL PRIMARY KEY,
+    user_id      UUID NOT NULL,
+    job_name     TEXT NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    window_end   TIMESTAMPTZ NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('running','succeeded','failed')),
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ,
+    error        TEXT,
+    stats        JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (user_id, job_name, window_start)
+);
+CREATE INDEX ON job_runs (user_id, job_name, window_end DESC);
+
 -- 采集器心跳:静默掉线是这条链路最可能的失效方式
 CREATE TABLE collector_heartbeat (
     user_id          UUID NOT NULL,
@@ -453,6 +472,9 @@ CREATE TABLE collector_heartbeat (
     PRIMARY KEY (user_id, device_id)
 );
 ```
+
+`job_runs.status='running'` 的记录**不清理**:进程被 kill 时它会留在那里,
+而"上一次跑了一半"和"从来没跑过"是两种不同的状态,分不清就没法安全补偿。
 
 采集白名单表 `collector_whitelist` 定义在
 [07 §4](07-config.md#4-采集白名单存表用户可改) —— 它是用户可改的配置,
