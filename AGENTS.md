@@ -85,6 +85,26 @@ prompt 的外部内容隔离格式已经定死,见 [06 §5](docs/06-data-model.m
   外部内容包括:邮件正文、群消息、**转账备注**、App 通知文本。
 - **审计日志记入参摘要,不记原文。** 日志本身是数据集中点。
 
+### 本地跑测试
+
+```bash
+pytest                       # 不需要数据库,约 180 个用例
+```
+
+**但只跑这些不算跑过测试。** 涉及 schema、约束、事务的改动必须连真库:
+
+```bash
+docker run -d --name lifein-pg -e POSTGRES_PASSWORD=lifein     -e POSTGRES_USER=lifein -e POSTGRES_DB=lifein_test     -p 55432:5432 pgvector/pgvector:pg16
+
+export TEST_DATABASE_URL=postgresql+psycopg://lifein:lifein@127.0.0.1:55432/lifein_test
+pytest -m integration        # 夹具每次从 base 重建到 head,顺带测迁移本身
+```
+
+**为什么不能省**:第一次接上真库就抓出三个单元测试永远发现不了的问题 ——
+`array_length` 对空数组返回 NULL 导致 CHECK 形同虚设、审计写失败把整个事务
+拖成 aborted、`alembic.ini` 里的中文让 configparser 在中文 Windows 上直接炸。
+**这三个的共同点是:代码看起来完全正确。**
+
 ---
 
 ## 4. 文档没写的怎么办
