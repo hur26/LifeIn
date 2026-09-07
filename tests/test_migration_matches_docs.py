@@ -14,18 +14,27 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-MIGRATION = REPO / "migrations" / "versions" / "0001_initial_schema.py"
+VERSIONS = REPO / "migrations" / "versions"
 DOCS = [REPO / "docs" / "06-data-model.md", REPO / "docs" / "07-config.md"]
 
 CREATE_TABLE = re.compile(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)")
 
 
-def load_migration():
-    spec = importlib.util.spec_from_file_location("initial_schema", MIGRATION)
+def load_migration(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def all_migrations():
+    """遍历全部迁移,不是只看 0001。
+
+    只看第一份的话,后面每加一次迁移这组检查就少覆盖一块 —— 而它存在的意义
+    正是"文档和迁移不许分家"。
+    """
+    return [load_migration(p) for p in sorted(VERSIONS.glob("0*.py"))]
 
 
 def tables_in_docs() -> set[str]:
@@ -35,8 +44,21 @@ def tables_in_docs() -> set[str]:
     return found
 
 
+def migration_ddls() -> list[str]:
+    ddls: list[str] = []
+    for module in all_migrations():
+        # 有的迁移用 TABLES 列表,有的只建一张表用 TABLE
+        ddls.extend(getattr(module, "TABLES", []))
+        single = getattr(module, "TABLE", None)
+        if single:
+            ddls.append(single)
+    return ddls
+
+
 def tables_in_migration() -> set[str]:
-    return {CREATE_TABLE.search(ddl).group(1) for ddl in load_migration().TABLES}
+    return {
+        CREATE_TABLE.search(ddl).group(1) for ddl in migration_ddls() if CREATE_TABLE.search(ddl)
+    }
 
 
 def test_migration_covers_every_documented_table():
@@ -51,14 +73,20 @@ def test_migration_has_no_undocumented_table():
 
 def test_drop_order_covers_every_table():
     # downgrade 漏一张表,回滚后再 upgrade 就会撞上"已存在"
-    module = load_migration()
-    assert set(module.DROP_ORDER) == tables_in_migration()
+    dropped: set[str] = set()
+    for module in all_migrations():
+        dropped.update(getattr(module, "DROP_ORDER", []))
+        single = getattr(module, "TABLE", None)
+        if single and not hasattr(module, "DROP_ORDER"):
+            # 单表迁移的 downgrade 直接写在函数里,从 DDL 反推表名
+            dropped.add(CREATE_TABLE.search(single).group(1))
+    assert dropped == tables_in_migration()
 
 
 def test_drop_order_is_dependency_safe():
     # 被引用的表必须后删。引用关系从 REFERENCES 里读,不手写清单 ——
     # 手写的清单会在加新外键时忘记更新
-    module = load_migration()
+    module = all_migrations()[0]
     position = {name: i for i, name in enumerate(module.DROP_ORDER)}
     for ddl in module.TABLES:
         table = CREATE_TABLE.search(ddl).group(1)
@@ -76,7 +104,7 @@ def test_security_constraints_are_in_the_schema():
     它们一旦从 schema 里消失,对应的铁律就退回成"文档里的一句话",
     而提示注入骗过 agent 之后就再没有第二道闸门。
     """
-    sql = "\n".join(load_migration().TABLES)
+    sql = "\n".join(migration_ddls())
     assert "facts_provenance_required" in sql  # 铁律 5
     assert "l3_never_triggered_by_external" in sql  # 铁律 8
     assert "l2_needs_rollback" in sql  # L2 必须可回滚
@@ -84,7 +112,7 @@ def test_security_constraints_are_in_the_schema():
 
 def test_every_business_table_has_user_id():
     """铁律 1:所有表带 user_id。P0 只有一个用户也不许省。"""
-    for ddl in load_migration().TABLES:
+    for ddl in migration_ddls():
         table = CREATE_TABLE.search(ddl).group(1)
         if table == "users":  # 它自己就是 user_id 的出处
             continue
