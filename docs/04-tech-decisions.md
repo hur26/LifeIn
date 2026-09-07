@@ -673,3 +673,57 @@ APScheduler 进程内跑,与 ADR-013"同进程"的取向一致。定时任务补
 P4 用户数增长到定时扫描无法在单进程内跑完 —— 那时**先拆 worker 进程,仍不换语言**。
 语言层面基本不会重评:瓶颈永远在 LLM 侧,不在服务端。
 
+
+---
+
+## ADR-017 · P0 依赖清单逐条定性
+
+**状态**:已确认(P0 生效)
+
+**背景**
+[AGENTS.md §3](../AGENTS.md#3-写代码时) 规定"不许引入新依赖而不补 ADR"。
+[ADR-016](#adr-016--服务端用-python--fastapi) 已经定了框架层(FastAPI /
+SQLAlchemy / Alembic / APScheduler / PostgreSQL),但真正装进 `pyproject.toml`
+的还有几个它没覆盖的。与其为每个库单写一条,不如在这里一次性交代清楚。
+
+**决策**
+
+| 依赖 | 用途 | 定性 |
+| --- | --- | --- |
+| `fastapi` / `uvicorn` / `pydantic` | Web 与 schema 校验 | ADR-016 已定 |
+| `sqlalchemy` / `alembic` | CRUD 与迁移 | ADR-016 已定 |
+| `apscheduler` | 进程内调度 | ADR-016 已定 |
+| `psycopg[binary]` | PostgreSQL 驱动 | psycopg3,官方现行版本 |
+| `pgvector` | 向量列的 SQLAlchemy 类型 | pgvector 扩展的官方 Python 绑定 |
+| `pydantic-settings` | 环境变量加载与**启动期校验** | 见下 |
+| `httpx` | 调 OpenAI 兼容接口与企微 API | 见下 |
+| `cryptography` | 凭据字段级加密([ADR-009](#adr-009--凭据字段级加密从第一天做)) | 见下 |
+
+**三个需要说明的**
+
+`pydantic-settings` 的价值不是"读环境变量" —— 那 `os.environ` 就够了 ——
+而是**缺配置在进程启动时就报错**,而不是等到当晚八点推摘要时才发现
+`WECOM_SECRET` 是空的。自托管单机没有值班的人,失败必须尽量早。
+
+`httpx` **不装任何厂商 SDK**。OpenAI 兼容接口在本项目只用到
+`POST /chat/completions` 和 `POST /embeddings` 两个端点,一层 SDK 换来的
+是它对特定厂商响应格式的假设。装 `openai` 包会让"换厂商只改两行环境变量"
+([07 §2.3](07-config.md#23-外部模型))这句话在遇到不完全兼容的国内供应商时失效。
+企微 API 本来就没有可用 SDK,两处复用同一个 HTTP 客户端还省一个连接池。
+
+`cryptography` 提供 AES-256-GCM。选它不是选算法而是选**不自己拼装密码学** ——
+它是 Python 生态里唯一有专职维护和安全响应流程的底层库。
+
+**被否决的方案**
+
+| 方案 | 否决理由 |
+| --- | --- |
+| `openai` SDK | 绑定厂商响应格式假设,与"不绑厂商"冲突(见上) |
+| `requests` | 同步阻塞;FastAPI 全异步,混用要多一层线程池 |
+| `pycryptodome` | 能用,但安全响应不如 `cryptography`,且后者已是多数库的传递依赖 |
+| `python-dotenv` 裸用 | 只加载不校验,拿不到"启动即失败"这个价值 |
+| `passlib` / `bcrypt` | P0 没有用户口令。凭据是**对称加密后取回原文**,不是哈希 |
+
+**重新评估的触发条件**
+出现第二个 LLM 供应商且两家响应格式差异大到需要各写一套解析 —— 那时把差异
+收敛进一个 provider 适配层,**仍然不装厂商 SDK**。
