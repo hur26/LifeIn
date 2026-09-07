@@ -60,6 +60,12 @@ P0 不该逼着人先生成一把用不到的密钥 —— 提前存在的凭据
 | `LLM_MAX_RETRIES` | | `2` | |
 | `EMBEDDING_MODEL` | P1 | | 换它要重算全部向量,见 `embeddings.model` |
 | `EMBEDDING_DIM` | P1 | `1024` | 与建表时的 `VECTOR(n)` 必须一致 |
+| `LLM_PRICE_PROMPT_PER_1K` | | `0` | 输入每千 token 单价(元),用于 `tool_calls.cost_cny` |
+| `LLM_PRICE_COMPLETION_PER_1K` | | `0` | 输出每千 token 单价(元) |
+
+> 单价默认 0,也就是**不记成本**。填了才算 —— 各家计价差别大且会变,
+> 与其在代码里维护一张价目表,不如让部署的人填一次。填错只会让成本统计
+> 不准,不影响功能。
 
 > **部署前必须确认供应商是否将请求用于训练**,优先选可关闭的接口,
 > 并把确认结果记在部署记录里 —— 这是 [R12](05-risks.md#r12--外部-llm-供应商侧的数据暴露)
