@@ -165,12 +165,17 @@ CREATE TABLE facts (
     created_by_agent  TEXT NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT facts_provenance_required
-        CHECK (array_length(provenance, 1) >= 1)
+        CHECK (cardinality(provenance) >= 1)
 );
 CREATE INDEX ON facts (user_id) WHERE negated_by_user = false;
 ```
 
 **`CHECK` 约束就是铁律 5 的执行者。** 没有来源的记忆在数据库层面就写不进去。
+
+> 用 `cardinality` 而不是 `array_length`,是踩过的坑:空数组的 `array_length`
+> 返回 **NULL**,而 `NULL >= 1` 也是 NULL,**CHECK 遇到 NULL 判定为通过** ——
+> 约束看着在那里,实际一条都拦不住。`cardinality('{}')` 老老实实返回 0。
+> 这个错只有真连数据库才发现得了,单元测试永远测不出来。
 `negated_by_user` 的记录**保留不删**,用来防止系统重复推断出同一条被否定的事实。
 
 ### 2.4 向量索引

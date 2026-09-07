@@ -97,7 +97,7 @@ TABLES = [
         created_by_agent  TEXT NOT NULL,
         created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
         CONSTRAINT facts_provenance_required
-            CHECK (array_length(provenance, 1) >= 1)
+            CHECK (cardinality(provenance) >= 1)
     )
     """,
     # VECTOR(1024) 与 EMBEDDING_DIM 必须一致,改一边等于改另一边(07 §2.3)
