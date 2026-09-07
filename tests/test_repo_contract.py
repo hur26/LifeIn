@@ -34,10 +34,38 @@ def data_access_functions():
     按"在不在 repos 包里"划会误伤:push_log.digest_card 是个纯函数,
     它定义的是往那一列里存什么形状,不访问任何数据。
     拿不到 session 就做不了数据访问,所以这个判据不会漏。
+
+    模块自己声明的 `NO_USER_ID_REQUIRED` 会被排除。目前只有 users 模块用到:
+    身份解析那一步手上还没有 user_id,它正是要算出这个值。
+    **例外必须写在代码里而不是这里** —— 加例外要改那个集合,那是个看得见的动作。
     """
-    for qualname, func in public_functions():
-        if "session" in inspect.signature(func).parameters:
-            yield qualname, func
+    for module_info in pkgutil.iter_modules(lifein.repos.__path__):
+        module = importlib.import_module(f"lifein.repos.{module_info.name}")
+        exempt = getattr(module, "NO_USER_ID_REQUIRED", frozenset())
+        for name, obj in vars(module).items():
+            if name.startswith("_") or not inspect.isfunction(obj):
+                continue
+            if obj.__module__ != module.__name__:
+                continue
+            if name in exempt:
+                continue
+            if "session" in inspect.signature(obj).parameters:
+                yield f"{module_info.name}.{name}", obj
+
+
+def test_exemptions_are_narrow():
+    """例外只允许出现在 users 模块,且只有身份解析与建用户两类。
+
+    这条测试存在的意义是让"再破一次例"变得需要解释:哪天有人想给别的模块
+    加 NO_USER_ID_REQUIRED,得先改这里。
+    """
+    for module_info in pkgutil.iter_modules(lifein.repos.__path__):
+        module = importlib.import_module(f"lifein.repos.{module_info.name}")
+        exempt = getattr(module, "NO_USER_ID_REQUIRED", frozenset())
+        if not exempt:
+            continue
+        assert module_info.name == "users", f"{module_info.name} 不该有例外"
+        assert exempt == {"find_by_wecom_userid", "create_user"}
 
 
 def test_there_are_data_access_functions_to_check():
