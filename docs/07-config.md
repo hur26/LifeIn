@@ -1,0 +1,179 @@
+# 07 · 配置清单
+
+配置项此前散落在五份文档里,谁也说不出"跑起来到底要准备什么"。这份文档就是那张单子。
+
+**凭据一律不进仓库。** `.env` 在 `.gitignore` 里,示例文件是 `.env.example`,
+里面只放键名和格式说明,不放任何真实值。
+
+---
+
+## 1. 配置分三处,不要混
+
+| 放哪 | 装什么 | 判据 |
+| --- | --- | --- |
+| **环境变量** | 系统级凭据与启动参数 | 进程起来之前就必须知道的 |
+| **`credentials` 表**(加密) | 用户级凭据 | 每个用户各有一份,P4 后按 `user_id` 隔离 |
+| **数据库配置表** | 用户可自行调整的 | 用户能在 App 里改的,不该要求重启 |
+
+最容易做错的是把 IMAP 授权码写进环境变量 —— P0 单用户时看着没问题,
+P4 来第二个人就得推倒重来。**用户级凭据从第一天就进 `credentials` 表**
+([06 §2.10](06-data-model.md#210-其余表))。
+
+---
+
+## 2. 环境变量
+
+### 2.1 基础
+
+| 键 | 必填 | 示例 / 默认 | 说明 |
+| --- | :-: | --- | --- |
+| `DATABASE_URL` | ✓ | `postgresql://…/lifein` | PostgreSQL 15+,需装 `pgvector` |
+| `APP_HOST` | | `127.0.0.1` | **默认只监听本地**,公网访问走反向代理 |
+| `APP_PORT` | | `8000` | |
+| `TZ` | ✓ | `Asia/Shanghai` | 影响"昨日邮件""今日日历"的窗口划分 |
+| `LOG_LEVEL` | | `INFO` | |
+
+### 2.2 加密主密钥
+
+| 键 | 必填 | 说明 |
+| --- | :-: | --- |
+| `MASTER_KEY` | ✓ | 32 字节,base64。加密 `credentials` 表的字段 |
+| `MASTER_KEY_VERSION` | ✓ | 整数,写入 `credentials.key_version` |
+| `MASTER_KEY_PREVIOUS` | | 轮换期间的旧密钥,解密用;轮换完成后删除 |
+
+> **主密钥泄露等于全部凭据泄露。** 它不进仓库、不进日志、不进备份的明文部分。
+> 轮换流程:配 `MASTER_KEY_PREVIOUS` → 逐条重加密并递增 `key_version` →
+> 确认无残留旧版本 → 删除 `MASTER_KEY_PREVIOUS`。
+> 没有 `key_version` 就没法平滑轮换,所以它从 P0 就在表里。
+
+### 2.3 外部模型
+
+| 键 | 必填 | 示例 / 默认 | 说明 |
+| --- | :-: | --- | --- |
+| `LLM_BASE_URL` | ✓ | `https://…/v1` | OpenAI 兼容接口 |
+| `LLM_API_KEY` | ✓ | | |
+| `LLM_MODEL` | ✓ | | 换厂商只改这两行 |
+| `LLM_TIMEOUT_S` | | `60` | |
+| `LLM_MAX_RETRIES` | | `2` | |
+| `EMBEDDING_MODEL` | ✓ | | 换它要重算全部向量,见 `embeddings.model` |
+| `EMBEDDING_DIM` | ✓ | `1024` | 与建表时的 `VECTOR(n)` 必须一致 |
+
+> **部署前必须确认供应商是否将请求用于训练**,优先选可关闭的接口,
+> 并把确认结果记在部署记录里 —— 这是 [R12](05-risks.md#r12--外部-llm-供应商侧的数据暴露)
+> 的措施之一,不是口头确认一次就算完。
+
+### 2.4 企业微信
+
+| 键 | 必填 | 说明 |
+| --- | :-: | --- |
+| `WECOM_CORP_ID` | ✓ | |
+| `WECOM_AGENT_ID` | ✓ | 自建应用 |
+| `WECOM_SECRET` | ✓ | |
+| `WECOM_CALLBACK_TOKEN` | ✓ | 回调签名校验 |
+| `WECOM_CALLBACK_AES_KEY` | ✓ | 回调消息解密 |
+
+日历复用同一套凭据(企微日程 API),不需要额外配置。
+
+### 2.5 采集入口
+
+| 键 | 必填 | 默认 | 说明 |
+| --- | :-: | --- | --- |
+| `INGEST_SECRET` | ✓ | | 采集上报的签名密钥,与查询凭据**不同** |
+| `INGEST_MAX_SKEW_S` | | `300` | 超出时间偏移的请求拒收,防重放 |
+| `APP_TOKEN_TTL_H` | | `24` | App 短期 token 有效期 |
+
+### 2.6 行为参数
+
+有默认值,通常不用改;改了要能解释为什么。
+
+| 键 | 默认 | 出处 |
+| --- | --- | --- |
+| `DAILY_DIGEST_AT` | `08:00` | [产品定义 §5](01-product-spec.md#5-主动性双模式) |
+| `MAX_PROACTIVE_PUSH_PER_DAY` | `3` | 频率闸门硬上限 |
+| `SHADOW_MODE_DEFAULT` | `true` | 新规则一律先影子模式 |
+| `TXN_DEDUP_WINDOW_S` | `300` | 跨渠道去重窗口,[06 §2.6](06-data-model.md#26-去重的两个层次) |
+| `TXN_MIN_CONFIDENCE` | `0.8` | 低于此值进待确认,不入账 |
+| `PENDING_EXPIRE_DAYS` | `30` | 待确认队列过期 |
+| `APPROVAL_EXPIRE_H` | `24` | L3 审批过期 |
+| `COLLECTOR_HEARTBEAT_TIMEOUT_M` | `60` | 超时即告警,P1 验收要求 1 小时内 |
+| `ALERT_CHANNEL` | `email` | 告警走兜底通道,不走可能已经挂掉的企微 |
+
+---
+
+## 3. 用户级凭据(存 `credentials` 表,加密)
+
+| `kind` | `scope` | 内容 | 备注 |
+| --- | --- | --- | --- |
+| `imap` | `query` | 主机、端口、账号、**授权码** | 授权码不是登录密码 |
+| `bill_archive` | `query` | 账单导出压缩包密码 | 支付宝/微信各一份 |
+| `statement_pdf` | `query` | 信用卡对账单 PDF 打开密码 | 每家银行一份 |
+| `collector` | `ingest` | 采集设备密钥 | **只能写不能读** |
+| `app_device` | `query` | App 查询长期凭据 | 存安卓 Keystore,服务端可单点吊销 |
+
+**`scope` 是 [R11](05-risks.md#r11--app-直连服务端的认证面) 的执行点。**
+`ingest` 的凭据打到读接口一律拒绝 —— 手机丢了或 App 被逆向,拿到的采集密钥
+读不出任何账本。
+
+### IMAP 的两个坑
+
+- **163 / 126 必须在 `SELECT` 前先发 `ID` 命令**,否则报 `Unsafe Login`。
+  Python 的 `imaplib` 默认不允许在该状态发 `ID`,要先注册为 AUTH 态可用命令。
+  QQ 邮箱无此要求。见 [ADR-011](04-tech-decisions.md#adr-011--数据源全面本地化)
+- **授权码会在改账号密码后失效。** 连续认证失败必须告警,不能静默停采
+  ([R9](05-risks.md#r9--单点自托管可用性))
+
+---
+
+## 4. 采集白名单(存表,用户可改)
+
+白名单**不进环境变量** —— 用户要能在 App 里增删,不该要求重启
+([架构 §8.4](02-architecture.md#84-查看侧))。
+
+```sql
+CREATE TABLE collector_whitelist (
+    id         BIGSERIAL PRIMARY KEY,
+    user_id    UUID NOT NULL,
+    match_type TEXT NOT NULL CHECK (match_type IN ('sms_sender','package_name')),
+    pattern    TEXT NOT NULL,
+    purpose    TEXT NOT NULL CHECK (purpose IN ('transaction','message')),
+    enabled    BOOLEAN NOT NULL DEFAULT true,
+    phase      TEXT NOT NULL,     -- P1|P2,控制分期放开
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, match_type, pattern)
+);
+```
+
+**默认拒绝。** 不在白名单里的短信与通知,采集器根本不上报
+([R10](05-risks.md#r10--手机端采集器的越权读取))。
+
+| 阶段 | 放行什么 |
+| --- | --- |
+| **P1** | 仅微信(`com.tencent.mm`),`purpose='message'` |
+| **P2** | 追加银行号段、支付宝、云闪付、银行 App、美团/京东等,`purpose='transaction'` |
+
+先用一条低风险链路验证采集器能不能稳定活着,再把账目压上去。
+
+### 验证码过滤
+
+**手机端与服务端各过滤一次,两边用同一份正则。**
+
+```
+验证码|校验码|动态密码|verification code|\b\d{4,8}\b\s*(?:为|是)?\s*(?:您的)?(?:验证码|校验码)
+```
+
+命中即丢弃,不进队列、不入库。这份正则是配置项,允许调整,
+但**只能放宽匹配范围不能收窄** —— 收窄意味着更多验证码会流进系统。
+
+---
+
+## 5. 部署前检查清单
+
+- [ ] `.env` 不在 git 里,`.env.example` 在
+- [ ] `MASTER_KEY` 已生成,且**不等于**示例值
+- [ ] PostgreSQL 装了 `pgvector`,`EMBEDDING_DIM` 与建表一致
+- [ ] `APP_HOST` 是 `127.0.0.1`,公网访问走反向代理 + TLS
+- [ ] 企微回调 URL 已实测能收到并验签通过
+- [ ] IMAP 实测能登录(163 记得发 `ID`)
+- [ ] **已确认 LLM 供应商是否将请求用于训练,结果记入部署记录**
+- [ ] 告警通道实测能收到(故意让一次采集失败)
+- [ ] 备份已配置,且**演练过一次恢复**(配了不算,演练过才算)

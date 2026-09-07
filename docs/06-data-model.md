@@ -435,6 +435,10 @@ CREATE TABLE collector_heartbeat (
 );
 ```
 
+采集白名单表 `collector_whitelist` 定义在
+[07 §4](07-config.md#4-采集白名单存表用户可改) —— 它是用户可改的配置,
+放在那份文档里更顺手,但它同样是一张需要 `user_id` 的业务表。
+
 `credentials.scope` 就是 [R11](05-risks.md#r11--app-直连服务端的认证面) 的
 "采集凭据与查询凭据分开" —— 采集端签发的凭据 `scope='ingest'`,读接口一律拒绝。
 
