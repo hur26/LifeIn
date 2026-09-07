@@ -62,12 +62,20 @@ class Settings(BaseSettings):
     embedding_model: str | None = None
     embedding_dim: int = 1024
 
+    # 单价默认 0 即不记成本(07 §2.3)。各家计价差别大且会变,
+    # 与其在代码里维护价目表,不如让部署的人填一次
+    llm_price_prompt_per_1k: float = 0.0
+    llm_price_completion_per_1k: float = 0.0
+
     # ---------- 企业微信 ----------
     wecom_corp_id: str
     wecom_agent_id: str
     wecom_secret: SecretStr
     wecom_callback_token: SecretStr
     wecom_callback_aes_key: SecretStr
+    wecom_calendar_id: str | None = None
+    """要读取的日历 cal_id。企微的日程接口按日历取,而自建应用没有
+    "列出我的全部日历"这个能力(07 §2.4)。没配就不采日历。"""
 
     # ---------- 采集入口(P1) ----------
     ingest_secret: SecretStr | None = None

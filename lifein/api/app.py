@@ -1,0 +1,84 @@
+"""HTTP 入口。
+
+P0 只有两个端点:健康检查,和企微回调。采集上报(`/ingest`)是 P1 的事,
+接口契约还没定(06 §4)。
+
+**回调的错误响应一律不带原因。** `CallbackRejected` 里写了是签名不对还是
+时间戳过期,那是给日志看的;返给对方只有一个 400 —— 告诉探测者他哪一步
+错了,等于帮他调试。
+
+默认只监听 `127.0.0.1`(07 §2.1),公网访问走反向代理 + TLS。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+
+from fastapi import FastAPI, Request, Response, status
+
+from lifein.bootstrap import Services, build_services
+from lifein.channels.wecom_callback import CallbackRejected
+from lifein.db import session_scope
+from lifein.jobs.qa_reply import QaDeps, handle_message
+
+log = logging.getLogger(__name__)
+
+
+def create_app(services: Services | None = None) -> FastAPI:
+    # 关掉自动文档:这个服务只服务于两个已知的调用方,把端点和 schema
+    # 挂在公网上是白送的侦察信息。
+    # openapi_url 必须一起关 —— 只关 docs_url,/openapi.json 照样是公开的,
+    # 而那份 JSON 比页面本身更好用。
+    app = FastAPI(title="LifeIn", docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.services = services or build_services()
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/wecom/callback")
+    def verify(msg_signature: str, timestamp: str, nonce: str, echostr: str) -> Response:
+        """企微后台配置回调地址时的一次性握手。"""
+        svc: Services = app.state.services
+        try:
+            plain = svc.callback.verify_url(
+                msg_signature=msg_signature, timestamp=timestamp, nonce=nonce, echostr=echostr
+            )
+        except CallbackRejected as exc:
+            log.warning("回调 URL 验证失败:%s", exc)
+            return Response(status_code=status.HTTP_400_BAD_REQUEST)
+        return Response(content=plain, media_type="text/plain")
+
+    @app.post("/wecom/callback")
+    async def receive(request: Request, msg_signature: str, timestamp: str, nonce: str) -> Response:
+        svc: Services = app.state.services
+        body = await request.body()
+
+        try:
+            message = svc.callback.parse_message(
+                body=body, msg_signature=msg_signature, timestamp=timestamp, nonce=nonce
+            )
+        except CallbackRejected as exc:
+            # 只记不回:告诉对方错在哪一步等于帮他调试
+            log.warning("回调被拒:%s", exc)
+            return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            with session_scope() as session:
+                handle_message(
+                    session,
+                    message=message,
+                    deps=QaDeps(llm=svc.llm, channel=svc.channel),
+                    now=datetime.now(UTC),
+                )
+        except Exception:  # noqa: BLE001
+            # 企微会对非 200 重投。问答失败重投也不会好,而重投意味着再花一次
+            # 模型钱、再回一次消息 —— 所以处理失败照样回 200,失败记在日志里
+            log.exception("处理回调消息失败,msg_id=%s", message.msg_id)
+
+        # 企微要求 5 秒内响应。空响应表示"收到了,不用回消息" ——
+        # 真正的回复是我们主动 send 出去的,不走这个响应体
+        return Response(content="", media_type="text/plain")
+
+    return app
