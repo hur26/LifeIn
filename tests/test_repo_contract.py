@@ -28,19 +28,42 @@ def public_functions():
             yield f"{module_info.name}.{name}", obj
 
 
-def test_there_are_repo_functions_to_check():
-    # 防止上面的遍历因为改包结构而悄悄变成空集合,让这组测试假装通过
-    assert list(public_functions())
+def data_access_functions():
+    """真正碰数据库的那些 —— 判据是**它收不收 session**。
 
-
-def test_every_repo_function_takes_user_id_first():
+    按"在不在 repos 包里"划会误伤:push_log.digest_card 是个纯函数,
+    它定义的是往那一列里存什么形状,不访问任何数据。
+    拿不到 session 就做不了数据访问,所以这个判据不会漏。
+    """
     for qualname, func in public_functions():
+        if "session" in inspect.signature(func).parameters:
+            yield qualname, func
+
+
+def test_there_are_data_access_functions_to_check():
+    # 防止遍历因为改包结构而悄悄变成空集合,让这组测试假装通过
+    assert list(data_access_functions())
+
+
+def test_every_data_access_function_takes_user_id_first():
+    for qualname, func in data_access_functions():
         params = list(inspect.signature(func).parameters)
         assert params and params[0] == "user_id", f"{qualname} 的第一个参数不是 user_id"
 
 
-def test_no_repo_function_defaults_user_id():
+def test_no_data_access_function_defaults_user_id():
     # 有默认值就意味着"可以不传",而不传的那次就是串数据的那次
-    for qualname, func in public_functions():
+    for qualname, func in data_access_functions():
         first = next(iter(inspect.signature(func).parameters.values()))
         assert first.default is inspect.Parameter.empty, f"{qualname} 的 user_id 不该有默认值"
+
+
+def test_session_is_the_second_parameter():
+    """签名统一成 (user_id, session, *, ...)。
+
+    统一不是洁癖:调用点全是 `repo.xxx(user_id, session, ...)` 的形状,
+    多出来的那个位置参数一眼就能看出是不是传错了。
+    """
+    for qualname, func in data_access_functions():
+        params = list(inspect.signature(func).parameters)
+        assert params[1] == "session", f"{qualname} 的第二个参数不是 session"
