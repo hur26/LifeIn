@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/status-P0%20设计中-blue?style=flat-square)](docs/03-roadmap.md)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](#技术栈-p0)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?style=flat-square&logo=postgresql&logoColor=white)](docs/04-tech-decisions.md#adr-006--存储用单一-postgresql--pgvector)
-[![Claude](https://img.shields.io/badge/Claude-API-D97757?style=flat-square&logo=anthropic&logoColor=white)](#技术栈-p0)
+[![LLM](https://img.shields.io/badge/LLM-OpenAI%20兼容接口-6E56CF?style=flat-square)](#技术栈-p0)
 [![WeCom](https://img.shields.io/badge/企业微信-主入口-07C160?style=flat-square&logo=wechat&logoColor=white)](docs/04-tech-decisions.md#adr-001--主入口选企业微信)
 
 [产品定义](docs/01-product-spec.md) ·
@@ -138,7 +138,7 @@ flowchart TB
 | 服务端 | Python 3.11+ · FastAPI(接企微回调) |
 | 调度 | APScheduler |
 | 存储 | PostgreSQL + pgvector(单库,不引入独立向量库) |
-| 模型 | Claude API 直调,**P0 不套 agent 框架** |
+| 模型 | 外部 LLM API 直调(OpenAI 兼容接口,换 base_url + model 即切换厂商),**P0 不套 agent 框架** |
 | 入口 | 企业微信自建应用(推送 + 交互卡片) |
 | 数据源 | IMAP / Gmail API · CalDAV |
 
@@ -154,7 +154,7 @@ flowchart TB
 | 技术 | 当前不用的理由 | 何时重新考虑 |
 | --- | --- | --- |
 | **LangGraph** | P0–P2 是"拉数据 → 调 LLM → 推送"的脚本级流程,上框架是纯负担 | **P3** —— 审批要求流程暂停数小时后从断点恢复,那时 checkpoint / interrupt 才真正划算 |
-| **MCP** | 只有一个后端在调工具,包一层 MCP 是白加抽象。工具治理是治理层的事,与 MCP 无关 | 当你想**在 Claude Code 里也直接查自己的邮件和账单** —— 一套工具两个消费方,MCP 立刻划算 |
+| **MCP** | 只有一个后端在调工具,包一层 MCP 是白加抽象。工具治理是治理层的事,与 MCP 无关 | 当你想**在其他 MCP client 里也直接查自己的邮件和账单** —— 一套工具两个消费方,MCP 立刻划算 |
 | **Hook 机制** | Hook 是给第三方扩展用的抽象,本项目没有第三方。拦截 L3 就是网关里的一个分支判断 | 基本不会 —— 与"不做通用框架"的非目标冲突 |
 | **多 agent 竞争择优** | 该范式需要客观验收标准且值得 N 倍 token,生活任务两条都不满足 | 单 agent 的 prompt 因领域过多互相干扰时,按领域拆分(**仍不做竞争择优**) |
 | **独立向量数据库** | 当前数据量下纯属增加运维复杂度,跨库事务一致性也难保证 | 向量数据超百万级且检索延迟成为瓶颈 |
