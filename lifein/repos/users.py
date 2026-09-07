@@ -20,10 +20,11 @@ from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
 
-NO_USER_ID_REQUIRED = frozenset({"find_by_wecom_userid", "create_user"})
+NO_USER_ID_REQUIRED = frozenset({"find_by_wecom_userid", "create_user", "list_active_users"})
 """不以 user_id 开头的函数白名单。
 
-只有两类可以进来:**把外部标识换成内部 id 的**,以及**创建用户的**。
+只有三类可以进来:**把外部标识换成内部 id 的**、**创建用户的**、
+**枚举用户的**(定时任务要知道该给谁跑)。
 其他任何函数都必须带 user_id —— 铁律 1 在 repos/__init__.py。
 """
 
@@ -95,3 +96,15 @@ def create_user(
             {"display_name": display_name, "wecom_userid": wecom_userid, "tz": tz},
         ).scalar_one()
     )
+
+
+def list_active_users(session: Session) -> list[str]:
+    """列出所有未停用的用户 id。定时任务要知道该给谁跑。
+
+    只返回 id,不返回别的字段 —— 调用方拿到 id 之后走正常的 get_user,
+    那条路径是带 user_id 的。这样"枚举"这个例外不会顺手变成"批量读数据"。
+    """
+    rows = session.execute(
+        text("SELECT id FROM users WHERE disabled_at IS NULL ORDER BY created_at")
+    ).all()
+    return [str(r.id) for r in rows]

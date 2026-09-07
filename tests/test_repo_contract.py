@@ -65,7 +65,7 @@ def test_exemptions_are_narrow():
         if not exempt:
             continue
         assert module_info.name == "users", f"{module_info.name} 不该有例外"
-        assert exempt == {"find_by_wecom_userid", "create_user"}
+        assert exempt == {"find_by_wecom_userid", "create_user", "list_active_users"}
 
 
 def test_there_are_data_access_functions_to_check():

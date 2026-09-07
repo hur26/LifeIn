@@ -13,6 +13,8 @@ P0 只有两个端点:健康检查,和企微回调。采集上报(`/ingest`)是 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
@@ -21,17 +23,45 @@ from lifein.bootstrap import Services, build_services
 from lifein.channels.wecom_callback import CallbackRejected
 from lifein.db import session_scope
 from lifein.jobs.qa_reply import QaDeps, handle_message
+from lifein.scheduler import build_scheduler, run_digest_for_all_users
 
 log = logging.getLogger(__name__)
 
 
-def create_app(services: Services | None = None) -> FastAPI:
+def create_app(services: Services | None = None, *, with_scheduler: bool = False) -> FastAPI:
+    """建应用。
+
+    `with_scheduler=True` 时把调度器挂进 lifespan —— 一个进程既收回调又跑
+    定时任务,这是 ADR-016"同进程"的取向。默认关着,因为测试不该起后台线程。
+    """
+    resolved = services or build_services()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        scheduler = None
+        if with_scheduler:
+            scheduler = build_scheduler(resolved)
+            scheduler.start()
+            # 启动即跑一次:昨晚八点进程正好挂着,今早重启不该等到明晚才发现
+            # 漏了一天。算不出窗口时它什么都不做
+            try:
+                run_digest_for_all_users(resolved)
+            except Exception:  # noqa: BLE001
+                log.exception("启动补跑失败")
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.shutdown(wait=False)
+
     # 关掉自动文档:这个服务只服务于两个已知的调用方,把端点和 schema
     # 挂在公网上是白送的侦察信息。
     # openapi_url 必须一起关 —— 只关 docs_url,/openapi.json 照样是公开的,
     # 而那份 JSON 比页面本身更好用。
-    app = FastAPI(title="LifeIn", docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.services = services or build_services()
+    app = FastAPI(
+        title="LifeIn", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
+    )
+    app.state.services = resolved
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
