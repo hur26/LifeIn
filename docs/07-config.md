@@ -189,40 +189,11 @@ CREATE TABLE collector_whitelist (
 
 ## 5. 部署步骤
 
-按顺序走一遍,每一步都有办法当场确认成功:
+**一步一步怎么做在 [08 部署实操](08-deployment.md)** —— 包括企微后台点哪里、
+邮箱授权码在哪生成、每一步怎么确认成功。
 
-```bash
-# 1. 建库(需要 pgvector 扩展)
-createdb lifein
-
-# 2. 配环境变量
-cp .env.example .env
-python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"  # MASTER_KEY
-
-# 3. 建表
-alembic upgrade head
-
-# 4. 建用户。wecom-userid 是企微成员 UserID,也就是推送目标
-python -m lifein.admin create-user --name 你的名字 --wecom-userid YourWecomId
-
-# 5. 配邮箱凭据,授权码在这一步交互输入(不进 shell history)
-python -m lifein.admin set-imap --user <上一步的 uuid>     --host imap.163.com --username you@163.com
-
-# 6. 实测能不能登录 —— 163 的 ID 握手对不对,只有真连一次能证明
-python -m lifein.admin test-imap --user <uuid>
-
-# 7. 立刻跑一次完整链路,不用等到早上八点
-python -m lifein --once
-
-# 8. 起服务
-python -m lifein
-```
-
-企微回调地址填 `https://你的域名/wecom/callback`,后台点保存时会走一次
-URL 验证握手。**服务默认只监听 127.0.0.1**,所以这一步之前反向代理要先配好。
-
-密钥轮换:配上 `MASTER_KEY_PREVIOUS` → `rotate-keys` → `key-status` 确认
-无残留 → 删掉 `MASTER_KEY_PREVIOUS`。
+这份文档只回答"这个配置项是什么意思、判据是什么",不重复步骤 ——
+两份都写一遍,迟早各自漂移。
 
 ---
 
