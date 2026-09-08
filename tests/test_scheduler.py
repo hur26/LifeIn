@@ -34,9 +34,7 @@ def services(**overrides) -> Services:
     return Services(
         settings=settings,
         llm=None,
-        wecom=None,
         channel=None,
-        callback=None,
         alerter=CollectingAlerter(),
     )
 

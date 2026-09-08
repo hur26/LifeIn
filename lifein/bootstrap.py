@@ -45,12 +45,14 @@ log = logging.getLogger(__name__)
 class Services:
     settings: Settings
     llm: LLMClient
-    wecom: WecomClient
     channel: Channel
-    """推送出口。默认是"微信优先、企微兜底"的组合(ADR-018)。"""
+    """推送出口。配了企微就是"微信优先、企微兜底";没配就只有微信(ADR-018)。"""
 
-    callback: WecomCallback
     alerter: Alerter
+    wecom: WecomClient | None = None
+    callback: WecomCallback | None = None
+    """没配企微时是 None。企微要配可信 IP 得先有公网域名,而 iLink 让这件事
+    在 P0 变成可选的 —— 但代价要说清:没有兜底通道,也没有日历数据源。"""
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -67,34 +69,37 @@ def build_services(settings: Settings | None = None) -> Services:
         price_completion_per_1k=Decimal(str(s.llm_price_completion_per_1k)),
     )
 
-    wecom = WecomClient(
-        corp_id=s.wecom_corp_id,
-        secret=s.wecom_secret.get_secret_value(),
-        agent_id=s.wecom_agent_id,
-    )
-
     alerter = LoggingAlerter()
 
     # ADR-018:微信优先,企微兜底。微信没配过会话时 WeixinChannel 会抛错,
     # 于是自动落到企微 —— 所以"还没配微信"和"微信坏了"走的是同一条路径,
     # 不需要在这里判断配没配
-    wecom_channel = WecomChannel(wecom, resolve_userid=_resolve_wecom_userid)
-    channel = FallbackChannel(
-        [WeixinChannel(load_session=_load_weixin_session), wecom_channel],
-        alerter=alerter,
-    )
+    channels: list[Channel] = [WeixinChannel(load_session=_load_weixin_session)]
 
-    callback = WecomCallback(
-        token=s.wecom_callback_token.get_secret_value(),
-        aes_key=s.wecom_callback_aes_key.get_secret_value(),
-        corp_id=s.wecom_corp_id,
-    )
+    wecom: WecomClient | None = None
+    callback: WecomCallback | None = None
+    if s.wecom_enabled:
+        wecom = WecomClient(
+            corp_id=s.wecom_corp_id,
+            secret=s.wecom_secret.get_secret_value(),
+            agent_id=s.wecom_agent_id,
+        )
+        channels.append(WecomChannel(wecom, resolve_userid=_resolve_wecom_userid))
+        callback = WecomCallback(
+            token=s.wecom_callback_token.get_secret_value(),
+            aes_key=s.wecom_callback_aes_key.get_secret_value(),
+            corp_id=s.wecom_corp_id,
+        )
+    else:
+        # 只剩一条通道的时候必须说出来。"没有兜底"和"兜底没生效"表现一样,
+        # 而前者是你自己选的、后者是故障 —— 启动时说一次,免得以后分不清
+        log.warning("未配置企业微信:没有兜底推送通道,也没有日历数据源")
 
     return Services(
         settings=s,
         llm=llm,
         wecom=wecom,
-        channel=channel,
+        channel=FallbackChannel(channels, alerter=alerter),
         callback=callback,
         alerter=alerter,
     )
@@ -180,7 +185,7 @@ def build_adapters(user_id: str, session: Session, services: Services) -> list[P
         log.warning("用户 %s 没有配 IMAP 凭据,跳过邮箱采集", user_id)
 
     user = users.get_user(user_id, session)
-    if user and s.wecom_calendar_id:
+    if user and s.wecom_calendar_id and services.wecom is not None:
         adapters.append(
             WecomCalendarAdapter(
                 services.wecom,
@@ -188,6 +193,6 @@ def build_adapters(user_id: str, session: Session, services: Services) -> list[P
             )
         )
     else:
-        log.warning("未配置 WECOM_CALENDAR_ID,跳过日历采集")
+        log.warning("未配置企微日历(需要 WECOM_* 与 WECOM_CALENDAR_ID),跳过日历采集")
 
     return adapters

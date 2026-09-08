@@ -20,6 +20,10 @@ BASE = {
     "llm_base_url": "https://example.com/v1",
     "llm_api_key": "k",
     "llm_model": "m",
+}
+
+WITH_WECOM = {
+    **BASE,
     "wecom_corp_id": "c",
     "wecom_agent_id": "1",
     "wecom_secret": "s",
@@ -40,6 +44,8 @@ def test_minimal_config_is_enough_for_p0():
     # P1 才用到的两项在 P0 可以为空,不该阻止启动
     assert s.embedding_model is None
     assert s.ingest_secret is None
+    # 企微整组可选:配可信 IP 要先有公网域名,而 iLink 让它不再是必需
+    assert s.wecom_enabled is False
 
 
 @pytest.mark.parametrize(
@@ -83,3 +89,14 @@ def test_secrets_do_not_leak_in_repr():
     assert marker not in repr(s)
     assert marker not in str(s.model_dump())
     assert s.llm_api_key.get_secret_value() == marker
+
+
+class TestWecomOptional:
+    def test_fully_configured_wecom_is_enabled(self):
+        assert Settings(_env_file=None, **WITH_WECOM).wecom_enabled is True
+
+    def test_partial_wecom_config_counts_as_absent(self):
+        """半套配置只会在运行时炸得莫名其妙,不如当它不存在,让降级接手。"""
+        half = {**WITH_WECOM}
+        del half["wecom_callback_aes_key"]
+        assert Settings(_env_file=None, **half).wecom_enabled is False

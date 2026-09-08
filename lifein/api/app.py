@@ -71,6 +71,8 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     def verify(msg_signature: str, timestamp: str, nonce: str, echostr: str) -> Response:
         """企微后台配置回调地址时的一次性握手。"""
         svc: Services = app.state.services
+        if svc.callback is None:
+            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         try:
             plain = svc.callback.verify_url(
                 msg_signature=msg_signature, timestamp=timestamp, nonce=nonce, echostr=echostr
@@ -83,6 +85,10 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     @app.post("/wecom/callback")
     async def receive(request: Request, msg_signature: str, timestamp: str, nonce: str) -> Response:
         svc: Services = app.state.services
+        if svc.callback is None:
+            # 没配企微就没有这个入口。回 503 而不是 404 —— 它是"暂时没开",
+            # 不是"不存在",配上就有了
+            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
         body = await request.body()
 
         try:

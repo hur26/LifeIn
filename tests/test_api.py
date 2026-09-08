@@ -61,10 +61,9 @@ def client() -> TestClient:
     services = Services(
         settings=None,  # 端点层用不到,别为了测试去造一份完整配置
         llm=None,
-        wecom=None,
         channel=None,
-        callback=WecomCallback(token=TOKEN, aes_key=CB_AES_KEY, corp_id=CB_CORP_ID),
         alerter=None,
+        callback=WecomCallback(token=TOKEN, aes_key=CB_AES_KEY, corp_id=CB_CORP_ID),
     )
     return TestClient(create_app(services))
 
