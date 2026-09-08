@@ -55,6 +55,7 @@ def register_tools() -> None:
     """
     from lifein.agents import digest, memory, qa  # noqa: F401
     from lifein.tools import memory as memory_tools  # noqa: F401
+    from lifein.tools import todo as todo_tools  # noqa: F401
 
     validate_all()
 
