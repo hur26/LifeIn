@@ -1,0 +1,177 @@
+"""微信 iLink 通道的测试。
+
+重点在**错误分类**:iLink 用同一个错误码表达两件性质完全不同的事,
+分错了会让系统在会话过期时不停退避重试,而重试一百次也是过期的。
+"""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from lifein.channels.base import Card, CardSection
+from lifein.channels.weixin import (
+    MAX_TEXT_CHARS,
+    WeixinChannel,
+    WeixinError,
+    WeixinSession,
+    WeixinSessionExpired,
+    WeixinUnavailable,
+    render_text,
+)
+
+USER = "11111111-1111-1111-1111-111111111111"
+
+
+def session(**overrides) -> WeixinSession:
+    base = dict(token="tok-secret", to_user_id="peer-1", base_url="https://ilink.example.com")
+    return WeixinSession(**{**base, **overrides})
+
+
+def build(
+    response, *, sess: WeixinSession | None = None
+) -> tuple[WeixinChannel, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if isinstance(response, Exception):
+            raise response
+        return httpx.Response(200, json=response)
+
+    channel = WeixinChannel(
+        load_session=lambda _uid: session() if sess is None else sess,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return channel, seen
+
+
+def card() -> Card:
+    return Card(
+        title="9 月 7 日摘要",
+        summary="今天有 2 件要紧事。",
+        sections=[CardSection(heading="要做的事", lines=["交房租", "回财务的邮件"])],
+        footer="来自 34 条事件",
+    )
+
+
+def test_successful_send():
+    channel, seen = build({"ret": 0, "msgid": "m-1"})
+    delivery = channel.send(USER, card())
+
+    assert delivery.channel == "weixin"
+    assert delivery.delivery_id == "m-1"
+    assert delivery.truncated is False
+
+    body = json.loads(seen[0].content)
+    assert body["msg"]["to_user_id"] == "peer-1"
+    assert body["msg"]["item_list"][0]["text_item"]["text"].startswith("9 月 7 日摘要")
+
+
+def test_token_goes_in_the_header():
+    channel, seen = build({"ret": 0})
+    channel.send(USER, card())
+
+    assert seen[0].headers["Authorization"] == "Bearer tok-secret"
+    assert "tok-secret" not in str(seen[0].url)
+
+
+def test_each_message_gets_a_fresh_client_id():
+    """client_id 是幂等键,重复用会让第二条被 iLink 当成重投丢掉。"""
+    channel, seen = build({"ret": 0})
+    channel.send(USER, card())
+    channel.send(USER, card())
+
+    ids = [json.loads(r.content)["msg"]["client_id"] for r in seen]
+    assert ids[0] != ids[1]
+
+
+def test_context_token_is_included_when_present():
+    channel, seen = build({"ret": 0}, sess=session(context_token="ctx-1"))
+    channel.send(USER, card())
+    assert json.loads(seen[0].content)["msg"]["context_token"] == "ctx-1"
+
+
+def test_context_token_is_omitted_when_absent():
+    channel, seen = build({"ret": 0})
+    channel.send(USER, card())
+    assert "context_token" not in json.loads(seen[0].content)["msg"]
+
+
+def test_missing_session_is_a_clear_error():
+    channel = WeixinChannel(load_session=lambda _uid: None)
+    with pytest.raises(WeixinError) as exc:
+        channel.send(USER, card())
+    assert "set-weixin" in str(exc.value)
+
+
+class TestErrorClassification:
+    """iLink 用同一个码表达两件事,分错了系统会一直重试一个永远不会好的错误。"""
+
+    def test_session_expired_is_not_retryable(self):
+        channel, _ = build({"ret": -14})
+        with pytest.raises(WeixinSessionExpired):
+            channel.send(USER, card())
+
+    def test_errcode_field_is_checked_too(self):
+        # ret 和 errcode 两个字段都可能带错误码
+        channel, _ = build({"errcode": -14, "errmsg": "session expired"})
+        with pytest.raises(WeixinSessionExpired):
+            channel.send(USER, card())
+
+    def test_minus_two_with_unknown_error_is_a_dead_session(self):
+        """-2 + unknown error 不是限频,是会话已经废了 —— 退避重试会一直失败。"""
+        channel, _ = build({"ret": -2, "errmsg": "unknown error"})
+        with pytest.raises(WeixinSessionExpired):
+            channel.send(USER, card())
+
+    def test_minus_two_with_a_real_message_is_rate_limiting(self):
+        channel, _ = build({"ret": -2, "errmsg": "frequency limit"})
+        with pytest.raises(WeixinUnavailable):
+            channel.send(USER, card())
+
+    def test_other_errors_carry_the_code(self):
+        channel, _ = build({"ret": -99, "errmsg": "something else"})
+        with pytest.raises(WeixinError) as exc:
+            channel.send(USER, card())
+        assert "-99" in str(exc.value)
+
+    def test_network_failure_does_not_leak_the_token(self):
+        channel, _ = build(httpx.ConnectError("boom"))
+        with pytest.raises(WeixinUnavailable) as exc:
+            channel.send(USER, card())
+        assert "tok-secret" not in str(exc.value)
+
+
+class TestRendering:
+    def test_plain_text_not_markdown(self):
+        """微信聊天窗口不渲染 markdown,写 ** 就是原样显示两个星号。"""
+        text, _ = render_text(card())
+        assert "**" not in text
+        assert "#" not in text
+        assert "【要做的事】" in text
+        assert "· 交房租" in text
+
+    def test_footer_is_visually_separated(self):
+        text, _ = render_text(card())
+        assert "—— 来自 34 条事件" in text
+
+    def test_empty_card_still_produces_something(self):
+        # 宁可发一句"(空)"也不要抛异常 —— 那会让当天完全没有摘要
+        text, truncated = render_text(Card(title="", summary=""))
+        assert text == "(空)"
+        assert truncated is False
+
+    def test_oversized_text_is_truncated(self):
+        big = Card(title="摘要", summary="", sections=[CardSection(lines=["很长的一行"] * 900)])
+        text, truncated = render_text(big)
+        assert truncated is True
+        assert len(text) <= MAX_TEXT_CHARS
+        assert text.endswith("已截断)")
+
+    def test_truncation_is_reported_on_the_delivery(self):
+        big = Card(title="摘要", summary="", sections=[CardSection(lines=["很长的一行"] * 900)])
+        channel, _ = build({"ret": 0})
+        assert channel.send(USER, big).truncated is True
