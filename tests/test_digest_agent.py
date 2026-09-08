@@ -203,3 +203,47 @@ class TestCard:
         result = run({"summary": "s", "items": [{"category": "todo", "text": "t", "refs": ["m1"]}]})
         card = to_card(result.output, DAY)
         assert len(card.sections) == 1
+
+
+class TestRefMatching:
+    """真跑第一天就撞上的:模型回引 Message-ID 时会去掉尖括号。
+
+    严格比对的结果是所有条目都被当成幻觉丢掉,摘要只剩一句总述 ——
+    看起来像模型不好好干活,实际是我们自己把内容扔了。
+    """
+
+    def bracketed(self):
+        return event("<abc@mail.example.com>")
+
+    def test_ref_without_angle_brackets_still_matches(self):
+        result = run(
+            {
+                "summary": "s",
+                "items": [{"category": "todo", "text": "t", "refs": ["abc@mail.example.com"]}],
+            },
+            events=[self.bracketed()],
+        )
+        assert result.output.dropped_hallucinated == 0
+        assert result.output.items[0].refs == ["<abc@mail.example.com>"]  # 还原成真实 id
+
+    def test_case_and_whitespace_are_tolerated(self):
+        result = run(
+            {
+                "summary": "s",
+                "items": [{"category": "todo", "text": "t", "refs": ["  ABC@Mail.Example.Com "]}],
+            },
+            events=[self.bracketed()],
+        )
+        assert result.output.items[0].unverified is False
+
+    def test_a_real_hallucination_is_still_dropped(self):
+        """放宽只到"明显安全"为止 —— 编出来的 id 照样要被抓住。"""
+        result = run(
+            {
+                "summary": "s",
+                "items": [{"category": "todo", "text": "编的", "refs": ["nope@example.com"]}],
+            },
+            events=[self.bracketed()],
+        )
+        assert result.output.items == []
+        assert result.output.dropped_hallucinated == 1

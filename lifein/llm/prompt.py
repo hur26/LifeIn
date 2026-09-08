@@ -131,3 +131,16 @@ def fields_sent(blocks: Sequence[ExternalBlock]) -> list[str]:
 def _attr(value: str) -> str:
     """属性值里不许出现引号和尖括号,否则能伪造出别的属性。"""
     return re.sub(r'["<>]', "", value)
+
+
+def normalize_ref(value: str) -> str:
+    """把模型回引的 id 归一化,再和素材比对。
+
+    **必须有这一步。** 邮件的 external_id 是原始 `Message-ID`,带尖括号;
+    模型回引时几乎总会把括号去掉。严格比对的结果是所有条目都被当成幻觉丢掉 ——
+    真出现过,而且表现是"摘要只剩一句总述",看起来像模型不好好干活。
+
+    只做**明显安全**的归一化:去首尾空白、去尖括号、大小写不敏感。
+    不做模糊匹配 —— 那会让真正的幻觉蒙混过关,而识别幻觉正是这个机制的目的。
+    """
+    return value.strip().strip("<>").strip().lower()

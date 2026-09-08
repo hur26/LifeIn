@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from lifein.agents.contract import OnUncertain, agent
 from lifein.llm.client import LLMBadResponse, LLMClient
-from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent
+from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent, normalize_ref
 from lifein.models.normalized import NormalizedEvent
 
 log = logging.getLogger(__name__)
@@ -138,9 +138,9 @@ def answer(payload: QaInput, *, llm: LLMClient) -> QaResult:
     if not text:
         raise QaFailed("模型没给出 answer")
 
-    known = {b.external_id for b in blocks}
+    known = {normalize_ref(b.external_id): b.external_id for b in blocks}
     refs = [str(r) for r in (parsed.get("refs") or [])]
-    valid = [r for r in refs if r in known]
+    valid = [known[key] for r in refs if (key := normalize_ref(r)) in known]
 
     grounded = bool(valid) and bool(parsed.get("confident", True))
     if not grounded:

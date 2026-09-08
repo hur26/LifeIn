@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, ValidationError
 from lifein.agents.contract import OnUncertain, agent
 from lifein.channels.base import Card, CardSection
 from lifein.llm.client import LLMBadResponse, LLMClient
-from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent
+from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent, normalize_ref
 from lifein.models.normalized import NormalizedEvent
 
 log = logging.getLogger(__name__)
@@ -127,6 +127,8 @@ def build_blocks(events: Sequence[NormalizedEvent]) -> list[ExternalBlock]:
 
 
 def _parse(payload: object, known_ids: set[str]) -> DigestOutput:
+    # 两边都归一化再比:模型回引时几乎总会把 Message-ID 的尖括号去掉
+    known = {normalize_ref(i): i for i in known_ids}
     if not isinstance(payload, dict):
         raise DigestFailed(f"模型返回的顶层不是对象:{type(payload).__name__}")
 
@@ -141,7 +143,7 @@ def _parse(payload: object, known_ids: set[str]) -> DigestOutput:
             dropped += 1
             continue
         refs = [str(r) for r in (raw.get("refs") or [])]
-        valid = [r for r in refs if r in known_ids]
+        valid = [known[key] for r in refs if (key := normalize_ref(r)) in known]
         if refs and not valid:
             # 引用了一个不存在的事件 = 模型编了一封邮件。确定的幻觉,丢掉
             log.warning("丢弃引用了未知事件的摘要条目:%s", refs)
