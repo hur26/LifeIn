@@ -724,6 +724,7 @@ SQLAlchemy / Alembic / APScheduler / PostgreSQL),但真正装进 `pyproject.toml
 | `pydantic-settings` | 环境变量加载与**启动期校验** | 见下 |
 | `httpx` | 调 OpenAI 兼容接口与企微 API | 见下 |
 | `cryptography` | 凭据字段级加密([ADR-009](#adr-009--凭据字段级加密从第一天做)) | 见下 |
+| `qrcode` | 在终端画 iLink 登录二维码([ADR-018](#adr-018--微信推送走-ilink-bot-api企微降为兜底与审批入口)) | 见下 |
 
 **三个需要说明的**
 
@@ -739,6 +740,10 @@ SQLAlchemy / Alembic / APScheduler / PostgreSQL),但真正装进 `pyproject.toml
 
 `cryptography` 提供 AES-256-GCM。选它不是选算法而是选**不自己拼装密码学** ——
 它是 Python 生态里唯一有专职维护和安全响应流程的底层库。
+
+`qrcode` 只用它的**字符画输出**,不装 Pillow。服务器上没有浏览器,
+登录链接是打不开的 —— 对自托管来说终端能画出二维码不是锦上添花。
+代码里做了 try/import 兜底:装不上就退回打印链接,不让登录整个失败。
 
 **被否决的方案**
 

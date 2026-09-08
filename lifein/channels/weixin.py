@@ -99,7 +99,7 @@ class WeixinChannel:
             response = self._http.post(
                 f"{session.base_url.rstrip('/')}/{SEND_ENDPOINT}",
                 content=body.encode(),
-                headers=_headers(session.token, body),
+                headers=build_headers(session.token, body),
             )
             response.raise_for_status()
             data = response.json()
@@ -109,7 +109,7 @@ class WeixinChannel:
         except ValueError as exc:
             raise WeixinError("iLink 返回的不是 JSON") from exc
 
-        _raise_for_errcode(data)
+        raise_for_errcode(data)
 
         return Delivery(
             channel=self.name,
@@ -162,7 +162,8 @@ def render_text(card: Card) -> tuple[str, bool]:
     return text[: MAX_TEXT_CHARS - len(TRUNCATION_NOTE)] + TRUNCATION_NOTE, True
 
 
-def _headers(token: str, body: str) -> dict[str, str]:
+def build_headers(token: str, body: str) -> dict[str, str]:
+    """iLink 要求的一组头。入站长轮询也用它,所以是公开的。"""
     # X-WECHAT-UIN 是每次请求一个随机值,不是身份标识
     uin = base64.b64encode(str(int.from_bytes(secrets.token_bytes(4), "big")).encode()).decode()
     return {
@@ -176,7 +177,8 @@ def _headers(token: str, body: str) -> dict[str, str]:
     }
 
 
-def _raise_for_errcode(data: dict) -> None:
+def raise_for_errcode(data: dict) -> None:
+    """把 iLink 的返回码翻译成异常。入站出站共用 —— 错误码表只该有一份。"""
     ret = data.get("ret")
     errcode = data.get("errcode")
     errmsg = str(data.get("errmsg") or "")

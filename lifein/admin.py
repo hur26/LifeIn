@@ -9,7 +9,8 @@
 
     python -m lifein.admin create-user --name 白杨 --wecom-userid BaiYang
     python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username me@163.com
-    python -m lifein.admin set-weixin --user <uuid> --to <iLink 对方 id>   # 微信推送(ADR-018)
+    python -m lifein.admin login-weixin --user <uuid>    # 扫码连微信(ADR-018)
+    python -m lifein.admin test-push --user <uuid>       # 真发一条，看走的哪个通道
     python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
@@ -21,13 +22,14 @@ import argparse
 import getpass
 import logging
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 
 from lifein.channels.base import Card
 from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.config import get_settings
 from lifein.db import session_scope
-from lifein.repos import credentials, users
+from lifein.repos import channel_state, credentials, users
 from lifein.sources.imap_client import ImapConfig, ImapError, ImapMailbox
 
 log = logging.getLogger("lifein.admin")
@@ -80,6 +82,110 @@ def cmd_set_imap(args: argparse.Namespace) -> int:
             settings=settings,
         )
     print("已加密写入。建议立刻跑 test-imap 确认能登录")
+    return 0
+
+
+def cmd_login_weixin(args: argparse.Namespace) -> int:
+    """扫码连微信。
+
+    **给 LifeIn 单独扫一个 bot。** 如果这个微信账号上还跑着别的 iLink 客户端
+    (比如另一个 agent),两边长轮询会互相抢消息。
+
+    扫完只拿到 token,**还不知道该把摘要推给谁** —— 推送目标要等你给 bot
+    发第一条消息才知道。所以最后会等你发一句话。
+    """
+    import httpx
+
+    from lifein.channels import weixin_inbound, weixin_login
+
+    settings = get_settings()
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+
+    def show(qr: weixin_login.QrCode) -> None:
+        print("\n请用微信扫这个二维码:")
+        print(qr.url or qr.value)
+        ascii_art = weixin_login.render_qr_ascii(qr)
+        if not ascii_art:
+            print("(装了 qrcode 包才能在终端画出来,现在只能打开上面的链接扫)")
+            return
+        try:
+            print(ascii_art)
+        except UnicodeEncodeError:
+            # 中文 Windows 的控制台默认 GBK,编不出二维码用的方块字符。
+            # 这不该让登录失败 —— 链接照样能扫
+            print("(当前终端编码画不出二维码,请扫上面的链接;")
+            print(" 想在终端里看的话:先执行 chcp 65001 切到 UTF-8)")
+
+    client = httpx.Client(timeout=40.0)
+    try:
+        result = weixin_login.login(
+            client,
+            show_qr=show,
+            on_scanned=lambda: print("已扫码,请在手机上点确认…"),
+            timeout_s=args.timeout,
+        )
+    except weixin_login.LoginFailed as exc:
+        print(f"登录失败:{exc}", file=sys.stderr)
+        return 1
+
+    print(f"\n连接成功,bot id = {result.account_id}")
+    print("现在在微信里给这个 bot 发一句话(随便什么),用来确定推送目标…")
+
+    poller = weixin_inbound.WeixinPoller(client=client)
+    sync_buf = ""
+    deadline = time.monotonic() + args.timeout
+    peer: str | None = None
+    context_token: str | None = None
+
+    while peer is None and time.monotonic() < deadline:
+        try:
+            polled = poller.poll_once(
+                base_url=result.base_url, token=result.token, sync_buf=sync_buf
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"等待消息时出错:{exc}", file=sys.stderr)
+            return 1
+        sync_buf = polled.sync_buf
+        for message in polled.messages:
+            peer = message.sender
+            context_token = message.channel_ref
+            break
+
+    if peer is None:
+        print("没等到消息。会话已建立,稍后可以用 set-weixin 手工补上推送目标", file=sys.stderr)
+        return 1
+
+    with session_scope() as session:
+        credentials.revoke_credential(args.user, session, kind="weixin")
+        payload = {
+            "token": result.token,
+            "to_user_id": peer,
+            "base_url": result.base_url,
+            "account_id": result.account_id,
+        }
+        if context_token:
+            payload["context_token"] = context_token
+        credentials.put_credential(
+            args.user,
+            session,
+            kind="weixin",
+            scope="query",
+            payload=payload,
+            settings=settings,
+        )
+        # 会话是新的,旧游标对它没有意义
+        channel_state.clear_state(
+            args.user,
+            session,
+            channel=weixin_inbound.CHANNEL,
+            key=weixin_inbound.SYNC_BUF_KEY,
+        )
+
+    print(f"已加密写入,推送目标 = {peer}")
+    print("跑 test-push 确认能发到微信")
     return 0
 
 
@@ -222,7 +328,12 @@ def build_parser() -> argparse.ArgumentParser:
     imap.add_argument("--port", type=int, default=993)
     imap.set_defaults(func=cmd_set_imap)
 
-    weixin = sub.add_parser("set-weixin", help="配微信 iLink 推送(token 交互输入)")
+    login_wx = sub.add_parser("login-weixin", help="扫码连微信(推荐)")
+    login_wx.add_argument("--user", required=True)
+    login_wx.add_argument("--timeout", type=int, default=480, help="等扫码/等消息的秒数")
+    login_wx.set_defaults(func=cmd_login_weixin)
+
+    weixin = sub.add_parser("set-weixin", help="手工填微信凭据(已有会话时用)")
     weixin.add_argument("--user", required=True)
     weixin.add_argument("--to", required=True, help="推送目标的 iLink user id")
     weixin.add_argument("--base-url", default=WEIXIN_BASE_URL)
