@@ -36,6 +36,8 @@ from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
 from lifein.jobs.plan_extract import PlanDeps
 from lifein.jobs.plan_extract import run_once as run_plan_once
+from lifein.jobs.reconcile import ReconcileDeps
+from lifein.jobs.reconcile import run_once as run_reconcile_once
 from lifein.jobs.reminders import ReminderDeps
 from lifein.jobs.reminders import run_once as run_reminders_once
 from lifein.repos import users
@@ -48,6 +50,7 @@ DIGEST_JOB_ID = "daily_digest"
 MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
 BOOKKEEPING_JOB_ID = "bookkeeping"
+RECONCILE_JOB_ID = "reconcile"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
@@ -77,6 +80,18 @@ REMINDER_INTERVAL_MINUTES = 15
 十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
 而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
 补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
+
+RECONCILE_DELAY_MINUTES = 75
+"""对账排在记账之后多久。
+
+**顺序有意义,不像另外几个。** 记账那一步可能刚把昨天的通知落成交易,
+而对账要拿对账单去匹配已有的实时记录 —— 反过来的话,昨天那几笔还没入账,
+对账单里对应的行会被判成"实时那路漏了",补成一笔新的,
+然后记账那一步再把通知记一遍,同一笔就有了两条。
+
+不靠这个顺序保证正确性(补录走 UNIQUE、回填走 matched_statement_event_id,
+两道幂等都在),但靠它避免那种"每次都要靠幂等兜住"的日常。
 """
 
 BOOKKEEPING_DELAY_MINUTES = 60
@@ -247,6 +262,36 @@ def run_bookkeeping_for_all_users(
     return recorded
 
 
+
+def run_reconcile_for_all_users(
+    services: Services,
+    *,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户对一遍账。返回回填了多少笔。
+
+    **不收 `now`。** 它处理的是"还没处理过的对账单行",而那个集合和现在
+    几点没有关系 —— 收一个用不上的时间会让人以为重跑的结果跟时间有关。
+    """
+    open_session = session_factory or session_scope
+    backfilled = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = ReconcileDeps(alerter=services.alerter)
+                result = run_reconcile_once(user_id, session, deps=deps)
+            backfilled += result.backfilled
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的对账失败", user_id)
+            services.alerter.alert("对账异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return backfilled
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -351,6 +396,7 @@ def build_scheduler(
     memory_runner: Callable[[Services], int] | None = None,
     plan_runner: Callable[[Services], int] | None = None,
     bookkeeping_runner: Callable[[Services], int] | None = None,
+    reconcile_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
@@ -360,6 +406,7 @@ def build_scheduler(
     run_memory = memory_runner or run_memory_extract_for_all_users
     run_plan = plan_runner or run_plan_extract_for_all_users
     run_bookkeeping = bookkeeping_runner or run_bookkeeping_for_all_users
+    run_reconcile = reconcile_runner or run_reconcile_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
@@ -367,6 +414,7 @@ def build_scheduler(
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
     book_hour, book_minute = _shift(hour, minute, BOOKKEEPING_DELAY_MINUTES)
+    recon_hour, recon_minute = _shift(hour, minute, RECONCILE_DELAY_MINUTES)
     retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
@@ -407,6 +455,17 @@ def build_scheduler(
         trigger=CronTrigger(hour=book_hour, minute=book_minute, timezone=services.settings.tzinfo),
         id=BOOKKEEPING_JOB_ID,
         name="记账",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_reconcile(services),
+        trigger=CronTrigger(
+            hour=recon_hour, minute=recon_minute, timezone=services.settings.tzinfo
+        ),
+        id=RECONCILE_JOB_ID,
+        name="对账回填",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,

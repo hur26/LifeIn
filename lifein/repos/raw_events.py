@@ -62,6 +62,24 @@ _SELECT_TRANSACTIONS_BETWEEN = text("""
      LIMIT :limit
 """)
 
+_SELECT_UNRECONCILED_STATEMENT_LINES = text("""
+    SELECT e.id, e.normalized, e.raw
+      FROM raw_events e
+     WHERE e.user_id = :user_id
+       AND e.normalized IS NOT NULL
+       AND e.normalized ->> 'kind' = 'transaction'
+       AND e.raw ->> 'channel' = :channel
+       -- 还没被处理过的：既没自己变成一笔交易，
+       -- 也没被回填到别人身上。这两种就是对账的全部结局
+       AND NOT EXISTS (
+           SELECT 1 FROM transactions t
+            WHERE t.user_id = e.user_id
+              AND (t.source_event_id = e.id OR t.matched_statement_event_id = e.id)
+       )
+     ORDER BY e.occurred_at
+     LIMIT :limit
+""")
+
 _COUNT_FAILED = text("""
     SELECT count(*)
       FROM raw_events
@@ -269,6 +287,44 @@ def fetch_transactions_between(
             )
         except ValueError:
             log.warning("raw_events.id=%s 的 normalized 结构已不合法,跳过", row.id)
+    return stored
+
+
+
+def fetch_unreconciled_statement_lines(
+    user_id: str,
+    session: Session,
+    *,
+    channel: str = "statement",
+    limit: int = 1000,
+) -> list[StoredEvent]:
+    """取**还没对过账的对账单行**。对账 job 用它。
+
+    它不按时间窗取，而是按“处理过没有”取 —— 这是故意的：
+    一行对账单的 `occurred_at` 是**那笔消费当时的日期**（上个月），
+    而它落地是本月的事。按时间窗取的 job 永远看不到它们。
+
+    “处理过”只有两种形态：自己变成了一笔交易（`source_event_id`），
+    或者被回填到了实时那一笔上（`matched_statement_event_id`）。
+    **这两道同时也是幂等键**，所以重跑多少次都是同一个结果。
+    """
+    rows = session.execute(
+        _SELECT_UNRECONCILED_STATEMENT_LINES,
+        {"user_id": user_id, "channel": channel, "limit": limit},
+    ).all()
+
+    stored: list[StoredEvent] = []
+    for row in rows:
+        try:
+            stored.append(
+                StoredEvent(
+                    event_id=row.id,
+                    event=NormalizedEvent.model_validate(row.normalized),
+                    raw=row.raw if isinstance(row.raw, dict) else None,
+                )
+            )
+        except ValueError:
+            log.warning("raw_events.id=%s 的 normalized 结构已不合法，跳过", row.id)
     return stored
 
 

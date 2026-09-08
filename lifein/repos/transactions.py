@@ -316,6 +316,31 @@ def record(
         # 同一条通知又送上来一次(采集器重试)。什么都不做
         return RecordResult(transaction=_to_txn(existing), created=False, duplicate=True)
 
+    params = {
+        "user_id": user_id,
+        "occurred_at": occurred_at,
+        "amount": amount,
+        "currency": currency,
+        "direction": direction.value,
+        "kind": kind.value,
+        "merchant_raw": merchant_raw,
+        "category": category,
+        "account_hint": account_hint,
+        "order_no": order_no,
+        "channel": channel,
+        "stage": stage.value,
+        "source_event_id": source_event_id,
+        "confidence": confidence,
+    }
+
+    if stage is Stage.RECONCILED:
+        # **对账补录不走跨渠道合并。** 那一路是给实时通知用的:同一笔交易被
+        # 支付宝和银行各推一条,5 分钟窗口把它们并起来。而一条对账单行走到
+        # 这里,说明对账那一遍(3 天窗口 + 只认没对过的实时记录)已经判过
+        # "它不是已有的任何一笔"——再用一个更弱的规则去推翻那个判断,
+        # 结果是把便利店连买两次同价商品里的第二笔悄悄吃掉。
+        return _insert(user_id, session, params)
+
     mergeable = session.execute(
         _FIND_MERGEABLE,
         {
@@ -353,30 +378,16 @@ def record(
             transaction=_to_txn(merged), created=False, merged_into=int(mergeable.id)
         )
 
-    row = session.execute(
-        _INSERT,
-        {
-            "user_id": user_id,
-            "occurred_at": occurred_at,
-            "amount": amount,
-            "currency": currency,
-            "direction": direction.value,
-            "kind": kind.value,
-            "merchant_raw": merchant_raw,
-            "category": category,
-            "account_hint": account_hint,
-            "order_no": order_no,
-            "channel": channel,
-            "stage": stage.value,
-            "source_event_id": source_event_id,
-            "confidence": confidence,
-        },
-    ).first()
+    return _insert(user_id, session, params)
 
+
+def _insert(user_id: str, session: Session, params: dict) -> RecordResult:
+    row = session.execute(_INSERT, params).first()
     if row is None:
         # 并发下另一个事务先插进去了。按重复处理,不抛异常
         again = session.execute(
-            _SELECT_BY_EVENT, {"user_id": user_id, "source_event_id": source_event_id}
+            _SELECT_BY_EVENT,
+            {"user_id": user_id, "source_event_id": params["source_event_id"]},
         ).one()
         return RecordResult(transaction=_to_txn(again), created=False, duplicate=True)
 

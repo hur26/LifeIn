@@ -374,3 +374,24 @@ class TestReconciliation:
         assert result.created is True
         assert result.transaction.stage is Stage.RECONCILED
         assert result.transaction.order_no == "ORD-9"
+
+    def test_a_reconciled_record_never_joins_the_five_minute_merge(self, pg_session, user_id):
+        """**对账补录不走跨渠道合并。**
+
+        跨渠道合并是给实时通知用的:同一笔被支付宝和银行各推一条。而一条
+        对账单行走到补录这一步,说明对账那一遍(3 天窗口、只认没对过的实时
+        记录)已经判过"它不是已有的任何一笔"—— 再用一个更弱的规则去推翻
+        那个判断,结果是把便利店连买两次同价商品里的第二笔悄悄吃掉。
+        """
+        a_txn(pg_session, user_id, external_id="rt-1")
+        line = an_event(pg_session, user_id, external_id="stmt-1")
+
+        result = record(
+            user_id, pg_session, occurred_at=NOW, amount=Decimal("38.50"),
+            direction=Direction.DEBIT, kind=TxnKind.EXPENSE, channel="statement",
+            source_event_id=line, confidence=1.0, account_hint="1234",
+            stage=Stage.RECONCILED,
+        )
+
+        assert result.created is True
+        assert result.merged_into is None
