@@ -62,6 +62,16 @@ _LAST_SUCCESS = text("""
 """)
 
 
+_STATS_FOR = text("""
+    SELECT stats FROM job_runs
+     WHERE user_id = :user_id
+       AND job_name = :job_name
+       AND status = 'succeeded'
+       AND to_char(window_start, 'YYYY-MM') = :period
+     ORDER BY window_start DESC
+     LIMIT 1
+""")
+
 def claim_window(
     user_id: str,
     session: Session,
@@ -109,6 +119,21 @@ def finish_window(
             "stats": json.dumps(dict(stats or {}), ensure_ascii=False, default=str),
         },
     )
+
+
+
+def stats_for(
+    user_id: str, session: Session, *, job_name: str, period: str
+) -> dict[str, Any] | None:
+    """取某个月那一次成功运行留下的 `stats`。**没跑过就是 None。**
+
+    App 的月度报表读它而不是现算(06 §6.11):现调一次模型既慢又贵,
+    而**同一个月的评语每次点开都不一样,会让人以为数字也在变**。
+    """
+    row = session.execute(
+        _STATS_FOR, {"user_id": user_id, "job_name": job_name, "period": period}
+    ).first()
+    return dict(row.stats) if row and row.stats else None
 
 
 def last_successful_window_end(user_id: str, session: Session, *, job_name: str) -> datetime | None:

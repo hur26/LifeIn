@@ -9,99 +9,18 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from lifein.api import auth
-from lifein.api.app import create_app
-from lifein.api.deps import get_app_settings, get_session, now_utc
-from lifein.bootstrap import Services, register_tools
-from lifein.config import Settings
 from lifein.repos import collector, credentials, pending, todos
-from tests.test_config import BASE
+from tests.conftest import DEVICE, NOW, bearer, signed
 
 pytestmark = pytest.mark.integration
-
-DEVICE = "pixel-7a"
-NOW = datetime(2026, 9, 8, 2, 0, 0, tzinfo=UTC)  # 北京时间 10:00
-
-
-def settings() -> Settings:
-    return Settings(_env_file=None, **BASE)
-
-
-@pytest.fixture(autouse=True)
-def tools_registered():
-    """确认待确认那条要过网关,网关要查得到 planner 的白名单。"""
-    register_tools()
-
-
-@pytest.fixture
-def secrets(pg_session, user_id) -> dict[str, str]:
-    issued = {}
-    for kind, scope in ((credentials.INGEST_KIND, "ingest"), (credentials.QUERY_KIND, "query")):
-        value = base64.b64encode(os.urandom(32)).decode()
-        credentials.put_credential(
-            user_id,
-            pg_session,
-            kind=kind,
-            scope=scope,
-            payload={"secret": value},
-            settings=settings(),
-            device_id=DEVICE,
-        )
-        issued[scope] = value
-    return issued
-
-
-@pytest.fixture
-def client(pg_session) -> TestClient:
-    app = create_app(Services(settings=None, llm=None, channel=None, alerter=None))
-    app.dependency_overrides[get_session] = lambda: pg_session
-    app.dependency_overrides[get_app_settings] = settings
-    app.dependency_overrides[now_utc] = lambda: NOW
-    return TestClient(app)
-
-
-def signed(client, path, body, *, user_id, secret, when=NOW):
-    payload = json.dumps(body).encode()
-    timestamp = str(int(when.timestamp()))
-    message = auth.signing_string(method="POST", path=path, timestamp=timestamp, body=payload)
-    return client.post(
-        path,
-        content=payload,
-        headers={
-            "Content-Type": "application/json",
-            auth.HEADER_USER: user_id,
-            auth.HEADER_DEVICE: DEVICE,
-            auth.HEADER_TIMESTAMP: timestamp,
-            auth.HEADER_SIGNATURE: hmac.new(
-                base64.b64decode(secret), message, hashlib.sha256
-            ).hexdigest(),
-        },
-    )
-
-
-@pytest.fixture
-def token(client, user_id, secrets) -> str:
-    response = signed(
-        client, "/app/token", {"device_id": DEVICE}, user_id=user_id, secret=secrets["query"]
-    )
-    assert response.status_code == 200
-    return response.json()["token"]
-
-
-def bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
 
 class TestTheIngestCredentialCannotRead:
     """R11 那句"最重要的一条",以及 P1 验收标准里的实测项。"""

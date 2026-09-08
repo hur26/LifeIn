@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,6 +79,13 @@ _SELECT_UNRECONCILED_STATEMENT_LINES = text("""
        )
      ORDER BY e.occurred_at
      LIMIT :limit
+""")
+
+_INSERT_MANUAL = text("""
+    INSERT INTO raw_events (user_id, source, external_id, occurred_at, trust, raw, normalized)
+    VALUES (:user_id, :source, :external_id, :occurred_at, 'user_input',
+            CAST(:raw AS JSONB), NULL)
+    RETURNING id
 """)
 
 _COUNT_FAILED = text("""
@@ -435,6 +443,36 @@ def fetch_refs(user_id: str, session: Session, *, event_ids: Sequence[int]) -> l
         )
         for row in rows
     ]
+
+
+
+def insert_manual_transaction(
+    user_id: str, session: Session, *, occurred_at: datetime, payload: dict
+) -> int:
+    """给手动补的那一笔造一条出处(06 §6.12)。返回 `raw_events.id`。
+
+    **它也要有出处**([铁律 5](../../AGENTS.md#1-铁律))。用户自己填的这笔账
+    不过网关(没有 agent 提它),但"这笔钱哪来的"仍然要答得上来 ——
+    答案就是这条 `trust=user_input` 的记录。
+
+    `external_id` 带一个随机后缀而不是内容摘要:**同一天在同一家店花同样的钱
+    是可能的**,按内容去重会把真实的第二笔吞掉。手动补的这条路没有重放问题
+    (用户点两次就是想记两笔),所以不需要幂等键。
+
+    `normalized` 留空:归一化骨架是给外部来源用的,而这条的字段本来就是
+    结构化的 —— 硬塞一份归一化只会多一处可能和 `transactions` 不一致的地方。
+    """
+    external_id = f"manual:{uuid.uuid4().hex[:16]}"
+    return session.execute(
+        _INSERT_MANUAL,
+        {
+            "user_id": user_id,
+            "source": "manual",
+            "external_id": external_id,
+            "occurred_at": occurred_at,
+            "raw": _json({"manual": payload}),
+        },
+    ).scalar_one()
 
 
 def count_failed(user_id: str, session: Session, *, since: datetime) -> int:

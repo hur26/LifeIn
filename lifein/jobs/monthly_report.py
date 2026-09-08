@@ -60,6 +60,11 @@ class MonthlyJobResult:
     skipped: bool = False
     no_transactions: bool = False
     notes: int = 0
+    notes_text: list[str] = field(default_factory=list)
+    """评语原文。**存进 `job_runs.stats`,App 的月度报表直接读它** ——
+    手机上点开就现调一次模型既慢又贵,而同一个月的评语每次点开都不一样,
+    会让人以为数字也在变(06 §6.11)。"""
+
     dropped_invented: int = 0
     delivered: bool = False
     error: str | None = None
@@ -69,6 +74,7 @@ class MonthlyJobResult:
         return {
             "period": self.period,
             "notes": self.notes,
+            "notes_text": list(self.notes_text),
             "dropped_invented": self.dropped_invented,
             "delivered": self.delivered,
             "no_transactions": self.no_transactions,
@@ -130,6 +136,7 @@ def _send(
 
     written = write_notes(MonthlyInput(report=report), llm=deps.llm)
     result.notes = len(written.output.notes)
+    result.notes_text = list(written.output.notes)
     result.dropped_invented = written.output.dropped_invented
 
     record_tool_call(

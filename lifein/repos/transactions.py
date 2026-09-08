@@ -258,6 +258,33 @@ _BACKFILL = text(f"""
  RETURNING {_COLUMNS}
 """)
 
+_SEARCH = text(f"""
+    SELECT {_COLUMNS} FROM transactions
+     WHERE user_id = :user_id
+       AND occurred_at >= :start AND occurred_at < :end
+       AND (CAST(:category AS TEXT) IS NULL OR category = CAST(:category AS TEXT))
+       -- 关键字只搜商户名。**不搜金额** —— 输入 38 想找那笔咖啡,
+       -- 结果连 3800 的房租一起出来,而列表看起来完全正常
+       AND (
+            CAST(:keyword AS TEXT) IS NULL
+            OR merchant_raw ILIKE '%' || CAST(:keyword AS TEXT) || '%'
+       )
+     ORDER BY occurred_at DESC
+     LIMIT :limit
+""")
+
+_SELECT_BY_ID = text(f"SELECT {_COLUMNS} FROM transactions WHERE user_id = :user_id AND id = :id")
+
+_UPDATE_FIELDS = text(f"""
+    UPDATE transactions
+       SET category = COALESCE(:category, category),
+           merchant_raw = COALESCE(:merchant_raw, merchant_raw)
+     WHERE user_id = :user_id AND id = :id
+ RETURNING {_COLUMNS}
+""")
+
+_DELETE_BY_ID = text("DELETE FROM transactions WHERE user_id = :user_id AND id = :id")
+
 @dataclass(frozen=True)
 class RecordResult:
     """写入的结果。
@@ -540,6 +567,80 @@ def backfill(
         log.info("回填未生效：交易 %s 已经对过账了", txn_id)
         return None
     return _to_txn(row)
+
+
+
+def search(
+    user_id: str,
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    category: str | None = None,
+    keyword: str | None = None,
+    limit: int = 200,
+) -> list[Transaction]:
+    """账本浏览用的查询(06 §6.11)。按时间倒序。
+
+    关键字**只搜商户名,不搜金额**:输入 38 想找那笔咖啡,连 3800 的房租
+    一起出来,而列表看起来完全正常 —— 你会以为那个月真的多花了。
+    """
+    rows = session.execute(
+        _SEARCH,
+        {
+            "user_id": user_id,
+            "start": start,
+            "end": end,
+            "category": category,
+            "keyword": keyword or None,
+            "limit": limit,
+        },
+    ).all()
+    return [_to_txn(row) for row in rows]
+
+
+def get(user_id: str, session: Session, *, txn_id: int) -> Transaction | None:
+    row = session.execute(_SELECT_BY_ID, {"user_id": user_id, "id": txn_id}).first()
+    return _to_txn(row) if row else None
+
+
+def update_fields(
+    user_id: str,
+    session: Session,
+    *,
+    txn_id: int,
+    category: str | None = None,
+    merchant_raw: str | None = None,
+) -> Transaction | None:
+    """改分类或商户。**只有这两样能改。**
+
+    金额和时间来自银行短信或对账单,是这个系统里最不该被手改的两个字段:
+    改了之后账本和银行对不上,而对不上的时候没有办法知道是谁改的。
+    记错了就删掉重记 —— 那会留下两条审计记录,而就地改什么都不留。
+    """
+    if category is not None and category not in CATEGORIES:
+        raise TransactionError(f"分类不在枚举内:{category}")
+
+    row = session.execute(
+        _UPDATE_FIELDS,
+        {
+            "user_id": user_id,
+            "id": txn_id,
+            "category": category,
+            "merchant_raw": merchant_raw,
+        },
+    ).first()
+    return _to_txn(row) if row else None
+
+
+def delete(user_id: str, session: Session, *, txn_id: int) -> bool:
+    """删一笔。**用户删的那条路** —— agent 记错的走 `undo_record()`。
+
+    两条分开是因为它们撤的东西不一样:`undo_record()` 认 `source_event_id`,
+    还要处理"当初是合并进别人的"那种情况;这一条是用户在列表里点了删除,
+    他指的就是看见的这一行。
+    """
+    return session.execute(_DELETE_BY_ID, {"user_id": user_id, "id": txn_id}).rowcount > 0
 
 
 def _to_txn(row) -> Transaction:

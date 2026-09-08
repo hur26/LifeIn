@@ -20,17 +20,32 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta
-from typing import Any
+from decimal import Decimal
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from lifein.api import auth
 from lifein.api.deps import AppCaller, NowDep, QueryDevice, SessionDep, SettingsDep
 from lifein.governance.gateway import CallContext, Gateway
 from lifein.models.normalized import Trust
-from lifein.repos import collector, credentials, entities, facts, pending, raw_events, todos, users
+from lifein.repos import (
+    budgets,
+    collector,
+    credentials,
+    entities,
+    facts,
+    job_runs,
+    merchant_rules,
+    pending,
+    raw_events,
+    reports,
+    todos,
+    transactions,
+    users,
+)
 from lifein.repos.tool_calls import PostgresAuditSink
 
 log = logging.getLogger(__name__)
@@ -39,6 +54,11 @@ router = APIRouter(prefix="/app", tags=["app"])
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+FromParam = Annotated[datetime | None, Query(alias="from")]
+"""`from` 是 Python 关键字,参数只能叫 `from_`,而 App 那边发的是 `from`。
+**别名写在类型上而不是默认值里** —— 写默认值里的话每个用到它的端点
+都要重复一遍那个 Query(...),而重复的东西迟早会有一处漏掉别名。"""
 
 TODOS_TABLE = "todos"
 """P1 唯一会写的目标表。
@@ -49,6 +69,40 @@ App 遇到不认识的 `target_table` 只展示不给确认按钮(06 §6.7),
 
 EDITABLE_FIELDS = ("title", "notes", "starts_at", "ends_at")
 """修改后确认时,客户端能改的就这几项。出处不由客户端说了算。"""
+
+
+
+class BudgetIn(BaseModel):
+    category: str | None = None
+    """不给就是总预算(06 §6.11)。"""
+
+    amount: Decimal = Field(gt=0)
+    alert_threshold: Decimal = Field(default=Decimal("0.9"), ge=Decimal("0.1"), le=Decimal("1"))
+
+
+class TxnPatchIn(BaseModel):
+    """**只有这两样能改。**
+
+    金额和时间来自银行短信或对账单,是这个系统里最不该被手改的两个字段:
+    改了之后账本和银行对不上,而对不上的时候没有办法知道是谁改的。
+    """
+
+    category: str | None = None
+    merchant_raw: str | None = None
+
+
+class ManualTxnIn(BaseModel):
+    """手动补一笔(06 §6.12)。现金和纸质票据那条长尾。"""
+
+    occurred_at: datetime
+    amount: Decimal = Field(gt=0)
+    """**正数**,方向由 `direction` 表达。"""
+
+    direction: str = "debit"
+    kind: str = "expense"
+    category: str | None = None
+    merchant_raw: str | None = None
+    note: str | None = None
 
 
 class TokenOut(BaseModel):
@@ -554,6 +608,202 @@ def _end_of_today(user_id: str, session, *, now: datetime) -> datetime:
     return local_end.astimezone(now.tzinfo or tz)
 
 
+
+# ---------- 账本、报表与预算(06 §6.11) ----------
+
+
+@router.get("/ledger/transactions")
+def list_transactions(
+    caller: AppCaller,
+    session: SessionDep,
+    now: NowDep,
+    from_: FromParam = None,
+    to: datetime | None = None,
+    category: str | None = None,
+    q: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """账目列表。默认看当月 —— **不是"最近 30 天"**:
+    月度预算按自然月切,列表和预算说的必须是同一段时间,
+    否则"这个月花了多少"会有两个不一样的答案。
+    """
+    start, end = budgets.period_bounds(now.astimezone(_tz(caller.user_id, session)))
+    items = transactions.search(
+        caller.user_id,
+        session,
+        start=from_ or start,
+        end=to or end,
+        category=category,
+        keyword=q,
+        limit=min(limit, MAX_LIMIT),
+    )
+    return {"transactions": [_txn_json(item) for item in items]}
+
+
+@router.get("/ledger/report")
+def monthly_report(
+    caller: AppCaller, session: SessionDep, now: NowDep, period: str | None = None
+) -> dict[str, Any]:
+    """月度报表。**不现算评语** —— 读 `monthly_report` job 上次跑的结果。
+
+    手机上点开就现调一次模型既慢又贵,而**同一个月的评语每次点开都不一样,
+    会让人以为数字也在变**。
+    """
+    moment = _period_start(period, now, caller.user_id, session)
+    report = reports.monthly(caller.user_id, session, now=moment)
+    return {
+        "period": report.period,
+        "total": str(report.total),
+        "count": report.count,
+        "last_total": str(report.last_total) if report.last_total is not None else None,
+        "categories": [
+            {
+                "category": line.category,
+                "total": str(line.total),
+                "count": line.count,
+                "last_total": str(line.last_total) if line.last_total is not None else None,
+            }
+            for line in report.categories
+        ],
+        "merchants": [
+            {"merchant": m.merchant, "total": str(m.total), "count": m.count}
+            for m in report.merchants
+        ],
+        "uncategorized": str(report.uncategorized),
+        "reconciled_ratio": report.reconciled_ratio,
+        "notes": _notes_for(caller.user_id, session, period=report.period),
+    }
+
+
+@router.get("/ledger/budgets")
+def list_budgets(caller: AppCaller, session: SessionDep, now: NowDep) -> dict[str, Any]:
+    items = budgets.progress(
+        caller.user_id, session, now=now.astimezone(_tz(caller.user_id, session))
+    )
+    return {
+        "budgets": [
+            {
+                "category": item.budget.category,
+                "amount": str(item.budget.amount),
+                "alert_threshold": str(item.budget.alert_threshold),
+                "spent": str(item.spent),
+                "remaining": str(item.remaining),
+                "over": item.over,
+                "near": item.near,
+            }
+            for item in items
+        ]
+    }
+
+
+@router.put("/ledger/budgets")
+def set_budget(caller: AppCaller, session: SessionDep, body: BudgetIn) -> dict[str, Any]:
+    try:
+        budget = budgets.set_budget(
+            caller.user_id,
+            session,
+            amount=body.amount,
+            category=body.category,
+            alert_threshold=body.alert_threshold,
+        )
+    except budgets.BudgetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "category": budget.category,
+        "amount": str(budget.amount),
+        "alert_threshold": str(budget.alert_threshold),
+    }
+
+
+@router.delete("/ledger/budgets")
+def delete_budget(
+    caller: AppCaller, session: SessionDep, category: str | None = None
+) -> dict[str, Any]:
+    """删一条预算。**删了就不再预警**,而不是把额度设成很大 ——
+    后者会在报表上留下一条永远用不满的假预算。"""
+    return {"deleted": budgets.delete_budget(caller.user_id, session, category=category)}
+
+
+@router.patch("/ledger/transactions/{txn_id}")
+def patch_transaction(
+    caller: AppCaller, session: SessionDep, txn_id: int, body: TxnPatchIn
+) -> dict[str, Any]:
+    """改分类或商户。**改分类会写回 `merchant_rules`,`created_by='user'`。**
+
+    用户改一次,以后这个商户就一直归到那一类(ADR-008),而且模型不能再改回去。
+    这是规则表最有价值的一条入口 —— 比模型自己沉淀的那些准得多。
+    """
+    try:
+        after = transactions.update_fields(
+            caller.user_id,
+            session,
+            txn_id=txn_id,
+            category=body.category,
+            merchant_raw=body.merchant_raw,
+        )
+    except transactions.TransactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if after is None:
+        raise HTTPException(status_code=404, detail="没有这一笔")
+
+    if body.category and after.merchant_raw:
+        merchant_rules.remember(
+            caller.user_id,
+            session,
+            merchant=after.merchant_raw,
+            category=body.category,
+            created_by=merchant_rules.CreatedBy.USER,
+        )
+    return _txn_json(after)
+
+
+@router.delete("/ledger/transactions/{txn_id}")
+def delete_transaction(caller: AppCaller, session: SessionDep, txn_id: int) -> dict[str, Any]:
+    """删一笔记错的。**删而不是标记作废**:这一行是派生的,源事件还在。"""
+    if not transactions.delete(caller.user_id, session, txn_id=txn_id):
+        raise HTTPException(status_code=404, detail="没有这一笔")
+    return {"deleted": True}
+
+
+@router.post("/ledger/transactions")
+def create_transaction(
+    caller: AppCaller, session: SessionDep, body: ManualTxnIn
+) -> dict[str, Any]:
+    """手动补一笔(06 §6.12)。**不过网关** —— 判据是"谁提的"。
+
+    用户自己填的金额和商户不需要 agent 的审计链,也没有什么可回滚的:
+    他填错了自己就会改。但**它仍然要有出处**(铁律 5)——
+    先落一条 `trust=user_input` 的 `raw_events`,那是这笔账的来源。
+    """
+    if body.occurred_at.tzinfo is None:
+        raise HTTPException(status_code=422, detail="occurred_at 必须带时区")
+
+    event_id = raw_events.insert_manual_transaction(
+        caller.user_id,
+        session,
+        occurred_at=body.occurred_at,
+        payload=body.model_dump(mode="json"),
+    )
+    try:
+        result = transactions.record(
+            caller.user_id,
+            session,
+            occurred_at=body.occurred_at,
+            amount=body.amount,
+            direction=transactions.Direction(body.direction),
+            kind=transactions.TxnKind(body.kind),
+            channel=MANUAL_CHANNEL,
+            source_event_id=event_id,
+            # 用户自己填的,没有什么可推断的
+            confidence=1.0,
+            merchant_raw=body.merchant_raw,
+            category=body.category,
+        )
+    except (transactions.TransactionError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _txn_json(result.transaction)
+
+
 def _todo_json(item: todos.Todo) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -609,6 +859,70 @@ def _rule_json(rule: collector.WhitelistRule) -> dict[str, Any]:
         "enabled": rule.enabled,
         "phase": rule.phase,
     }
+
+
+
+MANUAL_CHANNEL = "manual"
+"""手动补的那些记在这个 channel 上。**和实时通道分开** ——
+覆盖率统计要能看出"实时那一路采到了多少",而手动补的不该算进分母。"""
+
+
+def _txn_json(item: transactions.Transaction) -> dict[str, Any]:
+    """**金额一律是字符串。** JSON 的 number 是双精度浮点,`38.50` 传过去
+    可能变成 `38.499999999999996`,而账本上出现那个数字比出现一笔错账
+    更让人不信任(06 §6.11)。"""
+    return {
+        "id": item.id,
+        "occurred_at": _iso(item.occurred_at),
+        "amount": str(item.amount),
+        "currency": item.currency,
+        "direction": item.direction.value,
+        "kind": item.kind.value,
+        "merchant_raw": item.merchant_raw,
+        "category": item.category,
+        "account_hint": item.account_hint,
+        "order_no": item.order_no,
+        "channel": item.channel,
+        "stage": item.stage.value,
+        "counts_as_spending": item.counts_as_spending,
+    }
+
+
+def _notes_for(user_id: str, session: Any, *, period: str) -> list[str]:
+    """那个月的评语。**取 job 跑过的结果,不现算**(06 §6.11)。
+
+    还没跑过就返回空列表 —— 报表照样能看,只是没有那两句话。
+    空列表比现调一次模型好:数字是准的,而评语可以晚一点有。
+    """
+    stats = job_runs.stats_for(user_id, session, job_name="monthly_report", period=period)
+    notes = (stats or {}).get("notes_text")
+    return list(notes) if isinstance(notes, list) else []
+
+
+def _tz(user_id: str, session: Any) -> ZoneInfo:
+    """这个人的时区。**月度的一切都按它切** —— 一笔 8 月 31 日晚上的消费
+    在 UTC 已经是 9 月 1 日,按 UTC 切会让两个月的数字都错。"""
+    user = users.get_user(user_id, session)
+    return ZoneInfo(user.tz) if user else ZoneInfo("Asia/Shanghai")
+
+
+def _period_start(period: str | None, now: datetime, user_id: str, session: Any) -> datetime:
+    """`period=2026-08` → 那个月里的某一天。不给就是上个月 ——
+    **月报默认看上个月**,因为这个月还没过完,看它只会看到一个半截的数。
+    """
+    tz = _tz(user_id, session)
+    if period:
+        try:
+            year, month = (int(part) for part in period.split("-", 1))
+            return datetime(year, month, 15, 12, 0, tzinfo=tz)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"period 要写成 2026-08:{period}"
+            ) from exc
+
+    local = now.astimezone(tz)
+    first = local.replace(day=1, hour=12, minute=0, second=0, microsecond=0)
+    return first - timedelta(days=1)
 
 
 def _iso(moment: datetime | None) -> str | None:
