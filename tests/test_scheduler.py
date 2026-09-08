@@ -22,6 +22,7 @@ from lifein.bootstrap import Services
 from lifein.config import Settings
 from lifein.repos import users
 from lifein.scheduler import (
+    BOOKKEEPING_JOB_ID,
     DIGEST_JOB_ID,
     MEMORY_JOB_ID,
     PLAN_JOB_ID,
@@ -87,23 +88,29 @@ class TestSchedulerShape:
         fields = {f.name: str(f) for f in scheduler.get_job(MEMORY_JOB_ID).trigger.fields}
         assert (fields["hour"], fields["minute"]) == ("0", "15")
 
-    def test_three_jobs_are_staggered(self):
-        """三个 job 错开:它们之间没有依赖,错开只是为了不在同一分钟里
-        同时打三次外部模型接口。"""
+    def test_the_model_jobs_are_staggered(self):
+        """几个 job 错开:它们之间没有依赖,错开只是为了不在同一分钟里
+        同时打几次外部模型接口。
+
+        记账排在最后是另一个理由:一天里最后几笔消费常常发生在晚上,
+        早跑一刻钟的代价是那几笔要等到明天才入账。
+        """
         scheduler = build_scheduler(
             services(daily_digest_at="08:00"),
             runner=lambda _s: 0,
             memory_runner=lambda _s: 0,
             plan_runner=lambda _s: 0,
+            bookkeeping_runner=lambda _s: 0,
         )
         times = {}
-        for job_id in (DIGEST_JOB_ID, MEMORY_JOB_ID, PLAN_JOB_ID):
+        for job_id in (DIGEST_JOB_ID, MEMORY_JOB_ID, PLAN_JOB_ID, BOOKKEEPING_JOB_ID):
             fields = {f.name: str(f) for f in scheduler.get_job(job_id).trigger.fields}
             times[job_id] = (fields["hour"], fields["minute"])
 
         assert times[DIGEST_JOB_ID] == ("8", "0")
         assert times[MEMORY_JOB_ID] == ("8", "30")
         assert times[PLAN_JOB_ID] == ("8", "45")
+        assert times[BOOKKEEPING_JOB_ID] == ("9", "0")
 
     def test_scheduler_is_not_started_by_the_builder(self):
         # 由调用方决定什么时候起 —— 测试里不该有后台线程

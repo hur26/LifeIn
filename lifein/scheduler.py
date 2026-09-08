@@ -27,6 +27,8 @@ from sqlalchemy.orm import Session
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
 from lifein.db import session_scope
 from lifein.jobs import notification_retention
+from lifein.jobs.bookkeeping import BookkeepingDeps
+from lifein.jobs.bookkeeping import run_once as run_bookkeeping_once
 from lifein.jobs.collector_watch import WatchDeps
 from lifein.jobs.collector_watch import run_once as run_watch_once
 from lifein.jobs.daily_digest import DigestDeps, run_once
@@ -45,6 +47,7 @@ log = logging.getLogger(__name__)
 DIGEST_JOB_ID = "daily_digest"
 MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
+BOOKKEEPING_JOB_ID = "bookkeeping"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
@@ -74,6 +77,16 @@ REMINDER_INTERVAL_MINUTES = 15
 十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
 而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
 补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
+
+BOOKKEEPING_DELAY_MINUTES = 60
+"""记账排在摘要之后多久。
+
+排在最后面,和别的 job 一样只是为了不在同一分钟里打几次模型接口。
+**但它比另外两个更该往后放**:一天里最后几笔消费常常发生在晚上,
+而早跑一刻钟的代价是那几笔要等到明天才入账,月底那几天尤其明显。
+
+它照样认领窗口,所以真错过了下一次会补上 —— 往后放不会漏,只会晚。
 """
 
 PLAN_DELAY_MINUTES = 45
@@ -201,6 +214,39 @@ def run_plan_extract_for_all_users(
     return created
 
 
+
+def run_bookkeeping_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户记一遍账。返回**真的新增了多少笔**。
+
+    合并进已有那笔的不算,进待确认的也不算 —— 前者账本上没多出东西,
+    后者还没发生。返回一个偏大的数会让"记账在干活"这件事看起来比实际好,
+    而这个 job 恰恰是最不该被高估的那个(03 的验收标准是误记率 = 0)。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    recorded = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = BookkeepingDeps(llm=services.llm, alerter=services.alerter)
+                results = run_bookkeeping_once(user_id, session, deps=deps, now=moment)
+            recorded += sum(r.recorded for r in results)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的记账失败", user_id)
+            services.alerter.alert("记账异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return recorded
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -304,6 +350,7 @@ def build_scheduler(
     runner: Callable[[Services], int] | None = None,
     memory_runner: Callable[[Services], int] | None = None,
     plan_runner: Callable[[Services], int] | None = None,
+    bookkeeping_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
@@ -312,12 +359,14 @@ def build_scheduler(
     run = runner or run_digest_for_all_users
     run_memory = memory_runner or run_memory_extract_for_all_users
     run_plan = plan_runner or run_plan_extract_for_all_users
+    run_bookkeeping = bookkeeping_runner or run_bookkeeping_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
+    book_hour, book_minute = _shift(hour, minute, BOOKKEEPING_DELAY_MINUTES)
     retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
@@ -349,6 +398,15 @@ def build_scheduler(
         trigger=CronTrigger(hour=plan_hour, minute=plan_minute, timezone=services.settings.tzinfo),
         id=PLAN_JOB_ID,
         name="日程与待办提取",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_bookkeeping(services),
+        trigger=CronTrigger(hour=book_hour, minute=book_minute, timezone=services.settings.tzinfo),
+        id=BOOKKEEPING_JOB_ID,
+        name="记账",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
