@@ -115,6 +115,26 @@ class Settings(BaseSettings):
             raise ValueError(f"MASTER_KEY 解码后应为 32 字节(AES-256),实际 {len(decoded)}")
         return v
 
+    @field_validator("database_url", "llm_base_url", "llm_model", "tz")
+    @classmethod
+    def _not_blank(cls, v: str, info) -> str:
+        """必填项不许是空字符串。
+
+        `.env` 里写 `LLM_API_KEY=` 是最常见的"以为填了其实没填" —— 而 Pydantic
+        认为空字符串是一个合法的 str,于是进程照常启动,直到当晚推摘要时才炸。
+        这个校验就是把那一刻提前到启动。
+        """
+        if not v.strip():
+            raise ValueError(f"{info.field_name.upper()} 是空的,不能只写等号")
+        return v.strip()
+
+    @field_validator("llm_api_key")
+    @classmethod
+    def _secret_not_blank(cls, v: SecretStr, info) -> SecretStr:
+        if not v.get_secret_value().strip():
+            raise ValueError(f"{info.field_name.upper()} 是空的,不能只写等号")
+        return v
+
     @field_validator("daily_digest_at")
     @classmethod
     def _check_digest_at(cls, v: str) -> str:

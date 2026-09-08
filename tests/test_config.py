@@ -100,3 +100,26 @@ class TestWecomOptional:
         half = {**WITH_WECOM}
         del half["wecom_callback_aes_key"]
         assert Settings(_env_file=None, **half).wecom_enabled is False
+
+
+class TestBlankValuesAreNotConfigured:
+    """`.env` 里写 `LLM_API_KEY=` 是最常见的"以为填了其实没填"。
+
+    Pydantic 认为空字符串是合法的 str,于是进程照常启动,直到当晚推摘要时
+    才炸 —— 而那时候你已经睡了。这组用例把那一刻钉在启动。
+    """
+
+    @pytest.mark.parametrize("field", ["database_url", "llm_base_url", "llm_model", "tz"])
+    def test_blank_required_string_is_rejected(self, field):
+        with pytest.raises(ValidationError) as exc:
+            build(**{field: "   "})
+        assert field.upper() in str(exc.value)
+
+    def test_blank_secret_is_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            build(llm_api_key="")
+        assert "LLM_API_KEY" in str(exc.value)
+
+    def test_values_are_stripped(self):
+        # 复制粘贴很容易带上尾随空格,而那会让 URL 拼出来是错的
+        assert build(llm_base_url="  https://x/v1  ").llm_base_url == "https://x/v1"
