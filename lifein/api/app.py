@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
 
-from lifein.api import ingest
+from lifein.api import ingest, query
 from lifein.api.deps import AuthRejected
 from lifein.bootstrap import Services, build_services
 from lifein.channels.wecom_callback import CallbackRejected
@@ -80,6 +80,7 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     )
     app.state.services = resolved
     app.include_router(ingest.router)
+    app.include_router(query.router)
 
     @app.exception_handler(AuthRejected)
     def _auth_rejected(_request: Request, exc: AuthRejected) -> Response:

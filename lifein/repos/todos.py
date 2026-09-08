@@ -113,6 +113,22 @@ _LIST_OPEN = text(f"""
      LIMIT :limit
 """)
 
+_CLEAR_DEVICE_REF = text("""
+    UPDATE todos
+       SET device_ref = NULL, synced_at = NULL, updated_at = now()
+     WHERE user_id = :user_id AND id = :todo_id
+""")
+
+_LIST_TO_DELETE = text(f"""
+    SELECT {_COLUMNS}
+      FROM todos
+     WHERE user_id = :user_id
+       AND status = 'cancelled'
+       AND device_ref IS NOT NULL
+     ORDER BY updated_at
+     LIMIT :limit
+""")
+
 _LIST_UNSYNCED = text(f"""
     SELECT {_COLUMNS}
       FROM todos
@@ -222,6 +238,28 @@ def unsynced_schedules(user_id: str, session: Session, *, limit: int = 50) -> li
     """
     rows = session.execute(_LIST_UNSYNCED, {"user_id": user_id, "limit": limit}).all()
     return [_to_todo(row) for row in rows]
+
+
+def cancelled_on_device(user_id: str, session: Session, *, limit: int = 50) -> list[Todo]:
+    """已经撤销、但设备上那条日历事件还在的。**撤销只完成了一半**(tools/todo.py)。
+
+    另一半在设备上:App 下次同步时按这个列表去删。列表长期不空,
+    说明手机很久没上线 —— 那时日历里留着一条已经取消的会,比没写进去更糟。
+    """
+    rows = session.execute(_LIST_TO_DELETE, {"user_id": user_id, "limit": limit}).all()
+    return [_to_todo(row) for row in rows]
+
+
+def clear_device_ref(user_id: str, session: Session, *, todo_id: str) -> bool:
+    """设备回报:日历里那条已经删掉了。
+
+    清空之后这条自然掉出 `cancelled_on_device`,不会被反复要求删除。
+    **审计里那条 `rollback_info` 仍然留着 event id**,所以"设备上曾经有过
+    一条"照样查得出来 —— 这里清掉的是"现在还有",不是"曾经有过"。
+    """
+    return session.execute(
+        _CLEAR_DEVICE_REF, {"user_id": user_id, "todo_id": todo_id}
+    ).rowcount > 0
 
 
 def _to_todo(row) -> Todo:
