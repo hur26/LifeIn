@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
 
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
@@ -30,6 +31,8 @@ from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
 from lifein.jobs.plan_extract import PlanDeps
 from lifein.jobs.plan_extract import run_once as run_plan_once
+from lifein.jobs.reminders import ReminderDeps
+from lifein.jobs.reminders import run_once as run_reminders_once
 from lifein.repos import users
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -39,6 +42,18 @@ log = logging.getLogger(__name__)
 DIGEST_JOB_ID = "daily_digest"
 MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
+REMINDER_JOB_ID = "reminders"
+
+REMINDER_INTERVAL_MINUTES = 15
+"""提醒扫描的间隔。
+
+**这个 job 和别的三个不一样:它按间隔跑,不按每天一次。** 提醒是有时效的,
+"日程前半小时"这件事一天扫一次根本赶不上。
+
+十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
+而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
+补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
 
 PLAN_DELAY_MINUTES = 45
 """日程提取排在摘要之后多久。
@@ -165,17 +180,48 @@ def run_plan_extract_for_all_users(
     return created
 
 
+def run_reminders_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """跑一遍主动提醒规则。返回真的推出去的条数。
+
+    大部分时候返回 0 —— 规则默认在影子模式,而影子记录不算推送。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    pushed = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = ReminderDeps(channel=services.channel, alerter=services.alerter)
+                pushed += run_reminders_once(user_id, session, deps=deps, now=moment).pushed
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的提醒任务失败", user_id)
+            services.alerter.alert("提醒任务异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return pushed
+
+
 def build_scheduler(
     services: Services,
     *,
     runner: Callable[[Services], int] | None = None,
     memory_runner: Callable[[Services], int] | None = None,
     plan_runner: Callable[[Services], int] | None = None,
+    reminder_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
     run_memory = memory_runner or run_memory_extract_for_all_users
     run_plan = plan_runner or run_plan_extract_for_all_users
+    run_reminders = reminder_runner or run_reminders_for_all_users
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
@@ -212,6 +258,16 @@ def build_scheduler(
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_reminders(services),
+        trigger=IntervalTrigger(minutes=REMINDER_INTERVAL_MINUTES),
+        id=REMINDER_JOB_ID,
+        name="主动提醒",
+        coalesce=True,
+        max_instances=1,
+        # 错过五分钟以上就不补了:一条晚了半小时的"快到点了"只会让人困惑
+        misfire_grace_time=300,
     )
     return scheduler
 

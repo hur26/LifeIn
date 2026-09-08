@@ -574,6 +574,33 @@ event id,那个 id 就是 L2 的回滚信息(`tool_calls.rollback_info` 里存�
 
 ---
 
+### 2.12 rule_state · 主动规则的开关
+
+P1 新增。[架构 §4](02-architecture.md#4-触发方式) 要求"每条主动规则有
+`mode ∈ {shadow, active}`",[产品定义 §5](01-product-spec.md#5-主动性双模式)
+要求"每条主动推送都要能一键关闭该类规则"。这张表就是那两句话的落点。
+
+```sql
+CREATE TABLE rule_state (
+    user_id    UUID NOT NULL,
+    rule_id    TEXT NOT NULL,
+    mode       TEXT NOT NULL DEFAULT 'shadow',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, rule_id),
+    CONSTRAINT rule_state_mode_known CHECK (mode IN ('shadow', 'active', 'off'))
+);
+```
+
+**没有记录就是 `shadow`。** 这一条比表结构本身重要:新加一条规则时,
+不写这张表它就只会记录、不会推送 —— **忘记配置的后果是安静,不是打扰**。
+反过来设计(默认 active)的话,某天有人加了条规则忘了说,用户第二天就被吵到,
+而 [R4](05-risks.md#r4--主动推送误报摧毁信任) 说误报两次就足够让人关掉通知。
+
+`off` 是用户主动关掉的那一档,和"还在观察期"的 `shadow` 分开:
+前者不该再被自动转成 active,后者迟早要转。
+
+---
+
 ## 3. 索引与迁移约定
 
 - **每张表的第一个索引都以 `user_id` 开头。** 租户隔离靠数据访问层强制,
