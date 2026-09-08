@@ -32,7 +32,7 @@ from lifein.models.normalized import (
     PartyRole,
     Trust,
 )
-from lifein.repos import facts, raw_events
+from lifein.repos import embeddings, facts, raw_events
 from lifein.repos.entities import AliasType, EntityKind, resolve_or_create
 from lifein.sources.base import IngestedEvent
 
@@ -324,3 +324,99 @@ def test_memory_is_isolated_per_user(pg_session, user_id, gateway):
 
     result = gateway.call(ctx(pg_session, other), "memory.recent_events_with", {"name": "张三"})
     assert result["entity"] is None
+
+
+# ---------- 向量召回(第 5 片) ----------
+
+DIM = 1024
+EMB_MODEL = "emb-v1"
+
+
+def vec(position: int) -> list[float]:
+    v = [0.0] * DIM
+    v[position] = 1.0
+    return v
+
+
+def seed_fact(pg_session, user_id: str, statement: str, *, position: int | None = None):
+    created = facts.add_fact(
+        user_id,
+        pg_session,
+        statement=statement,
+        provenance=[1],
+        confidence=0.5,
+        trust=Trust.EXTERNAL,
+        created_by_agent="memory",
+        valid_from=NOW - timedelta(days=1),
+    ).fact
+    if position is not None:
+        embeddings.upsert(
+            user_id,
+            pg_session,
+            ref_type=embeddings.RefType.FACT,
+            ref_id=created.id,
+            embedding=vec(position),
+            model=EMB_MODEL,
+        )
+    return created
+
+
+def test_vector_recall_finds_what_the_words_miss(pg_session, user_id, gateway):
+    """"上次那个报销的事" —— 用户的说法和事实的措辞对不上。
+
+    字面检索在这里必然落空,向量补的就是这一段(ADR-019)。
+    """
+    seed_fact(pg_session, user_id, "张三负责差旅费用审批", position=0)
+
+    result = gateway.call(
+        ctx(pg_session, user_id),
+        "memory.recall_facts",
+        {"query": "报销", "query_embedding": vec(0), "embedding_model": EMB_MODEL},
+    )
+    assert [r["statement"] for r in result] == ["张三负责差旅费用审批"]
+
+
+def test_vector_hits_come_before_literal_ones(pg_session, user_id, gateway):
+    # 超出 limit 被切掉时,该先保住"意思像的"而不是"字面撞上的"
+    seed_fact(pg_session, user_id, "张三负责差旅费用审批", position=0)
+    seed_fact(pg_session, user_id, "报销单要贴发票")
+
+    result = gateway.call(
+        ctx(pg_session, user_id),
+        "memory.recall_facts",
+        {"query": "报销", "query_embedding": vec(0), "embedding_model": EMB_MODEL},
+    )
+    assert [r["statement"] for r in result] == ["张三负责差旅费用审批", "报销单要贴发票"]
+
+
+def test_the_same_fact_is_not_returned_twice(pg_session, user_id, gateway):
+    # 向量和字面都命中同一条时,重复送进 prompt 会让模型觉得它更重要
+    seed_fact(pg_session, user_id, "报销单要贴发票", position=0)
+
+    result = gateway.call(
+        pg_session and ctx(pg_session, user_id),
+        "memory.recall_facts",
+        {"query": "报销", "query_embedding": vec(0), "embedding_model": EMB_MODEL},
+    )
+    assert len(result) == 1
+
+
+def test_negated_fact_is_not_recalled_even_with_a_vector(pg_session, user_id, gateway):
+    """向量不随否定动作删,所以过滤只有一个地方靠得住:取正文那一步。"""
+    gone = seed_fact(pg_session, user_id, "张三下周离职", position=0)
+    facts.negate_fact(user_id, pg_session, fact_id=gone.id)
+
+    result = gateway.call(
+        ctx(pg_session, user_id),
+        "memory.recall_facts",
+        {"query": "离职", "query_embedding": vec(0), "embedding_model": EMB_MODEL},
+    )
+    assert result == []
+
+
+def test_without_a_vector_it_falls_back_to_literal_search(pg_session, user_id, gateway):
+    # 没配 EMBEDDING_MODEL 的部署走的就是这条路
+    seed_fact(pg_session, user_id, "报销单要贴发票")
+
+    result = gateway.call(ctx(pg_session, user_id), "memory.recall_facts", {"query": "报销"})
+    assert [r["statement"] for r in result] == ["报销单要贴发票"]

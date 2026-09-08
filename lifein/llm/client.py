@@ -78,6 +78,8 @@ class LLMClient:
         max_retries: int = 2,
         price_prompt_per_1k: Decimal = Decimal(0),
         price_completion_per_1k: Decimal = Decimal(0),
+        embedding_model: str | None = None,
+        embedding_dim: int = 1024,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -87,8 +89,24 @@ class LLMClient:
         self._max_retries = max_retries
         self._price_prompt = price_prompt_per_1k
         self._price_completion = price_completion_per_1k
+        self._embedding_model = embedding_model
+        self._embedding_dim = embedding_dim
         self._sleep = sleep
         self._http = client or httpx.Client(timeout=timeout_s)
+
+    @property
+    def embeddings_enabled(self) -> bool:
+        """没配 `EMBEDDING_MODEL` 就是不启用向量召回(ADR-019)。
+
+        字面检索照常工作 —— 记忆层不该因为少配一项而整个不可用。
+        """
+        return bool(self._embedding_model)
+
+    @property
+    def embedding_model(self) -> str:
+        if not self._embedding_model:
+            raise LLMError("没有配 EMBEDDING_MODEL,不该走到这里")
+        return self._embedding_model
 
     def chat(
         self,
@@ -122,6 +140,39 @@ class LLMClient:
             completion_tokens=completion_tokens,
             cost_cny=self._cost(prompt_tokens, completion_tokens),
         )
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """把一批文本变成向量。和 `chat` 共用同一个端点与重试逻辑(ADR-019)。
+
+        **维度不对当场炸。** `VECTOR(1024)` 是建表时定死的,拿一个 1536 维的
+        模型写进去会被库拒掉 —— 但那个错发生在半夜的抽取任务里,报错是一句
+        英文类型错误。在这里比一次,信息里说得清是哪个模型、差多少。
+
+        批量发一次而不是逐条:embedding 接口本来就收数组,逐条发等于把
+        往返次数乘以条数,而记忆抽取一晚上有几十条。
+        """
+        if not texts:
+            return []
+
+        data = self._post_with_retry(
+            "/embeddings", {"model": self.embedding_model, "input": list(texts)}
+        )
+        try:
+            items = sorted(data["data"], key=lambda item: item.get("index", 0))
+            vectors = [[float(x) for x in item["embedding"]] for item in items]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LLMBadResponse(f"embedding 响应结构不对:{str(data)[:200]}") from exc
+
+        if len(vectors) != len(texts):
+            raise LLMBadResponse(f"要了 {len(texts)} 条向量,回来 {len(vectors)} 条")
+        for vector in vectors:
+            if len(vector) != self._embedding_dim:
+                raise LLMBadResponse(
+                    f"模型 {self._embedding_model} 返回 {len(vector)} 维,"
+                    f"而库里建的是 {self._embedding_dim} 维。"
+                    f"换模型要同时改 EMBEDDING_DIM 并重算全部向量(06 §2.4)"
+                )
+        return vectors
 
     # ---------- 内部 ----------
 

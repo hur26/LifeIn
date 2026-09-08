@@ -28,7 +28,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from lifein.governance.registry import ToolContext, ToolLevel, tool
-from lifein.repos import entities, facts, raw_events
+from lifein.repos import embeddings, entities, facts, raw_events
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,17 @@ class RecallFactsArgs(BaseModel):
     """留空就是"把当前成立的事实都给我",用于"我这周答应了谁什么事"这类问题。"""
 
     limit: int = Field(default=MAX_FACTS, ge=1, le=MAX_FACTS)
+
+    query_embedding: list[float] | None = None
+    """问句的向量。**给了就先做模糊召回**,没给就只有字面检索(ADR-019)。
+
+    向量由调用方算 —— 算它要 LLM 客户端,而工具只拿得到 user_id 和 session。
+    这不是权宜:工具能自己调外部服务的话,"这次调用花了多少钱"就再也说不清了。
+    """
+
+    embedding_model: str | None = None
+    """算这个向量用的模型。**必须和向量一起给**:不同模型的向量之间比距离
+    会得到一个看起来正常、实际无意义的数(06 §2.4)。"""
 
 
 def _need_session(ctx: ToolContext) -> None:
@@ -142,6 +153,36 @@ def recent_events_with(args: RecentEventsArgs, ctx: ToolContext) -> dict[str, An
     }
 
 
+def _similar_facts(args: RecallFactsArgs, ctx: ToolContext, *, at: datetime) -> list:
+    """向量召回。**任何一步缺席都安静地返回空** —— 退回字面检索(ADR-019)。
+
+    缺席的形态:没配 EMBEDDING_MODEL、这次没算出向量、库里还一条向量都没有。
+    它们都不是故障,只是这次答得浅一点。
+    """
+    if not args.query_embedding or not args.embedding_model:
+        return []
+
+    hits = embeddings.search(
+        ctx.user_id,
+        ctx.session,
+        query_embedding=args.query_embedding,
+        model=args.embedding_model,
+        ref_type=embeddings.RefType.FACT,
+        limit=args.limit,
+    )
+    if not hits:
+        return []
+
+    by_id = {
+        f.id: f
+        for f in facts.get_facts_by_ids(
+            ctx.user_id, ctx.session, fact_ids=[h.ref_id for h in hits], at=at
+        )
+    }
+    # 保持向量给出的顺序:越靠前越像。get_facts_by_ids 的返回顺序是库说了算的
+    return [by_id[h.ref_id] for h in hits if h.ref_id in by_id]
+
+
 @tool(
     name="memory.recall_facts",
     level=ToolLevel.L1,
@@ -156,12 +197,21 @@ def recall_facts(args: RecallFactsArgs, ctx: ToolContext) -> list[dict[str, Any]
     """
     _need_session(ctx)
     now = datetime.now(UTC)
+
+    found = _similar_facts(args, ctx, at=now)
+    seen = {f.id for f in found}
+
     if args.query.strip():
-        found = facts.search_facts(
+        literal = facts.search_facts(
             ctx.user_id, ctx.session, query=args.query, at=now, limit=args.limit
         )
     else:
-        found = facts.list_active_facts(ctx.user_id, ctx.session, at=now, limit=args.limit)
+        literal = facts.list_active_facts(ctx.user_id, ctx.session, at=now, limit=args.limit)
+
+    # 向量召回在前、字面在后:前者是"意思像的",后者是"字面撞上的",
+    # 而超出 limit 被切掉时该先保住前者
+    found.extend(f for f in literal if f.id not in seen)
+    found = found[: args.limit]
 
     return [
         {

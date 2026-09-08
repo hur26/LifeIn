@@ -274,6 +274,34 @@ def expire_fact(user_id: str, session: Session, *, fact_id: str, valid_until: da
     return result.rowcount > 0
 
 
+_SELECT_MANY = text("""
+    SELECT id, statement, provenance, confidence, confirmed_by_user, negated_by_user,
+           valid_from, valid_until, created_by_agent
+      FROM facts
+     WHERE user_id = :user_id
+       AND id = ANY(CAST(:fact_ids AS uuid[]))
+       AND negated_by_user = false
+       AND valid_from <= :at
+       AND (valid_until IS NULL OR valid_until > :at)
+""")
+
+
+def get_facts_by_ids(
+    user_id: str, session: Session, *, fact_ids: Sequence[str], at: datetime
+) -> list[Fact]:
+    """按 id 批量取当前成立的事实。向量召回拿到的是 id,回填正文用它。
+
+    照样过一遍"没被否定、还在有效期内":向量索引里可能留着一条昨天被否定的
+    事实的向量(索引不随否定动作删),**过滤只有一个地方靠得住,就是这里**。
+    """
+    if not fact_ids:
+        return []
+    rows = session.execute(
+        _SELECT_MANY, {"user_id": user_id, "fact_ids": list(fact_ids), "at": at}
+    ).all()
+    return [_to_fact(row) for row in rows]
+
+
 def get_fact(user_id: str, session: Session, *, fact_id: str) -> Fact | None:
     row = session.execute(_SELECT_ONE, {"user_id": user_id, "fact_id": fact_id}).first()
     return _to_fact(row) if row else None

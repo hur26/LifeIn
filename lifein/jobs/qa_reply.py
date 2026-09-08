@@ -231,7 +231,11 @@ def _recall(
         found = gateway.call(
             ctx,
             "memory.recall_facts",
-            {"query": plan.keywords[0] if plan.keywords else "", "limit": MAX_RECALLED_FACTS},
+            {
+                "query": plan.keywords[0] if plan.keywords else "",
+                "limit": MAX_RECALLED_FACTS,
+                **_embedding_args(deps, question),
+            },
         )
         facts = [
             RecalledFact(
@@ -246,6 +250,26 @@ def _recall(
         log.exception("回忆事实失败,这次不带记忆")
 
     return events, facts
+
+
+def _embedding_args(deps: QaDeps, question: str) -> dict[str, object]:
+    """把问句算成向量,交给检索工具做模糊召回。
+
+    **算不出来就当没有这回事**(ADR-019):字面检索照常跑,答案差一点而已。
+    向量在这里算而不是在工具里算,是因为算它要 LLM 客户端 —— 工具能自己
+    调外部服务的话,"这次问答花了多少钱"就再也说不清了。
+
+    用整句问话而不是关键词:关键词是给字面检索用的,向量恰恰擅长
+    "上次那个报销的事"这种整句里的意思。
+    """
+    if not deps.llm.embeddings_enabled:
+        return {}
+    try:
+        [vector] = deps.llm.embed([question])
+    except (LLMError, ValueError) as exc:
+        log.info("问句向量没算成,这次只做字面检索:%s", exc)
+        return {}
+    return {"query_embedding": vector, "embedding_model": deps.llm.embedding_model}
 
 
 def _record_llm_call(

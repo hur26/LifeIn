@@ -92,6 +92,8 @@ def build_services(settings: Settings | None = None) -> Services:
         max_retries=s.llm_max_retries,
         price_prompt_per_1k=Decimal(str(s.llm_price_prompt_per_1k)),
         price_completion_per_1k=Decimal(str(s.llm_price_completion_per_1k)),
+        embedding_model=s.embedding_model,
+        embedding_dim=s.embedding_dim,
     )
 
     alerter = LoggingAlerter()

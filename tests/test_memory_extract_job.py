@@ -33,7 +33,7 @@ from lifein.models.normalized import (
     PartyRole,
     Trust,
 )
-from lifein.repos import facts, job_runs, raw_events
+from lifein.repos import embeddings, facts, job_runs, raw_events
 from lifein.repos.entities import AliasType, find_by_alias
 from lifein.sources.base import IngestedEvent
 
@@ -279,3 +279,98 @@ def test_window_is_claimed_once(pg_session, user_id):
     results = run_once(user_id, pg_session, deps=deps(ONE_FACT), now=NOW)
 
     assert results == [] or all(r.skipped or r.no_events for r in results)
+
+
+# ---------- 向量补齐(第 5 片) ----------
+
+DIM = 1024
+EMB_MODEL = "emb-v1"
+
+
+def llm_with_embeddings(
+    payload, *, dim: int = DIM, client_dim: int | None = None, embed_status: int = 200
+) -> LLMClient:
+    """按路径分流的假客户端:/chat/completions 回抽取结果,/embeddings 回向量。"""
+    chat_body = {
+        "model": "m",
+        "choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/embeddings"):
+            if embed_status != 200:
+                return httpx.Response(embed_status, json={"error": "boom"})
+            count = len(json.loads(request.content)["input"])
+            return httpx.Response(
+                200,
+                json={"data": [{"index": i, "embedding": [0.0] * dim} for i in range(count)]},
+            )
+        return httpx.Response(200, json=chat_body)
+
+    return LLMClient(
+        base_url="https://llm.example.com/v1",
+        api_key="k",
+        model="m",
+        embedding_model=EMB_MODEL,
+        embedding_dim=client_dim or dim,
+        max_retries=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _s: None,
+    )
+
+
+def test_new_facts_get_vectors(pg_session, user_id):
+    seed(pg_session, user_id, ingested())
+    d = MemoryDeps(llm=llm_with_embeddings(ONE_FACT), alerter=CollectingAlerter())
+
+    [result] = run_once(user_id, pg_session, deps=d, now=NOW)
+
+    assert result.facts_created == 1
+    assert result.embedded == 1
+    assert (
+        embeddings.facts_missing_embeddings(user_id, pg_session, model=EMB_MODEL) == []
+    ), "补完之后不该还有缺口"
+
+
+def test_embedding_failure_does_not_lose_the_facts(pg_session, user_id):
+    """向量算不出来,事实照样留在库里。
+
+    为此把窗口记成 failed 会让已经写好的记忆被当成没写过重跑一遍 ——
+    那才是真的损失。少了向量只是这几条暂时召不回来,明天还会被挑到。
+    """
+    seed(pg_session, user_id, ingested())
+    d = MemoryDeps(llm=llm_with_embeddings(ONE_FACT, embed_status=500), alerter=CollectingAlerter())
+
+    [result] = run_once(user_id, pg_session, deps=d, now=NOW)
+
+    assert result.error is None
+    assert result.facts_created == 1
+    assert result.embedded == 0
+    assert result.warnings, "算不出来要留下痕迹,不然只会表现为召回慢慢变差"
+    pending = embeddings.facts_missing_embeddings(user_id, pg_session, model=EMB_MODEL)
+    assert len(pending) == 1, "这条会排在明天的队首"
+
+
+def test_dimension_mismatch_is_caught_before_the_database(pg_session, user_id):
+    # 换了个 1536 维的模型却没改 EMBEDDING_DIM —— 报错要说得清是哪个模型
+    seed(pg_session, user_id, ingested())
+    # 模型回 8 维,配置说 1024 维
+    llm = llm_with_embeddings(ONE_FACT, dim=8, client_dim=DIM)
+    d = MemoryDeps(llm=llm, alerter=CollectingAlerter())
+
+    [result] = run_once(user_id, pg_session, deps=d, now=NOW)
+
+    assert result.facts_created == 1
+    assert result.embedded == 0
+    assert any(EMB_MODEL in w for w in result.warnings)
+
+
+def test_without_embedding_model_nothing_is_embedded(pg_session, user_id):
+    # 没配 EMBEDDING_MODEL 的部署:记忆照写,只是没有模糊召回(ADR-019)
+    seed(pg_session, user_id, ingested())
+
+    [result] = run_once(user_id, pg_session, deps=deps(ONE_FACT), now=NOW)
+
+    assert result.facts_created == 1
+    assert result.embedded == 0

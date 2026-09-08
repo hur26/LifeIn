@@ -29,13 +29,20 @@ from lifein.agents.memory import MemoryFailed, MemoryInput, extract
 from lifein.alerts import Alerter
 from lifein.governance.audit import ToolCallRecord
 from lifein.governance.registry import ToolLevel
-from lifein.llm.client import LLMClient
-from lifein.repos import entities, facts, job_runs, raw_events, users
+from lifein.llm.client import LLMClient, LLMError
+from lifein.repos import embeddings, entities, facts, job_runs, raw_events, users
 from lifein.repos.tool_calls import record_tool_call
 
 log = logging.getLogger(__name__)
 
 JOB_NAME = "memory_extract"
+
+EMBED_BATCH = 50
+"""一次最多给多少条事实补向量。
+
+补不完不要紧,明天接着补 —— `facts_missing_embeddings` 问的是"谁还没有",
+不是"这次抽了谁",所以漏掉的会一直排在队首。
+"""
 
 UNGROUNDED_ALERT_AT = 5
 """一个窗口里丢掉多少条无来源事实就告警。
@@ -67,6 +74,9 @@ class ExtractResult:
     """别名指向了另一个实体。**不是错误**,是"这里可能有两个同名的人"的记号。"""
 
     facts_created: int = 0
+    embedded: int = 0
+    """这次补了多少条向量。没配 EMBEDDING_MODEL 时恒为 0(ADR-019)。"""
+
     facts_merged: int = 0
     facts_skipped_negated: int = 0
     """用户否定过、这次没写回去的条数。这个数字越大说明抽取越该改。"""
@@ -82,6 +92,7 @@ class ExtractResult:
             "entities_touched": self.entities_touched,
             "conflicts": self.conflicts,
             "facts_created": self.facts_created,
+            "embedded": self.embedded,
             "facts_merged": self.facts_merged,
             "facts_skipped_negated": self.facts_skipped_negated,
             "dropped_ungrounded": self.dropped_ungrounded,
@@ -187,12 +198,55 @@ def _extract_window(
 
     _write_sightings(user_id, session, output.sightings, result=result)
     _write_facts(user_id, session, output.facts, stored=stored, result=result)
+    _embed_pending_facts(user_id, session, deps=deps, result=result)
 
     if result.dropped_ungrounded >= UNGROUNDED_ALERT_AT:
         # 记忆停止更新是没有外部表现的:摘要照发,只是它慢慢不再"记得你"
         message = f"本次有 {result.dropped_ungrounded} 条事实指不回来源,已全部丢弃"
         result.warnings.append(message)
         deps.alerter.alert("记忆抽取的溯源率异常", message)
+
+
+def _embed_pending_facts(
+    user_id: str,
+    session: Session,
+    *,
+    deps: MemoryDeps,
+    result: ExtractResult,
+) -> None:
+    """给还没有向量的事实补上向量。
+
+    **失败不影响这次抽取。** 事实已经写进库了,少了向量只是这几条暂时召不回来,
+    而明天这个任务还会挑到它们。为此把整个窗口记成 failed 会让已经写好的
+    记忆被当成没写过重跑一遍 —— 那才是真的损失。
+    """
+    if not deps.llm.embeddings_enabled:
+        return
+
+    model = deps.llm.embedding_model
+    pending = embeddings.facts_missing_embeddings(
+        user_id, session, model=model, limit=EMBED_BATCH
+    )
+    if not pending:
+        return
+
+    try:
+        vectors = deps.llm.embed([item.statement for item in pending])
+    except LLMError as exc:
+        log.warning("补向量失败,这批留到下次:%s", exc)
+        result.warnings.append(f"向量没算成:{exc}")
+        return
+
+    for item, vector in zip(pending, vectors, strict=True):
+        embeddings.upsert(
+            user_id,
+            session,
+            ref_type=embeddings.RefType.FACT,
+            ref_id=item.fact_id,
+            embedding=vector,
+            model=model,
+        )
+    result.embedded = len(pending)
 
 
 def _write_sightings(
