@@ -789,13 +789,19 @@ signing_string = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + sha256_hex(BOD
    系统折叠出来的"[3 条] ……"打上 `aggregated`
 5. **入库**,`ON CONFLICT DO NOTHING`,重复的计 `duplicates`
 
+**交易类多一步(P2)**:`purpose=transaction` 的来源放行之后,
+金额、卡号后四位、方向**用正则抠**(铁律 9),抠不出金额的计 `not_a_transaction`
+丢弃 —— 那多半是银行的营销短信,而 ADR-012 的第 3 层本来就要区分"营销"。
+**丢弃不是进待确认**:进队列的话你会收到一堆"优惠券待领取"。
+
 响应:
 
 ```json
 {
   "accepted": 3,
   "duplicates": 1,
-  "dropped": {"not_whitelisted": 2, "verification_code": 1, "phase_not_open": 0}
+  "dropped": {"not_whitelisted": 2, "verification_code": 1, "phase_not_open": 0,
+              "malformed": 0, "not_a_transaction": 0}
 }
 ```
 

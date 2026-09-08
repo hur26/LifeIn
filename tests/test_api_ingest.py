@@ -192,6 +192,7 @@ class TestEvents:
                 "phase_not_open": 0,
                 "verification_code": 0,
                 "malformed": 0,
+                "not_a_transaction": 0,
             },
         }
 

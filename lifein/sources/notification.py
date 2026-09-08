@@ -29,6 +29,8 @@ from datetime import datetime
 from typing import Any
 
 from lifein.models.normalized import (
+    Amount,
+    Direction,
     EventKind,
     ExternalRef,
     Flag,
@@ -38,7 +40,9 @@ from lifein.models.normalized import (
     PartyRole,
     Trust,
 )
-from lifein.repos.collector import PURPOSE_MESSAGE, WhitelistRule
+from lifein.repos.collector import PURPOSE_MESSAGE, PURPOSE_TRANSACTION, WhitelistRule
+from lifein.repos.transactions import Direction as TxnDirection
+from lifein.sources import transaction_text
 from lifein.sources.base import IngestedEvent
 from lifein.sources.verification_code import looks_like_verification_code
 
@@ -70,6 +74,13 @@ class DropReason:
     PHASE_NOT_OPEN = "phase_not_open"
     VERIFICATION_CODE = "verification_code"
     MALFORMED = "malformed"
+    NOT_A_TRANSACTION = "not_a_transaction"
+    """来源是放行的交易类,但文字里抠不出金额 —— 多半是银行的营销短信。
+
+    **丢弃而不是进待确认**:ADR-012 的第 3 层本来就要显式区分"营销",
+    而能用规则认出来的东西不该花一次模型调用(铁律 9)。
+    进待确认的话,你的队列里会堆满"您有一张优惠券待领取"。
+    """
 
 
 @dataclass
@@ -144,6 +155,22 @@ class NotificationAdapter:
             result.drop(DropReason.MALFORMED)
             return
 
+        if rule.purpose == PURPOSE_TRANSACTION:
+            event = self._to_transaction_event(
+                item,
+                external_id=external_id,
+                occurred_at=occurred_at,
+                title=title,
+                body=body,
+                sender=sender,
+            )
+            if event is None:
+                # 放行的来源,但不是一笔交易(营销短信、额度调整通知……)
+                result.drop(DropReason.NOT_A_TRANSACTION)
+                return
+            result.events.append(event)
+            return
+
         result.events.append(
             self._to_event(
                 item,
@@ -153,6 +180,70 @@ class NotificationAdapter:
                 body=body,
                 sender=sender,
             )
+        )
+
+    def _to_transaction_event(
+        self,
+        item: dict[str, Any],
+        *,
+        external_id: str,
+        occurred_at: datetime,
+        title: str,
+        body: str,
+        sender: str,
+    ) -> IngestedEvent | None:
+        """交易类的归一化。**金额、卡号、方向全走正则**(铁律 9)。
+
+        抠不出金额就返回 None —— 那多半根本不是交易,而**猜一个金额写进账本**
+        是这条链路上最不能犯的错(03 的退出条件:出现错记就停下来)。
+
+        `body` 暂时保留:ADR-012 的第 3 层要靠它判断是不是真实支出。
+        [R10](../../docs/05-risks.md#r10--手机端采集器的越权读取) 要求交易类
+        "不存整条报文",所以**记账 agent 判完之后要立刻把正文换成脱敏字段**
+        (`ParsedTransaction.redacted_fields()`)—— 那是第 4 片的事,
+        在它做完之前,交易正文的留存时间由通知保留期兜着。
+        """
+        parsed = transaction_text.parse(title, body)
+        if parsed is None:
+            return None
+
+        normalized = NormalizedEvent(
+            kind=EventKind.TRANSACTION,
+            title=title or (parsed.merchant_raw or "交易"),
+            occurred_at=occurred_at,
+            external_ref=ExternalRef(source=SOURCE, external_id=self._scoped(external_id)),
+            trust=Trust.EXTERNAL,
+            confidence=1.0,
+            amount=Amount(
+                value=parsed.amount,
+                currency=parsed.currency,
+                direction=(
+                    Direction.DEBIT
+                    if parsed.direction is TxnDirection.DEBIT
+                    else Direction.CREDIT
+                ),
+            ),
+            parties=_merchant_parties(parsed.merchant_raw),
+            body=body or None,
+        )
+        return IngestedEvent(
+            source=SOURCE,
+            external_id=self._scoped(external_id),
+            occurred_at=occurred_at,
+            trust=Trust.EXTERNAL,
+            raw={
+                "device_id": self._device_id,
+                "channel": _text(item.get("channel")) or CHANNEL_NOTIFICATION,
+                "source_app": _text(item.get("source_app")),
+                "sender": sender,
+                "title": title,
+                "text": body,
+                "posted_at": occurred_at.isoformat(),
+                # 规则抠出来的那几样一起存:第 4 层复核要拿 matched_amount_text
+                # 做"金额必须能在原文逐字找到"的比对
+                "parsed": {**parsed.redacted_fields(), "matched": parsed.matched_amount_text},
+            },
+            normalized=normalized,
         )
 
     def _match(self, *, package_name: str, sender: str) -> WhitelistRule | None:
@@ -217,6 +308,15 @@ class NotificationAdapter:
         不拼的话第二台上报的会被当成重复静默丢掉。
         """
         return f"{self._device_id}:{external_id}"
+
+
+def _merchant_parties(merchant_raw: str | None) -> list[Party]:
+    """商户当作参与方。抠不出来就空着 —— **不拿标题冒充商户**:
+    实时通知里的"标题"常常是 App 名(支付宝、微信支付),
+    把它当商户会让归类规则表里堆满"支付宝"这种没有意义的条目(ADR-008)。"""
+    if not merchant_raw:
+        return []
+    return [Party(role=PartyRole.MERCHANT, display_name=merchant_raw)]
 
 
 def _parties(*, title: str, sender: str) -> list[Party]:

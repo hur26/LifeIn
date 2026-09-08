@@ -37,6 +37,7 @@ ALL_DROP_REASONS = (
     DropReason.PHASE_NOT_OPEN,
     DropReason.VERIFICATION_CODE,
     DropReason.MALFORMED,
+    DropReason.NOT_A_TRANSACTION,
 )
 """响应里**每个原因都出现,没有的填 0**。
 
