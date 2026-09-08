@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LifeIn</string>
+    <string name="collector_label">LifeIn 通知采集</string>
+    <string name="widget_label">LifeIn 今天</string>
+</resources>

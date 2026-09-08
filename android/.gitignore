@@ -1,0 +1,8 @@
+# 安卓构建产物
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+.idea/
+captures/

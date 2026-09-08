@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      权限按需要一样一样加,不预留。**永远不会出现的是推送相关的那些** ——
+      没有厂商推送 SDK,不接收推送(铁律 10 / ADR-014)。
+      也不会有相机:配码走粘贴,不做应用内扫码(ADR-021)。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:name=".LifeInApp"
+        android:allowBackup="false"
+        android:icon="@android:drawable/ic_menu_agenda"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LifeIn">
+        <!--
+          allowBackup=false 是有意的:备份里会带上加密后的凭据和缓存的待办,
+          而那份备份会去到云端。R11 说 App 本地缓存同样是攻击面。
+        -->
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
