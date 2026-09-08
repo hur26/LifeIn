@@ -8,13 +8,19 @@ import ltd.iclab.lifein.collect.Whitelist
 import ltd.iclab.lifein.data.CachedTodo
 import ltd.iclab.lifein.data.LifeInDatabase
 import ltd.iclab.lifein.collect.WhitelistRule
+import ltd.iclab.lifein.net.BudgetBody
+import ltd.iclab.lifein.net.BudgetDto
 import ltd.iclab.lifein.net.CollectorStatus
 import ltd.iclab.lifein.net.FactsResponse
 import ltd.iclab.lifein.net.LifeInApi
+import ltd.iclab.lifein.net.ManualTxnBody
+import ltd.iclab.lifein.net.MonthlyReportDto
 import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.ResolveBody
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.net.TransactionDto
+import ltd.iclab.lifein.net.TxnPatchBody
 import ltd.iclab.lifein.net.WhitelistBody
 import ltd.iclab.lifein.work.Schedules
 import ltd.iclab.lifein.work.WidgetRefresh
@@ -138,6 +144,49 @@ class Repository(private val context: Context) {
         }
         status
     }
+
+
+    // ---------- 账本(P2 第 13、14 片) ----------
+
+    suspend fun transactions(
+        category: String? = null,
+        query: String? = null,
+    ): List<TransactionDto> = withContext(Dispatchers.IO) {
+        api().transactions(category = category, query = query).transactions
+    }
+
+    suspend fun monthlyReport(period: String? = null): MonthlyReportDto =
+        withContext(Dispatchers.IO) { api().monthlyReport(period) }
+
+    suspend fun budgets(): List<BudgetDto> = withContext(Dispatchers.IO) {
+        api().budgets().budgets
+    }
+
+    suspend fun setBudget(category: String?, amount: String, threshold: String = "0.9") =
+        withContext(Dispatchers.IO) {
+            api().setBudget(BudgetBody(category = category, amount = amount, alertThreshold = threshold))
+        }
+
+    suspend fun deleteBudget(category: String?) = withContext(Dispatchers.IO) {
+        api().deleteBudget(category)
+    }
+
+    /**
+     * 改分类。**服务端会把它写回商户规则表**,以后这个商户就一直归到这一类,
+     * 而且模型改不回去(ADR-008)—— 所以这个动作比它看起来重要。
+     */
+    suspend fun recategorize(txnId: Long, category: String): TransactionDto =
+        withContext(Dispatchers.IO) {
+            api().patchTransaction(txnId, TxnPatchBody(category = category))
+        }
+
+    suspend fun deleteTransaction(txnId: Long) = withContext(Dispatchers.IO) {
+        api().deleteTransaction(txnId)
+    }
+
+    /** 手动补一笔。现金和纸质票据那条长尾,实时通知那一路永远采不到。 */
+    suspend fun addTransaction(body: ManualTxnBody): TransactionDto =
+        withContext(Dispatchers.IO) { api().addTransaction(body) }
 
     private suspend fun cache(items: List<TodoDto>) {
         LifeInDatabase.get(context).cachedTodos().replace(

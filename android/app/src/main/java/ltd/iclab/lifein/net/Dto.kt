@@ -235,3 +235,97 @@ data class WhitelistBody(
 
 @Serializable
 data class EnabledBody(val enabled: Boolean)
+
+// ---------- 账本、报表与预算(06 §6.11 / §6.12) ----------
+//
+// **金额一律是 String,不是 Double。** 服务端那边发的就是字符串,
+// 而这边如果解成 Double,38.50 会变成 38.499999999999996 —— 账本上出现
+// 那个数字比出现一笔错账更让人不信任。要算的时候用 BigDecimal(它)。
+
+@Serializable
+data class TransactionDto(
+    val id: Long,
+    @SerialName("occurred_at") val occurredAt: String,
+    val amount: String,
+    val currency: String = "CNY",
+    val direction: String,
+    val kind: String,
+    @SerialName("merchant_raw") val merchantRaw: String? = null,
+    val category: String? = null,
+    @SerialName("account_hint") val accountHint: String? = null,
+    @SerialName("order_no") val orderNo: String? = null,
+    val channel: String,
+    val stage: String,
+    @SerialName("counts_as_spending") val countsAsSpending: Boolean = true,
+) {
+    /** 显示用。**只在这里转一次** —— 别处再解一遍就多一处可能解错的地方。 */
+    val money: java.math.BigDecimal get() = java.math.BigDecimal(amount)
+}
+
+@Serializable
+data class TransactionsResponse(val transactions: List<TransactionDto> = emptyList())
+
+@Serializable
+data class CategoryLineDto(
+    val category: String,
+    val total: String,
+    val count: Int,
+    @SerialName("last_total") val lastTotal: String? = null,
+)
+
+@Serializable
+data class MerchantLineDto(val merchant: String, val total: String, val count: Int)
+
+@Serializable
+data class MonthlyReportDto(
+    val period: String,
+    val total: String,
+    val count: Int,
+    @SerialName("last_total") val lastTotal: String? = null,
+    val categories: List<CategoryLineDto> = emptyList(),
+    val merchants: List<MerchantLineDto> = emptyList(),
+    val uncategorized: String = "0",
+    /** 对账覆盖率。**null 表示这个月还没对过账**,不是 0。 */
+    @SerialName("reconciled_ratio") val reconciledRatio: Double? = null,
+    /** 上一次月报 job 写下的评语。空着说明还没跑过 —— 数字照样是准的。 */
+    val notes: List<String> = emptyList(),
+)
+
+@Serializable
+data class BudgetDto(
+    /** null 就是总预算。 */
+    val category: String? = null,
+    val amount: String,
+    @SerialName("alert_threshold") val alertThreshold: String,
+    val spent: String,
+    val remaining: String,
+    val over: Boolean,
+    val near: Boolean,
+)
+
+@Serializable
+data class BudgetsResponse(val budgets: List<BudgetDto> = emptyList())
+
+@Serializable
+data class BudgetBody(
+    val category: String? = null,
+    val amount: String,
+    @SerialName("alert_threshold") val alertThreshold: String = "0.9",
+)
+
+@Serializable
+data class TxnPatchBody(
+    val category: String? = null,
+    @SerialName("merchant_raw") val merchantRaw: String? = null,
+)
+
+@Serializable
+data class ManualTxnBody(
+    @SerialName("occurred_at") val occurredAt: String,
+    val amount: String,
+    val direction: String = "debit",
+    val kind: String = "expense",
+    val category: String? = null,
+    @SerialName("merchant_raw") val merchantRaw: String? = null,
+    val note: String? = null,
+)

@@ -118,14 +118,15 @@ private fun Home(
 
     Column(Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tab) {
-            listOf("今天", "待确认", "记忆", "状态").forEachIndexed { index, title ->
+            listOf("今天", "待确认", "账本", "记忆", "状态").forEachIndexed { index, title ->
                 Tab(selected = tab == index, onClick = { tab = index }, text = { Text(title) })
             }
         }
         when (tab) {
             0 -> TodosScreen(repo)
             1 -> PendingScreen(repo)
-            2 -> MemoryScreen(repo)
+            2 -> LedgerScreen(repo)
+            3 -> MemoryScreen(repo)
             else -> StatusScreen(
                 repo = repo,
                 localListenerEnabled = CollectorState.listenerEnabled(context),

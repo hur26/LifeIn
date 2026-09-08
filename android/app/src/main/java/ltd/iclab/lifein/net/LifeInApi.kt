@@ -131,6 +131,61 @@ class LifeInApi(
         )
     }
 
+
+    // ---------- 账本、报表与预算(06 §6.11 / §6.12) ----------
+
+    fun transactions(
+        from: String? = null,
+        to: String? = null,
+        category: String? = null,
+        query: String? = null,
+    ): TransactionsResponse = authed {
+        val params = buildMap {
+            from?.let { value -> put("from", value) }
+            to?.let { value -> put("to", value) }
+            category?.let { value -> put("category", value) }
+            if (!query.isNullOrBlank()) put("q", query.trim())
+        }
+        json.decodeFromString(
+            TransactionsResponse.serializer(), bearerGet(PATH_TXNS, it, params)
+        )
+    }
+
+    /** `period` 形如 `2026-08`。不给就是上个月 —— 这个月还没过完。 */
+    fun monthlyReport(period: String? = null): MonthlyReportDto = authed {
+        val params = if (period.isNullOrBlank()) emptyMap() else mapOf("period" to period)
+        json.decodeFromString(MonthlyReportDto.serializer(), bearerGet(PATH_REPORT, it, params))
+    }
+
+    fun budgets(): BudgetsResponse =
+        authed { json.decodeFromString(BudgetsResponse.serializer(), bearerGet(PATH_BUDGETS, it)) }
+
+    fun setBudget(body: BudgetBody) = authed {
+        bearerPut(PATH_BUDGETS, it, json.encodeToString(BudgetBody.serializer(), body))
+    }
+
+    fun deleteBudget(category: String?) = authed {
+        val params = if (category.isNullOrBlank()) emptyMap() else mapOf("category" to category)
+        bearerDelete(PATH_BUDGETS, it, params)
+    }
+
+    /** 改分类或商户。**金额和时间改不了**(06 §6.11)。 */
+    fun patchTransaction(txnId: Long, body: TxnPatchBody): TransactionDto = authed {
+        val text = bearerPatch(
+            "$PATH_TXNS/$txnId", it, json.encodeToString(TxnPatchBody.serializer(), body)
+        )
+        json.decodeFromString(TransactionDto.serializer(), text)
+    }
+
+    fun deleteTransaction(txnId: Long) = authed { bearerDelete("$PATH_TXNS/$txnId", it) }
+
+    fun addTransaction(body: ManualTxnBody): TransactionDto = authed {
+        val text = bearerPost(
+            PATH_TXNS, it, json.encodeToString(ManualTxnBody.serializer(), body)
+        )
+        json.decodeFromString(TransactionDto.serializer(), text)
+    }
+
     fun collectorStatus(): CollectorStatus =
         authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
 
@@ -219,6 +274,38 @@ class LifeInApi(
     private fun q(query: String?): Map<String, String> =
         if (query.isNullOrBlank()) emptyMap() else mapOf("q" to query.trim())
 
+
+    internal fun bearerPut(path: String, token: String, body: String): String =
+        execute(
+            Request.Builder()
+                .url(enrollment.baseUrl.trimEnd('/') + path)
+                .header("Authorization", "Bearer $token")
+                .put(body.toByteArray().toRequestBody(JSON))
+                .build()
+        )
+
+    internal fun bearerPatch(path: String, token: String, body: String): String =
+        execute(
+            Request.Builder()
+                .url(enrollment.baseUrl.trimEnd('/') + path)
+                .header("Authorization", "Bearer $token")
+                .patch(body.toByteArray().toRequestBody(JSON))
+                .build()
+        )
+
+    internal fun bearerDelete(
+        path: String,
+        token: String,
+        query: Map<String, String> = emptyMap(),
+    ): String {
+        val url = (enrollment.baseUrl.trimEnd('/') + path).toHttpUrl().newBuilder()
+            .apply { query.forEach { (name, value) -> addQueryParameter(name, value) } }
+            .build()
+        return execute(
+            Request.Builder().url(url).header("Authorization", "Bearer $token").delete().build()
+        )
+    }
+
     internal fun bearerPost(path: String, token: String, body: String): String =
         execute(
             Request.Builder()
@@ -252,6 +339,9 @@ class LifeInApi(
         const val PATH_WHITELIST = "/app/collector/whitelist"
         const val PATH_FACTS = "/app/memory/facts"
         const val PATH_ENTITIES = "/app/memory/entities"
+        const val PATH_TXNS = "/app/ledger/transactions"
+        const val PATH_REPORT = "/app/ledger/report"
+        const val PATH_BUDGETS = "/app/ledger/budgets"
 
         private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 
