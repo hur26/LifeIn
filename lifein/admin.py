@@ -30,6 +30,8 @@
     python -m lifein.admin budgets --user <uuid>                         # 看进度
     python -m lifein.admin approvals --user <uuid>       # L3 审批队列与最近的执行
     python -m lifein.admin invite --user <uuid>          # 配码二维码(码是一次性的)
+    python -m lifein.admin export --user <uuid> --out my-data.json   # 导出全部数据
+    python -m lifein.admin purge-user --user <uuid>      # 彻底注销(要二次确认)
 """
 
 from __future__ import annotations
@@ -1092,6 +1094,83 @@ def cmd_invite(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """导出一个用户的全部数据(P4 第 6 片)。
+
+    [09 隐私说明](../docs/09-privacy.md)第 5 节里"要找白杨的"两件事之一。
+    **凭据不在导出里** —— 导出文件会躺在下载目录、会被发到微信,
+    而里面如果有邮箱授权码,那份文件的危险程度就超过了它保护的东西。
+    """
+    from lifein.repos import export as export_repo
+
+    settings = get_settings()
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        data = export_repo.export_user(
+            args.user, session, now=datetime.now(settings.tzinfo)
+        )
+
+    payload = {
+        "user_id": data.user_id,
+        "exported_at": data.exported_at.isoformat(),
+        "note": "凭据(邮箱授权码、设备密钥)不在这份文件里,见 docs/09-privacy.md",
+        "tables": data.tables,
+    }
+    out = Path(args.out).resolve()
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"已导出 {data.row_count()} 行到 {out}")
+    for table, rows in sorted(data.tables.items()):
+        if rows:
+            print(f"  {table:<24} {len(rows)}")
+    print()
+    print("这份文件里有这个人的全部内容。发给他之后就从这台机器上删掉。")
+    return 0
+
+
+def cmd_purge_user(args: argparse.Namespace) -> int:
+    """彻底删掉一个用户的全部数据(P4 第 6 片)。**不可撤销。**
+
+    要二次确认,而且确认要**打出用户 id 的后六位** —— 不是敲 y。
+    敲 y 那种确认在一次手滑里挡不住任何东西,而这个命令的后果是
+    一个人的全部数据没了。
+    """
+    from lifein.repos import export as export_repo
+
+    with session_scope() as session:
+        user = users.get_user(args.user, session)
+        if user is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        display = user.display_name
+
+    tail = args.user[-6:]
+    print(f"要彻底删掉 {display}({args.user})的全部数据。**这个动作不可撤销。**")
+    print("先跑 export 留一份存档 —— 删完之后没有任何办法找回来。")
+    print()
+    typed = input(f"确认请输入这个用户 id 的后六位({tail}):").strip()
+    if typed != tail:
+        print("对不上,什么都没做。", file=sys.stderr)
+        return 1
+
+    with session_scope() as session:
+        removed = export_repo.purge_user(args.user, session)
+        # users 那一行最后删:留着它才知道这个账号处理到哪儿了
+        session.execute(
+            sqltext("DELETE FROM users WHERE id = :u"), {"u": args.user}
+        )
+
+    total = sum(removed.values())
+    print(f"已删除 {total} 行:")
+    for table, count in sorted(removed.items()):
+        print(f"  {table:<24} {count}")
+    print()
+    print("用户记录也删了。这个 user_id 之后不会再出现在任何地方。")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1298,6 +1377,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-text", action="store_true", help="同时打印文本(扫不了码时的退路)"
     )
     invite.set_defaults(func=cmd_invite)
+
+    export_cmd = sub.add_parser("export", help="导出一个用户的全部数据(不含凭据)")
+    export_cmd.add_argument("--user", required=True)
+    export_cmd.add_argument("--out", required=True, help="写到哪个文件")
+    export_cmd.set_defaults(func=cmd_export)
+
+    purge = sub.add_parser("purge-user", help="彻底删掉一个用户的全部数据(不可撤销)")
+    purge.add_argument("--user", required=True)
+    purge.set_defaults(func=cmd_purge_user)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)
