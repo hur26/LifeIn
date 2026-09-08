@@ -13,6 +13,7 @@ import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.ResolveBody
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.work.WidgetRefresh
 
 /**
  * 界面和网络之间的那一层。
@@ -50,11 +51,15 @@ class Repository(private val context: Context) {
 
     suspend fun complete(todoId: String) = withContext(Dispatchers.IO) {
         api().setTodoStatus(todoId, "done")
+        // 刚点完的那条不该还留在桌面上。小组件下一个周期才刷,
+        // 而"点了没反应"会让人再点一次
+        WidgetRefresh.now(context)
     }
 
     suspend fun cancel(todoId: String) = withContext(Dispatchers.IO) {
         // 撤销之后,已经写进日历的那条要等下一次同步才会被删(06 §6.8)
         api().setTodoStatus(todoId, "cancelled")
+        WidgetRefresh.now(context)
     }
 
     suspend fun pending(): List<PendingDto> = withContext(Dispatchers.IO) {

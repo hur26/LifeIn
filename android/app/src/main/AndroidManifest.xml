@@ -42,5 +42,20 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+        <!--
+          桌面小组件。AppWidgetProvider + WorkManager **定时去拉**,
+          没有任何一方向这台手机推送 —— 铁律 10 禁的是接收推送,不是主动刷新
+          (ADR-020)。
+        -->
+        <receiver
+            android:name=".widget.TodayWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/today_widget_info" />
+        </receiver>
     </application>
 </manifest>

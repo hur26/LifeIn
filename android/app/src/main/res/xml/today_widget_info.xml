@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  updatePeriodMillis 写 0 是有意的:系统那套定时更新最快也要半小时,
+  而且不保证。刷新由 WorkManager 排(Schedules 里那条),
+  两套一起来只会重复拉。
+
+  **这仍然是"去拉",不是"接收推送"**(铁律 10 / ADR-020)。
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:initialLayout="@layout/widget_today"
+    android:minWidth="180dp"
+    android:minHeight="110dp"
+    android:resizeMode="horizontal|vertical"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen" />
