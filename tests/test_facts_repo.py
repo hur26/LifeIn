@@ -201,9 +201,9 @@ def test_search_skips_negated(pg_session, user_id):
     gone = add(pg_session, user_id, "张三下周离职")
     negate_fact(user_id, pg_session, fact_id=gone.fact.id)
 
-    hits = [f.statement for f in search_facts(user_id, pg_session, query="张三")]
+    hits = [f.statement for f in search_facts(user_id, pg_session, query="张三", at=NOW)]
     assert hits == ["张三在市场部"]
-    assert search_facts(user_id, pg_session, query="   ") == []
+    assert search_facts(user_id, pg_session, query="   ", at=NOW) == []
 
 
 def test_facts_are_isolated_per_user(pg_session, user_id):
@@ -218,6 +218,6 @@ def test_facts_are_isolated_per_user(pg_session, user_id):
     mine = add(pg_session, user_id, "张三在市场部")
 
     assert list_active_facts(other, pg_session, at=NOW) == []
-    assert search_facts(other, pg_session, query="张三") == []
+    assert search_facts(other, pg_session, query="张三", at=NOW) == []
     assert get_fact(other, pg_session, fact_id=mine.fact.id) is None
     assert negate_fact(other, pg_session, fact_id=mine.fact.id) is False

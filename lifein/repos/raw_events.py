@@ -218,6 +218,69 @@ def fetch_stored_between(
     return stored
 
 
+_SELECT_BY_PARTY = text("""
+    SELECT id, normalized
+      FROM raw_events
+     WHERE user_id = :user_id
+       AND normalized IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+             FROM jsonb_array_elements(normalized -> 'parties') AS p
+            WHERE lower(p ->> 'identifier') = ANY(:identifiers)
+               OR lower(p ->> 'display_name') = ANY(:names)
+       )
+     ORDER BY occurred_at DESC
+     LIMIT :limit
+""")
+
+
+def fetch_events_with_party(
+    user_id: str,
+    session: Session,
+    *,
+    identifiers: Sequence[str],
+    names: Sequence[str],
+    limit: int = 20,
+) -> list[StoredEvent]:
+    """找参与方里有这些标识符或名字的事件,最近的在前。
+
+    "上次和张三聊的是什么"最终落到的就是这个查询。**入参是别名表给的**,
+    不是用户随口打的那个词 —— 中间隔着实体归并那一层,所以他换过的邮箱、
+    署过的别名都能命中。
+
+    比对前两边都转小写:事件里存的是当初那封邮件写的原样(`Zhang@QQ.com`),
+    别名表里存的是归一化后的键(`zhang@qq.com`)。
+
+    走的是 `jsonb_array_elements` 而不是 `@>` 包含运算,所以用不上
+    `normalized` 上那个 GIN 索引。**这是明知故犯**:一个人一年的事件量在
+    万条这个数量级,顺序扫几十毫秒;而为了用上索引要把"或"拆成多次包含查询,
+    换来的复杂度现在不值。真慢了再改,那时的判据是 EXPLAIN 而不是猜。
+    """
+    if not identifiers and not names:
+        # 一个都没有就不查:空数组给到 ANY 会匹配不到任何行,但那是巧合不是设计
+        return []
+
+    rows = session.execute(
+        _SELECT_BY_PARTY,
+        {
+            "user_id": user_id,
+            "identifiers": [i.lower() for i in identifiers],
+            "names": [n.lower() for n in names],
+            "limit": limit,
+        },
+    ).all()
+
+    stored: list[StoredEvent] = []
+    for row in rows:
+        try:
+            stored.append(
+                StoredEvent(event_id=row.id, event=NormalizedEvent.model_validate(row.normalized))
+            )
+        except ValueError:
+            log.warning("raw_events.id=%s 的 normalized 结构已不合法,跳过", row.id)
+    return stored
+
+
 def count_failed(user_id: str, session: Session, *, since: datetime) -> int:
     """统计归一化失败数,供告警使用。
 

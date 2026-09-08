@@ -178,6 +178,16 @@ class AliasLink:
 
 
 @dataclass(frozen=True)
+class Alias:
+    alias: str
+    """归一化后的键,不是当初写的原样。原样在 `entities.canonical_name` 里。"""
+
+    alias_type: AliasType
+    confidence: float
+    evidence_event_ids: list[int]
+
+
+@dataclass(frozen=True)
 class Resolution:
     """一次归并的结果。
 
@@ -215,6 +225,13 @@ _TOUCH_ENTITY = text("""
            last_seen_at  = GREATEST(last_seen_at, :seen_at)
      WHERE user_id = :user_id AND id = :entity_id
  RETURNING id, kind, canonical_name, attributes, first_seen_at, last_seen_at
+""")
+
+_SELECT_ALIASES = text("""
+    SELECT alias, alias_type, confidence, evidence_event_ids
+      FROM entity_aliases
+     WHERE user_id = :user_id AND entity_id = :entity_id
+     ORDER BY confidence DESC, alias
 """)
 
 _SELECT_ALIASES_OF_TYPE = text("""
@@ -353,6 +370,26 @@ def find_by_alias(
         {"user_id": user_id, "alias": key, "alias_type": alias_type.value},
     ).first()
     return _to_entity(row) if row else None
+
+
+def list_aliases(user_id: str, session: Session, *, entity_id: str) -> list[Alias]:
+    """这个实体的全部别名。
+
+    问答要它:"上次和张三聊的是什么"最终得落到"哪些事件的参与方里有张三",
+    而事件里存的是当时那封邮件写的地址与署名 —— 别名表就是这两者之间的桥。
+    """
+    rows = session.execute(
+        _SELECT_ALIASES, {"user_id": user_id, "entity_id": entity_id}
+    ).all()
+    return [
+        Alias(
+            alias=row.alias,
+            alias_type=AliasType(row.alias_type),
+            confidence=float(row.confidence),
+            evidence_event_ids=list(row.evidence_event_ids or []),
+        )
+        for row in rows
+    ]
 
 
 def get_entity(user_id: str, session: Session, *, entity_id: str) -> Entity | None:

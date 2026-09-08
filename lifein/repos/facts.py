@@ -160,6 +160,8 @@ _SEARCH = text("""
       FROM facts
      WHERE user_id = :user_id
        AND negated_by_user = false
+       AND valid_from <= :at
+       AND (valid_until IS NULL OR valid_until > :at)
        AND statement ILIKE :pattern
      ORDER BY confirmed_by_user DESC, confidence DESC, valid_from DESC
      LIMIT :limit
@@ -296,12 +298,19 @@ def list_active_facts(
     return [_to_fact(row) for row in rows]
 
 
-def search_facts(user_id: str, session: Session, *, query: str, limit: int = 20) -> list[Fact]:
-    """按字面搜事实。语义召回是第 5 片的向量索引,这里只做字面。"""
+def search_facts(
+    user_id: str, session: Session, *, query: str, at: datetime, limit: int = 20
+) -> list[Fact]:
+    """按字面搜事实。语义召回是第 5 片的向量索引,这里只做字面。
+
+    `at` 和 `list_active_facts` 是同一个意思,也没有默认值:两个入口对
+    "现在成立的事实"要有同一个口径,否则搜出来的会包含已经过期的条目,
+    而用户看不出那是过期的。
+    """
     if not query.strip():
         return []
     rows = session.execute(
-        _SEARCH, {"user_id": user_id, "pattern": f"%{query.strip()}%", "limit": limit}
+        _SEARCH, {"user_id": user_id, "pattern": f"%{query.strip()}%", "at": at, "limit": limit}
     ).all()
     return [_to_fact(row) for row in rows]
 
