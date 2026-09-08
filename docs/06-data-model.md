@@ -513,6 +513,57 @@ CREATE TABLE collector_heartbeat (
 
 ---
 
+### 2.11 todos · 待办与待写入的日程
+
+P1 新增。[ADR-020](04-tech-decisions.md#adr-020--待办与日程落在自己的-app企微退出主链路)
+把待办和日程的落地点定在自己这边,**App 是它的界面,不是另一个数据源**。
+
+```sql
+CREATE TABLE todos (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL,
+    kind          TEXT NOT NULL,            -- todo | schedule
+    title         TEXT NOT NULL,
+    notes         TEXT,
+    starts_at     TIMESTAMPTZ,              -- kind=schedule 时必填
+    ends_at       TIMESTAMPTZ,
+    status        TEXT NOT NULL DEFAULT 'open',   -- open|done|cancelled
+    source        TEXT NOT NULL,            -- agent|user
+    provenance    BIGINT[] NOT NULL DEFAULT '{}', -- raw_events.id,agent 建的必须有
+    device_ref    TEXT,                     -- 系统日历里那条事件的 id,设备回报
+    synced_at     TIMESTAMPTZ,              -- 设备确认写入的时间。空 = 还没落地
+    created_by_agent TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT todos_schedule_needs_time
+        CHECK (kind <> 'schedule' OR starts_at IS NOT NULL),
+    CONSTRAINT todos_agent_needs_provenance
+        CHECK (source <> 'agent' OR cardinality(provenance) >= 1)
+);
+CREATE INDEX ON todos (user_id, status, starts_at);
+CREATE INDEX ON todos (user_id) WHERE synced_at IS NULL AND kind = 'schedule';
+```
+
+**两条 CHECK 各挡一类错:**
+
+- `todos_schedule_needs_time` —— 没有时间的东西写不进日历。它进来只会变成
+  设备端一次必然失败的写入,而失败发生在手机上,服务端只看得到"一直没同步"
+- `todos_agent_needs_provenance` —— **和 `facts` 是同一条铁律 5**。
+  用户自己加的待办不需要出处,系统替他加的必须说得出为什么。
+  一条"帮张三带个东西"凭空出现在待办列表里,比不出现更让人不敢用
+
+**`device_ref` 与 `synced_at` 是这张表和别处最不一样的地方。**
+`kind=schedule` 的行,副作用**发生在服务端之外**:App 写进系统日历之后回报
+event id,那个 id 就是 L2 的回滚信息(`tool_calls.rollback_info` 里存的也是它)。
+`synced_at` 为空就是**还没落地** —— 这个状态必须在 App 上看得见,
+"看得见的延迟"可以接受,"以为写进去了其实没有"不行。
+
+**为什么待办和日程同一张表。** 它们的区别只有"有没有时间"这一项:
+提取时拿不准时间的走待办,拿得准的走日程,而拿不准是常态。
+分两张表意味着"补上一个时间"要跨表搬行,而那正是最常发生的编辑。
+
+---
+
 ## 3. 索引与迁移约定
 
 - **每张表的第一个索引都以 `user_id` 开头。** 租户隔离靠数据访问层强制,
@@ -530,8 +581,8 @@ CREATE TABLE collector_heartbeat (
 
 诚实记录,不要假装完备:
 
-- **接口契约**(`/ingest` payload、App 查询 API 路由、企微卡片模板结构)
-  —— P1 开工前补,P0 用不到
+- **接口契约**(`/ingest` payload、App 查询与待办 API 路由、日历回报的 payload)
+  —— P1 的 App 那几片开工前补
 - ~~**prompt 结构**(外部内容的隔离标记格式)~~ ✅ 已定,见 §5
 
 - **评测集格式**(agent 契约第 5 项)—— 同上
