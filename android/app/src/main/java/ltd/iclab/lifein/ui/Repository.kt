@@ -13,6 +13,7 @@ import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.ResolveBody
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.work.Schedules
 import ltd.iclab.lifein.work.WidgetRefresh
 
 /**
@@ -71,6 +72,9 @@ class Repository(private val context: Context) {
         // 队列里那份 —— 出处不由客户端说了算(铁律 5)
         val payload = editedTitle?.takeIf { it.isNotBlank() }?.let { mapOf("title" to it) }
         api().resolvePending(id, ResolveBody(action = "confirm", payload = payload))
+        // 刚确认的那条日程该尽快进日历。等半小时的话,用户会以为没生效
+        Schedules.syncCalendarNow(context)
+        WidgetRefresh.now(context)
     }
 
     suspend fun reject(id: Long) = withContext(Dispatchers.IO) {

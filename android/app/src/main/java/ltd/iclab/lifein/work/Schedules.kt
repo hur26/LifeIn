@@ -3,7 +3,9 @@ package ltd.iclab.lifein.work
 import android.content.Context
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
@@ -24,6 +26,7 @@ object Schedules {
 
     private const val HEARTBEAT = "lifein.heartbeat"
     private const val UPLOAD_SWEEP = "lifein.upload.sweep"
+    private const val CALENDAR = "lifein.calendar.sync"
 
     private val onNetwork = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -48,6 +51,28 @@ object Schedules {
             UPLOAD_SWEEP,
             ExistingPeriodicWorkPolicy.KEEP,
             PeriodicWorkRequestBuilder<UploadWorker>(30, TimeUnit.MINUTES)
+                .setConstraints(onNetwork)
+                .build(),
+        )
+
+        // 日历同步:服务端记了"要写日历"而设备没执行的那些。
+        // 半小时一次 —— 一条明天的会晚半小时进日历没有关系,
+        // 而**一直不进**才是那条不可接受的失败(ADR-020)
+        manager.enqueueUniquePeriodicWork(
+            CALENDAR,
+            ExistingPeriodicWorkPolicy.KEEP,
+            PeriodicWorkRequestBuilder<CalendarSyncWorker>(30, TimeUnit.MINUTES)
+                .setConstraints(onNetwork)
+                .build(),
+        )
+    }
+
+    /** 刚在 App 里确认了一条日程 —— 别等半小时。 */
+    fun syncCalendarNow(context: Context) {
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            "lifein.calendar.now",
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<CalendarSyncWorker>()
                 .setConstraints(onNetwork)
                 .build(),
         )

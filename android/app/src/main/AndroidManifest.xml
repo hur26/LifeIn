@@ -8,6 +8,13 @@
     -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+      日历要读也要写:写之前先查这条是不是已经写过(06 §6.8 那条"幂等责任
+      在设备端")。只申请写权限的话,换手机恢复备份之后会写出两条一样的会。
+    -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+
     <application
         android:name=".LifeInApp"
         android:allowBackup="false"

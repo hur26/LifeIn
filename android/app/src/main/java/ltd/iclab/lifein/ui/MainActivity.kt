@@ -1,10 +1,12 @@
 package ltd.iclab.lifein.ui
 
+import android.Manifest
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -30,6 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import ltd.iclab.lifein.LifeInApp
+import ltd.iclab.lifein.calendar.CalendarWriter
 import ltd.iclab.lifein.collect.CollectorState
 import ltd.iclab.lifein.data.Enrollment
 import ltd.iclab.lifein.data.LifeInDatabase
@@ -43,6 +46,14 @@ import ltd.iclab.lifein.data.LifeInDatabase
  * 配好之后三个页签,对应三个问题:今天要干什么、有什么等我点头、采集器还活着吗。
  */
 class MainActivity : ComponentActivity() {
+
+    /**
+     * 日历是危险权限,只能在界面上要。**这个 App 要的权限一共就两处**:
+     * 通知使用权(去系统设置里开)和这一个 —— 少到可以一句话解释清楚,
+     * 而一个读你全部通知的 App 最需要的正是"能解释清楚"。
+     */
+    private val calendarPermission =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,6 +71,14 @@ class MainActivity : ComponentActivity() {
                         Home(
                             repo = repo,
                             onOpenListenerSettings = { openListenerSettings() },
+                            onRequestCalendar = {
+                                calendarPermission.launch(
+                                    arrayOf(
+                                        Manifest.permission.READ_CALENDAR,
+                                        Manifest.permission.WRITE_CALENDAR,
+                                    )
+                                )
+                            },
                             onUnenroll = {
                                 app.secrets.clear()
                                 enrolled = null
@@ -81,6 +100,7 @@ class MainActivity : ComponentActivity() {
 private fun Home(
     repo: Repository,
     onOpenListenerSettings: () -> Unit,
+    onRequestCalendar: () -> Unit,
     onUnenroll: () -> Unit,
 ) {
     var tab by remember { mutableIntStateOf(0) }
@@ -108,6 +128,12 @@ private fun Home(
                 )
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = onOpenListenerSettings) { Text("打开通知使用权设置") }
+                    if (!CalendarWriter(context).hasPermission()) {
+                        // 没有这个权限时,日程会一直停在"未写入日历"。
+                        // 那个状态在列表和小组件上都看得见,但原因只有这里说得清
+                        Text("没有日历权限,日程写不进系统日历")
+                        TextButton(onClick = onRequestCalendar) { Text("授予日历权限") }
+                    }
                     CollectorState.lastUpload(context)?.let { Text("上次上报:$it") }
                     CollectorState.lastHeartbeat(context)?.let { Text("上次心跳:$it") }
                     CollectorState.lastError(context)?.let {
