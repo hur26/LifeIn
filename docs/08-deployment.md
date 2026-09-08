@@ -415,30 +415,16 @@ P1 只放消息类。银行与支付类是 P2 的事,提前加了也会被 `purp
 
 **采集凭据读不到账本** —— 03 要求"实测验证,不是设计上认为":
 
-```python
-# 用采集密钥去打查询接口,应当拿到 401 且响应体是空的
-import httpx, json, time
-from lifein.api import auth
-from lifein.config import get_settings
-from lifein.db import session_scope
-from lifein.repos import credentials
-
-user, device, base = "<uuid>", "pixel-7a", "https://你的域名"
-with session_scope() as s:
-    secret = credentials.get_device_credential(
-        user, s, kind=credentials.INGEST_KIND, device_id=device,
-        settings=get_settings(), for_ingest=True)["secret"]
-
-body = json.dumps({"device_id": device}).encode()
-ts = str(int(time.time()))
-sig = auth.sign(secret, auth.signing_string(
-    method="POST", path="/app/token", timestamp=ts, body=body))
-r = httpx.post(f"{base}/app/token", content=body, headers={
-    "Content-Type": "application/json",
-    auth.HEADER_USER: user, auth.HEADER_DEVICE: device,
-    auth.HEADER_TIMESTAMP: ts, auth.HEADER_SIGNATURE: sig})
-print(r.status_code, repr(r.text))   # 期望:401 ''
+```bash
+python scripts/verify-app-api.py            # 默认打 http://127.0.0.1:8000
+LIFEIN_BASE=https://你的域名 python scripts/verify-app-api.py
 ```
+
+那个脚本对着**真库、真 HTTP** 走一遍两组接口:心跳、上报、采集密钥换 token
+(必须 401)、拿采集密钥伪造的 token(必须 401)、六个查询接口、以及吊销之后
+同一个 token 立刻失效。**它不会往 `raw_events` 里写任何东西** ——
+白名单空着时上报会被第一道挡下(06 §6.4),链路照样走完,
+而测试数据一旦进了事件流,第二天就会出现在摘要里。
 
 拿不到 401 就**立刻停下**:那意味着采集端能读账本,而手机丢了等于全部数据丢了
 ([R11](05-risks.md#r11--app-直连服务端的认证面))。
