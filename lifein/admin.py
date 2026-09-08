@@ -19,6 +19,8 @@
     python -m lifein.admin list-devices --user <uuid>
     python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm
     python -m lifein.admin list-sources --user <uuid>   # 白名单 + 采集器心跳
+    python -m lifein.admin rules --user <uuid> --detail # 影子期数据,判断误报率
+    python -m lifein.admin rule-mode --user <uuid> --rule upcoming_schedule --mode active
 """
 
 from __future__ import annotations
@@ -584,6 +586,71 @@ def cmd_list_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rules(args: argparse.Namespace) -> int:
+    """看主动规则的状态与**影子期的数据**。
+
+    03 要求"先跑一周影子模式统计,再决定是否转 active",而统计的前提是
+    看得见 —— 在这条命令之前,影子记录只进得去、出不来。
+
+    误报率要人自己判:命令把影子期那些"要是真发出来会长什么样"逐条列出来,
+    你数一下其中几条是你不想收的。**低于 20% 才允许转 active**
+    ([R4](../docs/05-risks.md#r4--主动推送误报摧毁信任))。
+    """
+    from lifein.repos import push_log, rule_state
+    from lifein.rules import builtin
+
+    since = datetime.now(UTC) - timedelta(days=args.days)
+
+    with session_scope() as session:
+        modes = rule_state.all_modes(args.user, session)
+        records = push_log.list_since(args.user, session, since=since, limit=500)
+
+    print(f"最近 {args.days} 天\n")
+    for rule in builtin.ALL_RULES:
+        mode = modes.get(rule.rule_id, rule_state.RuleMode.SHADOW)
+        mine = [r for r in records if r.rule_id == rule.rule_id]
+        shadowed = [r for r in mine if r.mode == "shadow"]
+        active = [r for r in mine if r.mode == "active"]
+        print(
+            f"{rule.rule_id:<24} {mode.value:<7} "
+            f"影子 {len(shadowed):>3} 条,真推 {len(active):>3} 条"
+        )
+
+    if not args.detail:
+        print("\n加 --detail 逐条看影子期的内容(判断误报率要看这个)")
+        return 0
+
+    print("\n影子期逐条(判断哪些是你不想收的):")
+    for record in records:
+        if record.mode != "shadow":
+            continue
+        print(f"  {record.created_at:%m-%d %H:%M}  [{record.rule_id}]  {record.title}")
+    return 0
+
+
+def cmd_rule_mode(args: argparse.Namespace) -> int:
+    """开关一条规则(产品定义 §5:每条主动推送都要能一键关闭该类规则)。
+
+    **`off` 和 `shadow` 不是一回事**(06 §2.12):`off` 是你主动关掉的那一档,
+    不该再被自动转回 active;`shadow` 是还在观察期,迟早要转。
+    """
+    from lifein.repos import rule_state
+
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        rule_state.set_mode(
+            args.user, session, rule_id=args.rule, mode=rule_state.RuleMode(args.mode)
+        )
+
+    print(f"{args.rule} → {args.mode}")
+    if args.mode == "active":
+        # 不拦,但要问一句:R4 说误报两次就足够让人关掉通知
+        print("转 active 之前看过影子期的数据了吗?误报率要低于 20%(rules --detail)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -704,6 +771,18 @@ def build_parser() -> argparse.ArgumentParser:
     sources = sub.add_parser("list-sources", help="看白名单与采集器心跳")
     sources.add_argument("--user", required=True)
     sources.set_defaults(func=cmd_list_sources)
+
+    rules = sub.add_parser("rules", help="看主动规则的状态与影子期数据")
+    rules.add_argument("--user", required=True)
+    rules.add_argument("--days", type=int, default=7, help="看最近几天,默认一周")
+    rules.add_argument("--detail", action="store_true", help="逐条列影子期的内容")
+    rules.set_defaults(func=cmd_rules)
+
+    mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
+    mode.add_argument("--user", required=True)
+    mode.add_argument("--rule", required=True)
+    mode.add_argument("--mode", required=True, choices=("shadow", "active", "off"))
+    mode.set_defaults(func=cmd_rule_mode)
 
     return parser
 

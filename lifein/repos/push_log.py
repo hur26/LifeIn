@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import text
@@ -116,6 +117,84 @@ _WAS_PUSHED = text("""
        AND created_at >= :since
      LIMIT 1
 """)
+
+
+@dataclass(frozen=True)
+class PushRecord:
+    """一条推送记录里**给人看的那部分**。
+
+    影子期的复盘全靠它:标题 + 时间 + 是哪条规则,足够判断"这条要是真发出来,
+    是不是误报"。`payload_digest` 里本来就只有标题和长度(digest_card),
+    所以这里读不到正文 —— 那是有意的,日志本身是数据集中点。
+    """
+
+    id: int
+    rule_id: str | None
+    channel: str
+    mode: str
+    title: str
+    dedup_key: str | None
+    """这条推送针对的是哪个东西(日程提醒里就是那条 `todos.id`)。
+
+    **复盘时靠它去把内容解出来** —— 日志里不存正文(AGENTS §3:审计记摘要不记原文),
+    所以"这条提醒说的是哪件事"是在读的时候现查的,不是写的时候存下来的。
+    """
+
+    delivered: bool
+    error: str | None
+    created_at: datetime
+
+
+_LIST_SINCE = text("""
+    SELECT id, rule_id, channel, mode, payload_digest, delivered, error, created_at
+      FROM push_log
+     WHERE user_id = :user_id
+       AND created_at >= :since
+       AND (CAST(:mode AS TEXT) IS NULL OR mode = CAST(:mode AS TEXT))
+       AND (CAST(:rule_id AS TEXT) IS NULL OR rule_id = CAST(:rule_id AS TEXT))
+     ORDER BY created_at DESC
+     LIMIT :limit
+""")
+
+
+def list_since(
+    user_id: str,
+    session: Session,
+    *,
+    since: datetime,
+    mode: str | None = None,
+    rule_id: str | None = None,
+    limit: int = 200,
+) -> list[PushRecord]:
+    """列出一段时间内的推送记录。**影子期复盘读的就是它**。
+
+    03 要求"先跑一周影子模式统计,再决定是否转 active",而统计的前提是
+    看得见 —— 在这个函数之前,影子记录只进得去出不来。
+    """
+    rows = session.execute(
+        _LIST_SINCE,
+        {
+            "user_id": user_id,
+            "since": since,
+            "mode": mode,
+            "rule_id": rule_id,
+            "limit": limit,
+        },
+    ).all()
+    return [
+        PushRecord(
+            id=row.id,
+            rule_id=row.rule_id,
+            channel=row.channel,
+            mode=row.mode,
+            title=str((row.payload_digest or {}).get("title", "(没有标题)")),
+            dedup_key=(row.payload_digest or {}).get("dedup_key"),
+            delivered=row.delivered,
+            error=row.error,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 def was_pushed_since(

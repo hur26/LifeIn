@@ -25,13 +25,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from lifein.alerts import Alerter
-from lifein.channels.base import Channel
+from lifein.channels.base import Card, Channel
 from lifein.repos import push_log, rule_state
 from lifein.rules.base import Reminder, Rule, RuleContext
 from lifein.rules.builtin import ALL_RULES
@@ -117,6 +117,23 @@ def run_once(
     return result
 
 
+def _with_off_hint(card: Card, rule_id: str) -> Card:
+    """给推出去的提醒加一行"怎么关掉这一类"。
+
+    [产品定义 §5](../../docs/01-product-spec.md#5-主动性双模式) 要求
+    **每条主动推送都要能一键关闭该类规则**。P1 没有交互按钮
+    (那是 P3 的审批卡片,ADR-001),所以"一键"在这一期的形态是
+    **一条能直接抄走的命令**。
+
+    要紧的不是它有多方便,而是**看到这条推送的当下就知道怎么关** ——
+    等到去翻文档才找得到关法的时候,人已经先把整类通知关掉了
+    ([R4](../../docs/05-risks.md#r4--主动推送误报摧毁信任))。
+    """
+    hint = f"不想再收这类:python -m lifein.admin rule-mode --rule {rule_id} --mode off"
+    joined = "\n".join([card.footer, hint]) if card.footer else hint
+    return replace(card, footer=joined)
+
+
 def _handle(
     user_id: str,
     session: Session,
@@ -171,8 +188,10 @@ def _handle(
         result.suppressed += 1
         return
 
+    card = _with_off_hint(reminder.card, rule.rule_id)
+
     try:
-        delivery = deps.channel.send(user_id, reminder.card)
+        delivery = deps.channel.send(user_id, card)
     except Exception as exc:  # noqa: BLE001
         # 推送失败也要写 push_log:"发过但没送到"是排查通道问题时唯一的线索。
         # 失败的不算额度(count 只数 delivered),所以下一轮它还有机会
@@ -181,7 +200,7 @@ def _handle(
             session,
             channel=deps.channel.name,
             mode="active",
-            card=reminder.card,
+            card=card,
             delivered=False,
             rule_id=rule.rule_id,
             dedup_key=reminder.dedup_key,
@@ -196,7 +215,7 @@ def _handle(
         session,
         channel=delivery.channel,
         mode="active",
-        card=reminder.card,
+        card=card,
         delivered=True,
         rule_id=rule.rule_id,
         dedup_key=reminder.dedup_key,

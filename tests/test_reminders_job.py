@@ -334,3 +334,82 @@ def test_reminder_dedup_is_per_rule(pg_session, user_id):
 
     assert result.pushed == 2
     assert len(channel.sent) == 2
+
+
+class TestTheOffSwitch:
+    """产品定义 §5:**每条主动推送都要能一键关闭该类规则。**
+
+    P1 没有交互按钮(那是 P3 的审批卡片),所以"一键"在这一期的形态是
+    推送里带一条能直接抄走的命令。要紧的不是它多方便,而是**看到推送的当下
+    就知道怎么关** —— 等到要去翻文档才找得到关法时,人已经把整类通知关掉了(R4)。
+    """
+
+    def test_every_active_push_says_how_to_turn_it_off(self, pg_session, user_id):
+        a_schedule(pg_session, user_id)
+        rule_state.set_mode(
+            user_id, pg_session, rule_id=UPCOMING_SCHEDULE.rule_id, mode=rule_state.RuleMode.ACTIVE
+        )
+        reminder_deps, channel = deps()
+
+        run_once(user_id, pg_session, deps=reminder_deps, now=NOW)
+
+        (card,) = channel.sent
+        assert card.footer and UPCOMING_SCHEDULE.rule_id in card.footer
+        assert "rule-mode" in card.footer
+
+    def test_turning_a_rule_off_is_not_the_same_as_shadow(self, pg_session, user_id):
+        """`off` 是用户主动关掉的那一档,不该再被自动转回 active(06 §2.12)。"""
+        a_schedule(pg_session, user_id)
+        rule_state.set_mode(
+            user_id, pg_session, rule_id=UPCOMING_SCHEDULE.rule_id, mode=rule_state.RuleMode.OFF
+        )
+        reminder_deps, channel = deps()
+
+        result = run_once(user_id, pg_session, deps=reminder_deps, now=NOW)
+
+        assert channel.sent == []
+        # 关掉的连影子记录都不留 —— 那是"你不想要这类",不是"还在观察"
+        assert result.shadowed == 0
+        assert push_log.list_since(user_id, pg_session, since=NOW - timedelta(days=1)) == []
+
+
+class TestShadowReview:
+    """03 要求"先跑一周影子模式统计,再决定是否转 active"。
+
+    统计的前提是看得见 —— 在 `list_since` 之前,影子记录只进得去、出不来。
+    """
+
+    def test_shadow_pushes_can_be_listed_for_review(self, pg_session, user_id):
+        a_schedule(pg_session, user_id, title="项目周会")
+        reminder_deps, channel = deps()  # 默认 shadow
+
+        run_once(user_id, pg_session, deps=reminder_deps, now=NOW)
+
+        assert channel.sent == []  # 影子期一条都不推
+        records = push_log.list_since(
+            user_id, pg_session, since=NOW - timedelta(days=1), mode="shadow"
+        )
+        (record,) = records
+        assert record.rule_id == UPCOMING_SCHEDULE.rule_id
+        assert record.delivered is False
+        # 日志里**没有正文**(审计记摘要不记原文),所以复盘靠 dedup_key
+        # 在读的时候把那条日程解出来 —— admin rules --detail 做的就是这件事
+        assert record.dedup_key is not None
+        assert todos.get_todo(user_id, pg_session, todo_id=record.dedup_key).title == "项目周会"
+
+    def test_filtering_by_rule(self, pg_session, user_id):
+        a_schedule(pg_session, user_id)
+        reminder_deps, _ = deps()
+        run_once(user_id, pg_session, deps=reminder_deps, now=NOW)
+
+        assert push_log.list_since(
+            user_id, pg_session, since=NOW - timedelta(days=1), rule_id=PENDING_BACKLOG.rule_id
+        ) == []
+        assert len(
+            push_log.list_since(
+                user_id,
+                pg_session,
+                since=NOW - timedelta(days=1),
+                rule_id=UPCOMING_SCHEDULE.rule_id,
+            )
+        ) == 1
