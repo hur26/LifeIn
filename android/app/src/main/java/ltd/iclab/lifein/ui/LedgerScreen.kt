@@ -1,5 +1,8 @@
 package ltd.iclab.lifein.ui
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -28,8 +31,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import ltd.iclab.lifein.collect.ReceiptScanner
 import ltd.iclab.lifein.net.BudgetDto
 import ltd.iclab.lifein.net.ManualTxnBody
 import ltd.iclab.lifein.net.MonthlyReportDto
@@ -335,17 +340,48 @@ private fun CategoryDialog(
     )
 }
 
+/**
+ * 手动补一笔。**拍小票只是把这个表单先填上几格**,不是另一条路 ——
+ * 识别出来的东西一律要人看一眼再点"记上",而不是直接入账。
+ *
+ * 小票上"实付"和"原价"、桌号和金额长得一样近,而
+ * [03 那条"误记率 = 0"](../../../../../../../docs/03-roadmap.md)
+ * 不区分错误来自模型还是来自 OCR。
+ */
 @Composable
 private fun ManualEntryDialog(onSubmit: (ManualTxnBody) -> Unit, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     var amount by remember { mutableStateOf("") }
     var merchant by remember { mutableStateOf("") }
     var category by remember { mutableStateOf<String?>(null) }
+    var scanNote by remember { mutableStateOf<String?>(null) }
+
+    val pickPhoto = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            // 认不出来不是异常:小票拍糊、光线不好都是日常,
+            // 弹错误对话框只会让人下次不再用这个功能
+            val parsed = runCatching { ReceiptScanner(context).scan(uri) }.getOrNull()
+            if (parsed?.useful == true) {
+                amount = parsed.amount!!.toPlainString()
+                parsed.merchant?.let { merchant = it }
+                scanNote = "认出来了,核对一下再记上"
+            } else {
+                scanNote = "没认出金额,自己填一下"
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("手动补一笔") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = { pickPhoto.launch("image/*") }) { Text("拍/选一张小票") }
+                scanNote?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 OutlinedTextField(
                     value = amount,
                     onValueChange = { amount = it },

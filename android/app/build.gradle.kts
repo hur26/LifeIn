@@ -85,5 +85,11 @@ dependencies {
     // 表现会是"扫码页打开就报错",且只在真机上出现
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
+    // 小票识别(ADR-021 的 2026-09 补充)。**打包版**,不是 Play 服务版 ——
+    // 和上面那条同一个理由:免捆绑版在没有 Play 服务的国内 ROM 上会静默
+    // 降级成"识别不出来",而那和"这张小票拍糊了"长得一模一样。
+    // 代价是 APK 大约多 20 MB,这个代价是明知道并且接受的
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+
     testImplementation("junit:junit:4.13.2")
 }
