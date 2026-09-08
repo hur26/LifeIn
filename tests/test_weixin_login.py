@@ -87,9 +87,7 @@ def test_redirect_switches_the_base_url():
 
 def test_expired_qr_is_refreshed():
     second_qr = {"qrcode": "def456", "qrcode_img_content": "https://weixin.qq.com/x/def"}
-    _, _, shown, _ = run(
-        [{"status": "expired"}, CONFIRMED], qr_responses=[QR_RESPONSE, second_qr]
-    )
+    _, _, shown, _ = run([{"status": "expired"}, CONFIRMED], qr_responses=[QR_RESPONSE, second_qr])
     assert len(shown) == 2
     assert shown[1].value == "def456"
 

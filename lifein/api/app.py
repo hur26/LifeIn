@@ -19,10 +19,12 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
 
-from lifein.bootstrap import Services, build_services, resolve_user_for_message
+from lifein.bootstrap import Services, build_services
 from lifein.channels.wecom_callback import CallbackRejected
 from lifein.db import session_scope
 from lifein.jobs.qa_reply import QaDeps, handle_message
+from lifein.jobs.weixin_inbox import start_inbox_thread
+from lifein.repos import users
 from lifein.scheduler import build_scheduler, run_digest_for_all_users
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         scheduler = None
+        inbox_stops: list = []
         if with_scheduler:
             scheduler = build_scheduler(resolved)
             scheduler.start()
@@ -48,9 +51,15 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
                 run_digest_for_all_users(resolved)
             except Exception:  # noqa: BLE001
                 log.exception("启动补跑失败")
+
+            # 微信入站:每个配了微信的用户一个线程。没配的会自己退出,
+            # 所以这里不判断配没配
+            inbox_stops = _start_inboxes(resolved)
         try:
             yield
         finally:
+            for stop in inbox_stops:
+                stop.set()
             if scheduler is not None:
                 scheduler.shutdown(wait=False)
 
@@ -108,7 +117,7 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
                     deps=QaDeps(
                         llm=svc.llm,
                         channel=svc.channel,
-                        resolve_user=resolve_user_for_message,
+                        resolve_user=svc.resolve_user,
                     ),
                     now=datetime.now(UTC),
                 )
@@ -122,3 +131,19 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
         return Response(content="", media_type="text/plain")
 
     return app
+
+
+def _start_inboxes(services: Services) -> list:
+    """给每个用户起一个微信入站线程,返回它们的停止开关。
+
+    没配微信的线程会立刻自己退出 —— 所以这里不判断配没配,少一处会漂移的判断。
+    """
+    stops = []
+    with session_scope() as session:
+        user_ids = users.list_active_users(session)
+    for user_id in user_ids:
+        _thread, stop = start_inbox_thread(
+            user_id, services=services, session_factory=session_scope
+        )
+        stops.append(stop)
+    return stops

@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -49,6 +50,11 @@ class Services:
     """推送出口。配了企微就是"微信优先、企微兜底";没配就只有微信(ADR-018)。"""
 
     alerter: Alerter
+    resolve_user: Callable[[Session, InboundMessage], users.User | None] = field(
+        default=lambda session, message: resolve_user_for_message(session, message)
+    )
+    """把通道内的发送者换成本系统用户。放在这里,入站通道和 HTTP 入口拿的是同一个。"""
+
     wecom: WecomClient | None = None
     callback: WecomCallback | None = None
     """没配企微时是 None。企微要配可信 IP 得先有公网域名,而 iLink 让这件事
