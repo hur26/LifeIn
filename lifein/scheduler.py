@@ -28,6 +28,8 @@ from lifein.db import session_scope
 from lifein.jobs.daily_digest import DigestDeps, run_once
 from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
+from lifein.jobs.plan_extract import PlanDeps
+from lifein.jobs.plan_extract import run_once as run_plan_once
 from lifein.repos import users
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -36,6 +38,15 @@ log = logging.getLogger(__name__)
 
 DIGEST_JOB_ID = "daily_digest"
 MEMORY_JOB_ID = "memory_extract"
+PLAN_JOB_ID = "plan_extract"
+
+PLAN_DELAY_MINUTES = 45
+"""日程提取排在摘要之后多久。
+
+在记忆抽取(+30)之后再隔一刻钟,理由和记忆那条一样:它们都只读 raw_events,
+而当天的事件是摘要那一步采进来的。彼此之间没有依赖 —— 错开只是为了
+不在同一分钟里同时打三次外部模型接口。
+"""
 
 MEMORY_DELAY_MINUTES = 30
 """记忆抽取排在摘要之后多久。
@@ -124,17 +135,50 @@ def run_memory_extract_for_all_users(
     return written
 
 
+def run_plan_extract_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户提一遍日程与待办。返回直接建出来的条数。
+
+    **返回的不是"提取到多少"** —— 大部分会进待确认队列,那些不算已经发生的事。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    created = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = PlanDeps(llm=services.llm, alerter=services.alerter)
+                results = run_plan_once(user_id, session, deps=deps, now=moment)
+            created += sum(r.created for r in results)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的日程提取失败", user_id)
+            services.alerter.alert("日程提取异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return created
+
+
 def build_scheduler(
     services: Services,
     *,
     runner: Callable[[Services], int] | None = None,
     memory_runner: Callable[[Services], int] | None = None,
+    plan_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
     run_memory = memory_runner or run_memory_extract_for_all_users
+    run_plan = plan_runner or run_plan_extract_for_all_users
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
+    plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
     scheduler.add_job(
@@ -156,6 +200,15 @@ def build_scheduler(
         ),
         id=MEMORY_JOB_ID,
         name="记忆抽取",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_plan(services),
+        trigger=CronTrigger(hour=plan_hour, minute=plan_minute, timezone=services.settings.tzinfo),
+        id=PLAN_JOB_ID,
+        name="日程与待办提取",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,

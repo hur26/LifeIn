@@ -53,7 +53,7 @@ def register_tools() -> None:
     可能先于工具模块加载。晚几十毫秒,换来的是不用关心谁先谁后
     (contract.py 里写着同一件事)。
     """
-    from lifein.agents import digest, memory, qa  # noqa: F401
+    from lifein.agents import digest, memory, planner, qa  # noqa: F401
     from lifein.tools import memory as memory_tools  # noqa: F401
     from lifein.tools import todo as todo_tools  # noqa: F401
 
