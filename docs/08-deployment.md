@@ -15,6 +15,9 @@
 >
 > 所以可以分两步:先跑通摘要拿到第一条推送([§1](#1-跑通摘要)),
 > 等有服务器了再开问答([§2](#2-可选开问答))。
+>
+> **手机那半边是 P1 的事,在 [§5](#5-p1装上手机那半边)** —— 摘要的 14 天数完再装,
+> 顺序反了会把那 14 天的样本口径搅了。
 
 P0 的验收标准是"你自己每天会不会看",而那个问题只需要摘要就能回答。
 **先别为了问答去买服务器。**
@@ -327,3 +330,127 @@ P0 的唯一目标是回答两个问题:你会不会每天看,以及摘要质量
 - **企微日程接口**的确切路径与分页参数(标记在 `lifein/sources/calendar_source.py`
   的常量上,对不上只改那三行,归一化不用动)
 - **LLM 供应商是否将请求用于训练**,记进部署记录([R12](05-risks.md#r12--外部-llm-供应商侧的数据暴露))
+
+---
+
+## 5. P1:装上手机那半边
+
+摘要跑顺了、14 天数完了,再做这一步。**顺序不能反** ——
+采集器一放行,群消息就会进 `raw_events`,而摘要是按窗口读它的:
+代码一个字节没动,摘要的口径却变了,那 14 天的样本就不好比了
+([AGENTS §9](../AGENTS.md#9-当前状态))。
+
+服务端**没有新迁移**:App 用到的四张表(`credentials`、`collector_heartbeat`、
+`collector_whitelist`、`todos`)前面几片就建好了。拉代码、重启进程即可。
+
+### 5.1 签发这台手机的凭据
+
+```bash
+python -m lifein.admin issue-device --user <uuid> --device-id pixel-7a \
+    --base-url https://你的域名
+```
+
+它会打出一串配码,并在当前目录生成 `device-pixel-7a.html`(二维码)。
+
+**那串东西只显示一次。** 库里存的是密文,服务端自己也读不出来给你看第二遍
+—— 丢了就重新签发,旧的同时作废。
+
+签出来的是**两条独立的行、两把独立的密钥**(铁律 12):采集那把只能写,
+查询那把才读得到东西。手机丢了:
+
+```bash
+python -m lifein.admin revoke-device --user <uuid> --device-id pixel-7a
+```
+
+**下一次请求就失效**,不用等 token 过期([06 §6.3](06-data-model.md#63-查询端长期凭据换短期-token))。
+
+### 5.2 编 App、装上去
+
+编译步骤在 [`android/README.md`](../android/README.md)。产物是
+`android/app/build/outputs/apk/debug/app-debug.apk`,`adb install` 或者直接传到手机装。
+
+**`base_url` 必须是 https。** 写 `http://` 的话安卓 9 起直接拒明文流量,
+表现是所有请求都失败 —— 那正是要的(架构 §8.3),没有开口子。
+
+### 5.3 在手机上配好
+
+1. 打开 App,把 5.1 那串配码粘进去(用系统相机扫二维码扫出文字再粘)
+2. **系统设置 → 通知使用权 → 允许 LifeIn** —— 状态页有按钮直接跳过去
+3. 状态页点"授予日历权限"
+4. 厂商的自启动 / 电池优化白名单里加上它(各家位置不同,这一步没有 API 能替你做)
+5. 想要小组件就长按桌面加上
+
+### 5.4 放行来源(**默认拒绝,不放行什么都进不来**)
+
+```bash
+python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm
+python -m lifein.admin list-sources --user <uuid>     # 白名单 + 心跳一起看
+```
+
+P1 只放消息类。银行与支付类是 P2 的事,提前加了也会被 `purpose` 闸门挡住
+([06 §6.4](06-data-model.md#64-采集上报-post-ingestevents))。
+
+### 5.5 确认它真的在跑
+
+按这个顺序看,每一步单独能判断:
+
+| 看哪 | 说明什么 |
+| --- | --- |
+| App 状态页"通知监听:已开启" | 手机这侧的权限对了 |
+| 状态页"待上报 N 条" | 采集器**真的收到了东西**(筛过之后)。一直是 0 = 那个 App 没发通知,或全被筛掉了 |
+| 状态页"上次上报:收下 X 条" | 服务端收下了。X=0 而丢弃不为 0,多半是白名单没放行 |
+| `list-sources` 里的最后心跳 | 服务端这侧看到的。超过一小时会发告警邮件 |
+
+### 5.6 三条只能实测的事(P1 验收标准要的就是这几条)
+
+**掉线告警**:别等它自然掉线。**去系统里关掉通知使用权** ——
+下一次心跳会带 `listener_enabled=false`,服务端照样告警
+([06 §6.5](06-data-model.md#65-心跳-post-ingestheartbeat))。这比等一小时快,
+而且验的是更隐蔽的那一种:心跳正常但采不到东西。
+
+**日程真的进日历**:等一条日程被提取出来 → App 的待确认里点确认 →
+半小时内(或在 App 里点一下待办触发一次同步)看系统日历。
+回来看 `todos.synced_at` 有没有值:**空的就是没落地**,那个状态在待办列表上
+也看得见("还没写进系统日历")。
+
+**采集凭据读不到账本** —— 03 要求"实测验证,不是设计上认为":
+
+```python
+# 用采集密钥去打查询接口,应当拿到 401 且响应体是空的
+import httpx, json, time
+from lifein.api import auth
+from lifein.config import get_settings
+from lifein.db import session_scope
+from lifein.repos import credentials
+
+user, device, base = "<uuid>", "pixel-7a", "https://你的域名"
+with session_scope() as s:
+    secret = credentials.get_device_credential(
+        user, s, kind=credentials.INGEST_KIND, device_id=device,
+        settings=get_settings(), for_ingest=True)["secret"]
+
+body = json.dumps({"device_id": device}).encode()
+ts = str(int(time.time()))
+sig = auth.sign(secret, auth.signing_string(
+    method="POST", path="/app/token", timestamp=ts, body=body))
+r = httpx.post(f"{base}/app/token", content=body, headers={
+    "Content-Type": "application/json",
+    auth.HEADER_USER: user, auth.HEADER_DEVICE: device,
+    auth.HEADER_TIMESTAMP: ts, auth.HEADER_SIGNATURE: sig})
+print(r.status_code, repr(r.text))   # 期望:401 ''
+```
+
+拿不到 401 就**立刻停下**:那意味着采集端能读账本,而手机丢了等于全部数据丢了
+([R11](05-risks.md#r11--app-直连服务端的认证面))。
+
+### 5.7 卡住了
+
+| 现象 | 原因 |
+| --- | --- |
+| App 所有请求都 401 | 手机时钟偏差超过五分钟(签名带时间戳),或者凭据被吊销过。心跳返回里有服务端时间可以对 |
+| 上报回来全是 `not_whitelisted` | 服务端白名单没放行那个包名 —— 跑 `allow-source` |
+| 上报回来是 `phase_not_open` | 那条白名单的 `purpose` 是 `transaction`,P1 不放行 |
+| 队列一直涨、上报不动 | 看状态页"最近一次失败"。401 不会自动重试(设计如此,重试到没电也一样) |
+| 日程一直"未写入日历" | 日历权限没给;或者手机很久没联网。**这是看得见的延迟,不是丢失**(ADR-020) |
+| 小组件不刷新 | 各家省电策略。它是"看一眼"的入口不是提醒机制 —— 真提醒走消息通道 |
+| 心跳正常但什么都采不到 | 通知使用权被系统收走了。状态页那行会显示,服务端也会告警 |

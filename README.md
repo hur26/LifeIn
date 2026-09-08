@@ -125,7 +125,7 @@ flowchart TB
 | | 阶段 | 主题 | 验收标准 | 估计 |
 | :---: | :---: | --- | --- | :---: |
 | 🔨 | **P0** | 邮箱 + 日历 → 每日摘要 | 你自己每天真的会打开它 | 2–3 周 |
-| ⬜ | **P1** | 记忆层 + 安卓 App + 主动触发 | 它开始"记得你",且提醒不烦人 | 6–8 周 |
+| 🔨 | **P1** | 记忆层 + 安卓 App + 主动触发 | 它开始"记得你",且提醒不烦人 | 6–8 周 |
 | ⬜ | **P2** | 财务与账单 + App 账本 | 你不再逐笔记账 | 6–8 周 |
 | ⬜ | **P3** | 审批执行 | 你敢让它代发一条真实消息 | 4–5 周 |
 | ⬜ | **P4** | 多用户托管 + Web 控制台 | **朋友才在这一步进来** | 5–7 周 |
@@ -142,7 +142,7 @@ flowchart TB
 
 ---
 
-## 技术栈 (P0)
+## 技术栈
 
 | 用途 | 选型 |
 | --- | --- |
@@ -151,7 +151,8 @@ flowchart TB
 | 调度 | APScheduler(进程内,不引入消息队列) |
 | 存储 | PostgreSQL + pgvector(单库,不引入独立向量库) |
 | 模型 | 外部 LLM API 直调(OpenAI 兼容接口,换 base_url + model 即切换厂商),**P0 不套 agent 框架** |
-| 入口 | 企业微信(推送 + 审批卡片)· 安卓 App(采集 + 查看,**不接收推送**) |
+| 入口 | 微信 iLink(推送,[ADR-018](docs/04-tech-decisions.md#adr-018--微信推送走-ilink-bot-api企微降为兜底与审批入口))· 企业微信(兜底 + 审批卡片)· 安卓 App(采集 + 查看,**不接收推送**) |
+| App(P1 起) | Compose · WorkManager · Room · OkHttp,**不接厂商推送 SDK**([ADR-021](docs/04-tech-decisions.md#adr-021--安卓端依赖清单逐条定性)) |
 | 数据源 | 邮箱 IMAP + 授权码(QQ / 163)· 企业微信日程 API · 微信通知(P1)· 交易通知(P2) |
 
 <details>
@@ -185,7 +186,7 @@ flowchart TB
 | [03 开发计划](docs/03-roadmap.md) | P0–P4 分期,每期的验收标准和**退出条件** |
 | [04 技术决策](docs/04-tech-decisions.md) | 每个选型的理由,**以及被否决的方案和否决理由** |
 | [05 风险登记](docs/05-risks.md) | 隐私、合规、提示注入、成本、信任、平台政策 |
-| [06 数据模型](docs/06-data-model.md) | **归一化骨架、完整 DDL、待确认队列** —— 改这里等于改代码 |
+| [06 数据模型](docs/06-data-model.md) | **归一化骨架、完整 DDL、待确认队列、接口契约、评测集格式** —— 改这里等于改代码 |
 | [07 配置清单](docs/07-config.md) | 每个配置项**是什么意思**、白名单与验证码过滤 |
 | [08 部署实操](docs/08-deployment.md) | **第一次部署一步步怎么做** —— 凭据在哪拿、怎么确认成功、卡住了查哪 |
 
@@ -215,6 +216,17 @@ python -m lifein --once       # 立刻跑一遍完整链路
 python -m lifein              # 起服务(默认只监听 127.0.0.1)
 ```
 
+**手机那半边(P1)**:
+
+```bash
+python -m lifein.admin issue-device --user <uuid> --device-id pixel-7a   # 签配码
+python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm  # 默认拒绝
+python -m lifein.admin list-sources --user <uuid>                        # 白名单 + 心跳
+```
+
+App 的编译与安装见 [`android/README.md`](android/README.md),
+一步步部署在 [08 §5](docs/08-deployment.md#5-p1装上手机那半边)。
+
 **第一次部署照着 [08 部署实操](docs/08-deployment.md) 走** —— 企微后台点哪里、授权码在哪生成、每步怎么验证,都在里面。配置项的含义见 [07 配置清单](docs/07-config.md)。
 
 > 摘要**不需要公网**(服务端主动往企微发),只有问答需要回调。所以可以先在本机跑通摘要,有服务器了再开问答。
@@ -231,6 +243,9 @@ pytest                        # 连上真库,含迁移与约束
 
 **只跑不带库的那批不算跑过测试** —— 第一次接上真实 PostgreSQL 就抓出三个
 单元测试发现不了的问题,原因见 [AGENTS.md](AGENTS.md#本地跑测试)。
+
+**agent 的评测集另算**(06 §7):它会真的调模型、真的花钱,所以不进 CI、
+不进 pytest,改完 prompt 手动跑一次 —— `python -m lifein.evals planner`。
 
 ---
 
