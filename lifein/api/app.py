@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
 
-from lifein.bootstrap import Services, build_services
+from lifein.bootstrap import Services, build_services, resolve_user_for_message
 from lifein.channels.wecom_callback import CallbackRejected
 from lifein.db import session_scope
 from lifein.jobs.qa_reply import QaDeps, handle_message
@@ -99,7 +99,11 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
                 handle_message(
                     session,
                     message=message,
-                    deps=QaDeps(llm=svc.llm, channel=svc.channel),
+                    deps=QaDeps(
+                        llm=svc.llm,
+                        channel=svc.channel,
+                        resolve_user=resolve_user_for_message,
+                    ),
                     now=datetime.now(UTC),
                 )
         except Exception:  # noqa: BLE001

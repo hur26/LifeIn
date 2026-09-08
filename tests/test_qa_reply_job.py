@@ -15,8 +15,7 @@ import httpx
 import pytest
 from sqlalchemy import text
 
-from lifein.channels.base import Card, Delivery
-from lifein.channels.wecom_callback import InboundMessage
+from lifein.channels.base import Card, Delivery, InboundMessage
 from lifein.jobs.qa_reply import FAILED_REPLY, UNSUPPORTED_REPLY, QaDeps, handle_message
 from lifein.llm.client import LLMClient
 from lifein.models.normalized import EventKind, ExternalRef, NormalizedEvent, Trust
@@ -46,7 +45,8 @@ class FakeChannel:
 
 def message(content="报销批了吗", msg_type="text", from_user=WECOM_ID) -> InboundMessage:
     return InboundMessage(
-        from_user=from_user,
+        channel="wecom",
+        sender=from_user,
         msg_type=msg_type,
         content=content,
         msg_id="1",
@@ -109,9 +109,16 @@ def seed_event(pg_session, user_id: str) -> None:
     )
 
 
+def resolve_wecom(session, message):
+    return users.find_by_wecom_userid(session, wecom_userid=message.sender)
+
+
 def deps(channel=None, llm=None) -> tuple[QaDeps, FakeChannel]:
     channel = channel or FakeChannel()
-    return QaDeps(llm=llm or fake_llm(), channel=channel), channel
+    return (
+        QaDeps(llm=llm or fake_llm(), channel=channel, resolve_user=resolve_wecom),
+        channel,
+    )
 
 
 def test_question_gets_answered(pg_session, registered_user):

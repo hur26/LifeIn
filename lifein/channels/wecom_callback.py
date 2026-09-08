@@ -31,10 +31,11 @@ import logging
 import re
 import struct
 import time
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from lifein.channels.base import InboundMessage
 
 log = logging.getLogger(__name__)
 
@@ -62,15 +63,6 @@ _FIELDS = {
 
 class CallbackRejected(Exception):
     """回调不可信。**不要在响应里回显原因** —— 那等于给探测者做提示。"""
-
-
-@dataclass(frozen=True)
-class InboundMessage:
-    from_user: str
-    msg_type: str
-    content: str
-    msg_id: str
-    created_at: datetime
 
 
 def compute_signature(token: str, timestamp: str, nonce: str, encrypt: str) -> str:
@@ -194,7 +186,8 @@ class WecomCallback:
             raise CallbackRejected("消息里没有 FromUserName")
 
         return InboundMessage(
-            from_user=values["FromUserName"],
+            channel="wecom",
+            sender=values["FromUserName"],
             msg_type=values["MsgType"] or "unknown",
             content=values["Content"],
             msg_id=values["MsgId"],

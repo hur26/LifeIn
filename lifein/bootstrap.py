@@ -22,7 +22,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from lifein.alerts import Alerter, LoggingAlerter
-from lifein.channels.base import Channel
+from lifein.channels.base import Channel, InboundMessage
 from lifein.channels.fallback import FallbackChannel
 from lifein.channels.wecom import WecomChannel
 from lifein.channels.wecom_callback import WecomCallback
@@ -114,6 +114,29 @@ def _load_weixin_session(user_id: str) -> WeixinSession | None:
         base_url=stored.get("base_url") or WEIXIN_BASE_URL,
         context_token=stored.get("context_token"),
     )
+
+
+def resolve_user_for_message(session: Session, message: InboundMessage) -> users.User | None:
+    """按通道把发送者换成本系统用户。
+
+    企微给的是成员 UserID,直接查 `users.wecom_userid`。
+    iLink 给的是对方在 bot 会话里的 user id —— 那个值存在微信凭据里,
+    所以反过来遍历用户去比对。**P0 只有一个用户**,这个"遍历"就是一次比较;
+    P4 要换成一张索引表,到时候只改这个函数。
+    """
+    if message.channel == "wecom":
+        return users.find_by_wecom_userid(session, wecom_userid=message.sender)
+
+    if message.channel == "weixin":
+        settings = get_settings()
+        for user_id in users.list_active_users(session):
+            stored = credentials.get_credential(user_id, session, kind="weixin", settings=settings)
+            if stored and stored.get("to_user_id") == message.sender:
+                return users.get_user(user_id, session)
+        return None
+
+    log.warning("不认识的入站通道:%s", message.channel)
+    return None
 
 
 def _resolve_wecom_userid(user_id: str) -> str:

@@ -17,15 +17,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from lifein.agents.qa import QaFailed, QaInput, answer
-from lifein.channels.base import Card, Channel
-from lifein.channels.wecom_callback import InboundMessage
+from lifein.channels.base import Card, Channel, InboundMessage
 from lifein.governance.audit import ToolCallRecord
 from lifein.governance.registry import ToolLevel
 from lifein.llm.client import LLMClient, LLMError
@@ -52,6 +51,12 @@ MAX_QUESTION_CHARS = 500
 class QaDeps:
     llm: LLMClient
     channel: Channel
+    resolve_user: Callable[[Session, InboundMessage], users.User | None]
+    """把"通道内的发送者"换成本系统的用户。
+
+    企微认 UserID、iLink 认对方的 user id,**这个映射是通道的事,不是问答的事**。
+    注入进来,问答就不用为每加一个入站通道改一次。
+    """
 
 
 @dataclass
@@ -70,10 +75,10 @@ def handle_message(
     now: datetime,
     lookback: timedelta = LOOKBACK,
 ) -> ReplyResult:
-    user = users.find_by_wecom_userid(session, wecom_userid=message.from_user)
+    user = deps.resolve_user(session, message)
     if user is None:
         # 陌生人。不回复 —— 回复等于告诉对方这个地址是活的
-        log.warning("收到未知用户的消息:%s", message.from_user)
+        log.warning("收到未知用户的消息:channel=%s sender=%s", message.channel, message.sender)
         return ReplyResult(handled=False, reason="unknown_user")
 
     if not user.active:

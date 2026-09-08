@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 
@@ -36,6 +37,28 @@ class Card:
     summary: str
     sections: Sequence[CardSection] = field(default_factory=tuple)
     footer: str | None = None
+
+
+@dataclass(frozen=True)
+class InboundMessage:
+    """用户发进来的一条消息 —— **通道中立**。
+
+    企微回调解出来的是它,微信 iLink 长轮询收到的也是它。问答那条链路
+    (`jobs/qa_reply.py`)只认这个结构,所以加一个入站通道不用碰问答。
+
+    `channel_ref` 是通道自己的东西(比如 iLink 的 `context_token`) ——
+    回复时可能要原样带回去,但上层不解释它的含义。
+    """
+
+    channel: str
+    sender: str
+    """通道内的发送者标识:企微是 UserID,iLink 是对方的 user id。"""
+
+    msg_type: str
+    content: str
+    msg_id: str
+    created_at: datetime
+    channel_ref: str | None = None
 
 
 @dataclass(frozen=True)

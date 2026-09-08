@@ -82,7 +82,7 @@ def test_message_is_parsed():
     msg = callback().parse_message(
         body=body_for(encrypt), now=NOW, **signed(encrypt, str(int(NOW)))
     )
-    assert msg.from_user == "BaiYang"
+    assert msg.sender == "BaiYang"
     assert msg.msg_type == "text"
     assert msg.content == "上周我答应了谁什么事"
     assert msg.msg_id == "1234567890123456"
@@ -197,9 +197,7 @@ def test_default_skew_window_is_five_minutes():
     encrypt = encrypt_for(MESSAGE_XML)
     within = str(int(NOW - 299))
     assert (
-        callback()
-        .parse_message(body=body_for(encrypt), now=NOW, **signed(encrypt, within))
-        .from_user
+        callback().parse_message(body=body_for(encrypt), now=NOW, **signed(encrypt, within)).sender
         == "BaiYang"
     )
 
