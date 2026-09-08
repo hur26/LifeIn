@@ -23,6 +23,9 @@
     python -m lifein.admin rules --user <uuid> --detail # 影子期数据,判断误报率
     python -m lifein.admin rule-mode --user <uuid> --rule upcoming_schedule --mode active
     python -m lifein.admin import-statement --user <uuid> --file 账单.pdf --issuer cmb
+    python -m lifein.admin budget --user <uuid> --amount 5000            # 总预算
+    python -m lifein.admin budget --user <uuid> --category 餐饮 --amount 1500
+    python -m lifein.admin budgets --user <uuid>                         # 看进度
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import secrets as secrets_module
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from lifein.agents.digest import MAX_EVENTS
@@ -833,6 +837,70 @@ def _parse_statement(
 
 
 
+def cmd_budget(args: argparse.Namespace) -> int:
+    """设或删一条预算(P2 第 9 片)。
+
+    **不设预算就一条预警都不会发。** 这是刻意的:猜出来的额度一定是错的,
+    而一条错的预算发出的每一次提醒都是误报,而 R4 说误报两次就足够
+    让人永久关掉通知。
+    """
+    from lifein.repos import budgets
+
+    category = args.category
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+
+        if args.delete:
+            removed = budgets.delete_budget(args.user, session, category=category)
+            print("已删除" if removed else "本来就没有这条预算")
+            return 0
+
+        try:
+            budget = budgets.set_budget(
+                args.user,
+                session,
+                amount=Decimal(str(args.amount)),
+                category=category,
+                alert_threshold=Decimal(str(args.threshold)),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    name = budget.category or "总预算"
+    threshold = int(budget.alert_threshold * 100)
+    print(f"{name}:每月 {budget.amount} 元,用到 {threshold}% 时提醒一次")
+    print("超支当天还会再提醒一次 —— 这条规则默认在影子模式,")
+    print("看过几天再用 rule-mode --rule budget_alert --mode active 打开。")
+    return 0
+
+
+def cmd_budgets(args: argparse.Namespace) -> int:
+    """看每条预算当期花到哪儿了。**算的是"到现在为止",不是上个月。**"""
+    from lifein.repos import budgets
+
+    now = datetime.now(get_settings().tzinfo)
+    with session_scope() as session:
+        rows = budgets.progress(args.user, session, now=now)
+
+    if not rows:
+        print("还没设任何预算 —— 没有预算就不会有超支预警")
+        return 0
+
+    print(f"{now:%Y-%m} 到今天为止:")
+    for item in rows:
+        name = item.budget.category or "总预算"
+        mark = "已超支" if item.over else ("快到了" if item.near else "")
+        print(
+            f"  {name:<8} {item.spent:>10.2f} / {item.budget.amount:>10.2f}"
+            f"  {int(item.ratio * 100):>3}%  {mark}"
+        )
+    return 0
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -987,6 +1055,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stmt.add_argument("--dry-run", action="store_true", help="只解析打印,不入库")
     stmt.set_defaults(func=cmd_import_statement)
+
+    budget = sub.add_parser("budget", help="设一条月度预算(不设就不会有超支预警)")
+    budget.add_argument("--user", required=True)
+    budget.add_argument(
+        "--category",
+        default=None,
+        help="类目,不给就是总预算。必须在记账用的那个枚举内",
+    )
+    budget.add_argument("--amount", type=float, help="每月多少钱")
+    budget.add_argument(
+        "--threshold",
+        type=float,
+        default=0.9,
+        help="用到几成时提醒一次(默认 0.9)。超支当天会另外再提醒一次",
+    )
+    budget.add_argument("--delete", action="store_true", help="删掉这条预算")
+    budget.set_defaults(func=cmd_budget)
+
+    budget_list = sub.add_parser("budgets", help="看每条预算当期花到哪儿了")
+    budget_list.add_argument("--user", required=True)
+    budget_list.set_defaults(func=cmd_budgets)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)

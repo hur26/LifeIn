@@ -1,10 +1,16 @@
-"""P1 的两条内建规则。
+"""内建规则的清单。
 
-选这两条不是随手挑的:它们代表两类不同的主动推送,而这一期要验证的正是
-"主动说话时不招人烦"。
+P1 选的头两条代表两类不同的主动推送,而那一期要验证的正是
+"主动说话时不招人烦":
 
     upcoming_schedule   **有时限的事** —— 错过就没了,该提前说
     pending_backlog     **攒着的事** —— 不提也不会消失,所以宁可少说
+
+P2 加的第三条是第三类:
+
+    budget_alert        **已经发生的事** —— 说了也改不回来,但你得知道
+                        (03 要求超支**当天**发出,所以它必须是规则,
+                         不能是月度任务)
 
 两条都从 `shadow` 起步(没有 `rule_state` 记录就是 shadow),先跑一周看
 误报率,再决定转不转 active。03 的验收标准写着"主动提醒误报率 < 20%,
@@ -20,6 +26,7 @@ from datetime import timedelta
 from lifein.channels.base import Card, CardSection
 from lifein.repos import pending, todos
 from lifein.rules.base import Reminder, Rule, RuleContext
+from lifein.rules.budget import BUDGET_ALERT
 
 log = logging.getLogger(__name__)
 
@@ -116,5 +123,5 @@ PENDING_BACKLOG = Rule(
     evaluate=_pending_backlog,
 )
 
-ALL_RULES: tuple[Rule, ...] = (UPCOMING_SCHEDULE, PENDING_BACKLOG)
+ALL_RULES: tuple[Rule, ...] = (UPCOMING_SCHEDULE, PENDING_BACKLOG, BUDGET_ALERT)
 """加一条新规则只改这一行和一个新模块。**默认 shadow,不需要在这里声明。**"""

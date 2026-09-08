@@ -479,7 +479,10 @@ CREATE TABLE budgets (
     period          TEXT NOT NULL DEFAULT 'month',
     amount          NUMERIC(14,2) NOT NULL,
     alert_threshold NUMERIC(3,2) NOT NULL DEFAULT 0.9,
-    UNIQUE (user_id, category, period)
+    -- NULLS NOT DISTINCT 不能省:总预算的 category 是 NULL,而 Postgres 默认
+    -- 把 NULL 之间看成互不相同 —— 少了它,同一个人能有两条总预算,
+    -- 各发各的预警,而改额度这个动作在用户眼里就是失败了(迁移 0009)
+    UNIQUE NULLS NOT DISTINCT (user_id, category, period)
 );
 
 -- 凭据:字段级加密 + 支持轮换 + 读写权限分离
