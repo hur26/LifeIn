@@ -222,7 +222,7 @@ python -m lifein.admin create-user --name 你的名字 --wecom-userid 1.2 第 5 
 # 记下打印出来的 uuid
 
 python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username you@163.com
-# 这里会提示输授权码，不回显，粘贴后回车
+# 这里会提示输授权码,不回显,粘贴后回车
 
 python -m lifein.admin test-imap --user <uuid>
 ```
@@ -592,10 +592,21 @@ sudo journalctl -u lifein -n 50                            # 微信长轮询有�
 
 ```bash
 # /etc/cron.daily/lifein-backup
-sudo -u postgres pg_dump -d lifein --format=custom \
-    > /var/backups/lifein-$(date +\%F).dump
-find /var/backups -name 'lifein-*.dump' -mtime +14 -delete
+BACKUP_DIR=/var/backups/lifein /path/to/lifein/scripts/backup.sh
 ```
+
+那个脚本比一条 `pg_dump` 多做三件事,而**三件都是“备份看起来成功了但其实
+没用”的常见形态**:
+
+1. 写完立刻 `pg_restore --list` 读一遍 —— `pg_dump` 成功不等于文件完整
+2. 数一下有几张表有数据,太少就报错 —— **空库备份成功时什么都不会报**
+3. 提醒你这份备份还没被还原过
+
+**“配了备份”不算过门槛,“恢复演练过”才算。**
+[03 的 P4 硬门槛](03-roadmap.md#前置硬门槛不满足则不开放)第 3 条要的是后者,
+清单在 [`scripts/restore-drill.md`](../scripts/restore-drill.md) ——
+走一遍二十分钟,而**那份文件最后那张演练记录表就是门槛的凭据**。
+一份从来没有被还原过的备份,和没有备份的区别只有一个:前者让你以为自己有备份。
 
 **备份和主密钥不要放同一个地方。** `.env` 在服务器上,备份也在服务器上的话,
 一次拖库就两样都拿走了 —— 加密等于没做([R1](05-risks.md#r1--代管他人凭据与支付数据)
