@@ -187,3 +187,141 @@ class TestShippedExamples:
         assert len(cases) >= 2
         for item in cases:
             assert item.note, f"{item.id} 没写 note:三个月后看不懂的用例等于没有"
+
+
+@pytest.mark.integration
+class TestExportNegatives:
+    """从库里攒负样本(06 §7.3)。需要真实 PostgreSQL。
+
+    这一组的价值在于:06 §2.7 那句"rejected 永不删除,它们是评测集的负样本来源"
+    在 export 之前只是一句话 —— 这里验的就是那句话真的兑现得出来。
+    """
+
+    def event(self, session, user_id, title="项目组"):
+        from sqlalchemy import text as sql
+
+        return session.execute(
+            sql(
+                "INSERT INTO raw_events (user_id, source, external_id, occurred_at, trust,"
+                " raw, normalized) VALUES (:u, 'notification', :e, now(), 'external',"
+                " '{}'::jsonb, CAST(:n AS JSONB)) RETURNING id"
+            ),
+            {
+                "u": user_id,
+                "e": f"n-{id(self)}-{title}",
+                "n": json.dumps(
+                    {
+                        "kind": "message",
+                        "title": title,
+                        "occurred_at": "2026-09-08T10:00:00+08:00",
+                        "external_ref": {"source": "notification", "external_id": "x"},
+                        "trust": "external",
+                        "confidence": 1.0,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ).scalar_one()
+
+    def test_rejected_pendings_become_negative_cases(self, pg_session, user_id):
+        from datetime import UTC, datetime
+
+        from lifein.evals.export import export_planner_negatives
+        from lifein.repos import pending
+
+        now = datetime.now(UTC)
+        event_id = self.event(pg_session, user_id)
+        queued = pending.enqueue(
+            user_id,
+            pg_session,
+            agent="planner",
+            kind=pending.PendingKind.CALENDAR_EVENT,
+            target_table="todos",
+            payload={"title": "周三下午三点开会", "provenance": [event_id]},
+            reason=pending.PendingReason.LOW_CONFIDENCE,
+            source_event_id=event_id,
+            now=now,
+        )
+        pending.reject(user_id, pg_session, pending_id=queued.id, resolved_via="app")
+
+        cases = export_planner_negatives(user_id, pg_session, now=now)
+
+        (case,) = cases
+        assert case.id == f"planner-rejected-{queued.id}"
+        # 期望是"一条都不该提出来" —— 比"应该走待确认"更严格是有意的
+        assert case.expect[0].op == ABSENT
+        assert case.expect[0].path == "items"
+        # 输入是归一化之后的形状,不是原始 payload(原文过了保留期就该没有了)
+        assert case.input["events"][0]["event_id"] == event_id
+        assert "项目组" in case.input["events"][0]["event"]["title"]
+        assert "周三下午三点开会" in case.note
+
+    def test_pendings_that_are_still_open_are_not_negatives(self, pg_session, user_id):
+        from datetime import UTC, datetime
+
+        from lifein.evals.export import export_planner_negatives
+        from lifein.repos import pending
+
+        now = datetime.now(UTC)
+        event_id = self.event(pg_session, user_id, title="还没处理")
+        pending.enqueue(
+            user_id,
+            pg_session,
+            agent="planner",
+            kind=pending.PendingKind.TASK,
+            target_table="todos",
+            payload={"title": "帮张三带个东西"},
+            reason=pending.PendingReason.AMBIGUOUS,
+            source_event_id=event_id,
+            now=now,
+        )
+        assert export_planner_negatives(user_id, pg_session, now=now) == []
+
+    def test_negated_facts_become_negative_cases(self, pg_session, user_id):
+        from datetime import UTC, datetime
+
+        from lifein.evals.export import export_memory_negatives
+        from lifein.models.normalized import Trust
+        from lifein.repos import facts
+
+        event_id = self.event(pg_session, user_id, title="聚餐")
+        created = facts.add_fact(
+            user_id,
+            pg_session,
+            statement="不吃香菜",
+            provenance=[event_id],
+            confidence=0.5,
+            trust=Trust.EXTERNAL,
+            created_by_agent="memory",
+            valid_from=datetime.now(UTC),
+        ).fact
+        facts.negate_fact(user_id, pg_session, fact_id=created.id)
+
+        (case,) = export_memory_negatives(user_id, pg_session)
+
+        assert case.expect[0].op == ABSENT
+        assert "不吃香菜" in case.note
+        assert case.input["events"][0]["event_id"] == event_id
+
+    def test_facts_the_user_wrote_are_not_negatives(self, pg_session, user_id):
+        """用户自己改出来的那条被否定了,不是 agent 的错 —— 不该进负样本。"""
+        from datetime import UTC, datetime
+
+        from lifein.evals.export import export_memory_negatives
+        from lifein.models.normalized import Trust
+        from lifein.repos import facts
+
+        event_id = self.event(pg_session, user_id, title="聚餐2")
+        created = facts.add_fact(
+            user_id,
+            pg_session,
+            statement="不吃芹菜",
+            provenance=[event_id],
+            confidence=1.0,
+            trust=Trust.USER_INPUT,
+            created_by_agent=facts.USER_AUTHORED,
+            valid_from=datetime.now(UTC),
+        ).fact
+        facts.negate_fact(user_id, pg_session, fact_id=created.id)
+
+        assert export_memory_negatives(user_id, pg_session) == []
