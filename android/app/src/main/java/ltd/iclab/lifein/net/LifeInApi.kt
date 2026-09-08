@@ -187,7 +187,7 @@ class LifeInApi(
         client.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                // 401 的响应体是空的,这是服务端有意的(06 §6.10)——
+                // 401 的响应体是空的,这是服务端有意的(06 §6.11)——
                 // 所以这里的消息只能靠状态码说话
                 throw HttpError(response.code, "HTTP ${response.code} ${request.url.encodedPath}")
             }

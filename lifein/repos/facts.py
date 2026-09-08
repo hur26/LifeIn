@@ -36,6 +36,13 @@ EXTERNAL_MAX_CONFIDENCE = 0.6
 
 CONFIRMED_CONFIDENCE = 1.0
 
+USER_AUTHORED = "user"
+"""用户亲手改出来的那条事实,`created_by_agent` 记这个。
+
+它不是一个注册过的 agent —— `created_by_agent` 这一列回答的是"这句话是谁写的",
+而答案确实是本人。写成某个 agent 的名字会让"这条是系统推的还是我自己改的"
+永远分不开,而那正是记忆层最需要分清的一件事。"""
+
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -260,6 +267,60 @@ def confirm_fact(
         _CONFIRM, {"user_id": user_id, "fact_id": fact_id, "confidence": confidence}
     )
     return result.rowcount > 0
+
+
+def correct_fact(
+    user_id: str,
+    session: Session,
+    *,
+    fact_id: str,
+    statement: str,
+    now: datetime,
+) -> AddResult:
+    """用户把一条事实改成另一种说法(06 §6.10)。
+
+    **两步在同一个事务里**:否定旧的,再用**同一份 `provenance`** 写一条新的。
+
+    `provenance` 从旧那条继承,不由调用方给 —— 和待确认队列那条"客户端只能改
+    人看得懂的那几项"是同一条规矩(铁律 5)。用户改的是说法,不是出处:
+    那条事实当初是从哪几件事推出来的,不会因为措辞改了而改变。
+
+    **不是原地改 `statement`。** 原地改会让"系统当初推断出了什么"消失,
+    而那正是判断抽取 agent 好不好用的依据;而且被改掉的那句话不再进
+    `negated_by_user`,同一句错话明天会被重新推断出来([R7](../../docs/05-risks.md))。
+
+    新那条 `trust=user_input`:用户亲手写的话不该被 external 的 0.6 上限压着,
+    写完立刻标成 confirmed。
+    """
+    if not statement.strip():
+        raise FactError("改过的说法不能为空")
+
+    original = get_fact(user_id, session, fact_id=fact_id)
+    if original is None:
+        raise FactError(f"没有这条事实:{fact_id}")
+
+    negate_fact(user_id, session, fact_id=fact_id)
+
+    result = add_fact(
+        user_id,
+        session,
+        statement=statement,
+        # 出处照抄,一个字节都不动
+        provenance=original.provenance,
+        confidence=CONFIRMED_CONFIDENCE,
+        trust=Trust.USER_INPUT,
+        created_by_agent=USER_AUTHORED,
+        valid_from=now,
+    )
+    if result.fact is not None:
+        confirm_fact(user_id, session, fact_id=result.fact.id)
+        return AddResult(
+            fact=get_fact(user_id, session, fact_id=result.fact.id),
+            created=result.created,
+            reason=result.reason,
+        )
+    # 用户以前否定过这句改后的话 —— 那是他自己的判断,照它办,不写
+    return result
 
 
 def expire_fact(user_id: str, session: Session, *, fact_id: str, valid_until: datetime) -> bool:

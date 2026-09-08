@@ -1,4 +1,4 @@
-"""查询端 —— App 打开时用的那一组([06 §6.3–§6.9](../../docs/06-data-model.md#6-接口契约))。
+"""查询端 —— App 打开时用的那一组([06 §6.3–§6.10](../../docs/06-data-model.md#6-接口契约))。
 
 **这一组读得到东西**,所以它挂的是另一套凭据:长期设备密钥换来的短期 token,
 吊销立刻生效(R11)。采集端那把密钥在这里一个字节都读不出来。
@@ -30,7 +30,7 @@ from lifein.api import auth
 from lifein.api.deps import AppCaller, NowDep, QueryDevice, SessionDep, SettingsDep
 from lifein.governance.gateway import CallContext, Gateway
 from lifein.models.normalized import Trust
-from lifein.repos import collector, credentials, pending, todos, users
+from lifein.repos import collector, credentials, entities, facts, pending, raw_events, todos, users
 from lifein.repos.tool_calls import PostgresAuditSink
 
 log = logging.getLogger(__name__)
@@ -88,6 +88,11 @@ class CalendarReportIn(BaseModel):
 
     device_ref: str | None = None
     """系统日历里那条事件的 id。`created` 时必填 —— **它就是回滚信息**。"""
+
+
+class CorrectionIn(BaseModel):
+    statement: str = Field(min_length=1, max_length=500)
+    """改过的说法。**只有这一项** —— 出处、置信度、谁写的都不由客户端说了算。"""
 
 
 class WhitelistIn(BaseModel):
@@ -315,6 +320,108 @@ def calendar_report(
     raise HTTPException(status_code=422, detail="action 只能是 created 或 deleted")
 
 
+# ---------- 记忆与实体浏览 ----------
+
+
+@router.get("/memory/facts")
+def list_facts(
+    caller: AppCaller,
+    session: SessionDep,
+    now: NowDep,
+    q: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """当前成立的事实,**每条都带出处**(06 §6.10)。
+
+    出处不是锦上添花:P1 的退出条件写着"记忆里开始出现你不认可又说不清来源的
+    条目 → provenance 链路有漏"。把来源和事实并排显示,是那句话唯一能被
+    日常验证的形式 —— 翻库查 `provenance` 谁也不会天天做。
+    """
+    capped = min(limit, MAX_LIMIT)
+    items = (
+        facts.search_facts(caller.user_id, session, query=q, at=now, limit=capped)
+        if q
+        else facts.list_active_facts(caller.user_id, session, at=now, limit=capped)
+    )
+
+    # 一次把所有引用到的事件取回来,不是每条事实查一次
+    referenced = {event_id for item in items for event_id in item.provenance}
+    refs = raw_events.fetch_refs(caller.user_id, session, event_ids=sorted(referenced))
+    return {
+        "facts": [_fact_json(item) for item in items],
+        "sources": {
+            str(ref.event_id): {
+                "source": ref.source,
+                "title": ref.title,
+                "occurred_at": _iso(ref.occurred_at),
+            }
+            for ref in refs
+        },
+    }
+
+
+@router.post("/memory/facts/{fact_id}/confirm")
+def confirm_fact(caller: AppCaller, session: SessionDep, fact_id: str) -> dict[str, Any]:
+    """用户说这条对。**这是突破 external 0.6 上限的唯一路径**(06 §2.3)。"""
+    if not facts.confirm_fact(caller.user_id, session, fact_id=fact_id):
+        raise HTTPException(status_code=404, detail="没有这一条")
+    return _fact_json(facts.get_fact(caller.user_id, session, fact_id=fact_id))
+
+
+@router.post("/memory/facts/{fact_id}/negate")
+def negate_fact(caller: AppCaller, session: SessionDep, fact_id: str) -> dict[str, Any]:
+    """用户说这条不对。**只标记不删** —— 删了明天会被重新推断出来(R7)。"""
+    if not facts.negate_fact(caller.user_id, session, fact_id=fact_id):
+        raise HTTPException(status_code=404, detail="没有这一条")
+    return {"id": fact_id, "negated": True}
+
+
+@router.post("/memory/facts/{fact_id}/correct")
+def correct_fact(
+    caller: AppCaller, session: SessionDep, fact_id: str, body: CorrectionIn, now: NowDep
+) -> dict[str, Any]:
+    """改成另一种说法:否定旧的 + 用**同一份出处**写一条新的,同一个事务。
+
+    出处由服务端从旧那条继承,客户端给不了(铁律 5)。
+    """
+    try:
+        result = facts.correct_fact(
+            caller.user_id, session, fact_id=fact_id, statement=body.statement, now=now
+        )
+    except facts.FactError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if result.fact is None:
+        # 用户以前否定过这句改后的话。照他自己的判断办,不写 —— 但要说清
+        raise HTTPException(status_code=409, detail="你以前否定过这句话")
+    return _fact_json(result.fact)
+
+
+@router.get("/memory/entities")
+def list_entities(
+    caller: AppCaller, session: SessionDep, q: str | None = None, limit: int = 20
+) -> dict[str, Any]:
+    """实体浏览,**只读**。
+
+    别名归并走规则(铁律 9),不该在手机上手工编:06 §2.2 那套证据累积
+    会被手工改乱,而它错了没有任何外部表现。要改先改规则。
+    """
+    found = entities.search_entities(
+        caller.user_id, session, name=q or "", limit=min(limit, MAX_LIMIT)
+    )
+    return {
+        "entities": [
+            {
+                "id": item.id,
+                "kind": item.kind.value,
+                "canonical_name": item.canonical_name,
+                "last_seen_at": _iso(item.last_seen_at),
+            }
+            for item in found
+        ]
+    }
+
+
 # ---------- 采集器状态与白名单 ----------
 
 
@@ -474,6 +581,22 @@ def _pending_json(item: pending.Pending) -> dict[str, Any]:
         "reason": item.reason.value,
         "confidence": item.confidence,
         "expires_at": _iso(item.expires_at),
+    }
+
+
+def _fact_json(item: facts.Fact | None) -> dict[str, Any]:
+    if item is None:
+        raise HTTPException(status_code=404, detail="没有这一条")
+    return {
+        "id": item.id,
+        "statement": item.statement,
+        "confidence": item.confidence,
+        "confirmed_by_user": item.confirmed_by_user,
+        # 出处永远跟着事实一起给:分开给的话,App 上就会出现一条没有来源的记忆
+        "provenance": item.provenance,
+        "created_by_agent": item.created_by_agent,
+        "valid_from": _iso(item.valid_from),
+        "valid_until": _iso(item.valid_until),
     }
 
 

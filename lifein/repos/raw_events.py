@@ -281,6 +281,52 @@ def fetch_events_with_party(
     return stored
 
 
+@dataclass(frozen=True)
+class EventRef:
+    """一条事件的"身份证":够用来说清"这条记忆是哪来的",不含正文。
+
+    App 上那份记忆列表要在每条事实旁边显示出处(06 §6.10)——
+    P1 的退出条件写着"记忆里出现说不清来源的条目就说明 provenance 链路有漏",
+    而让来源和事实并排显示,是那句话唯一能被日常验证的形式。
+
+    **只给标题不给正文**:正文可能是别人在群里说的话,而查一条记忆的出处
+    不需要把那段话再读一遍(R10)。通知过了保留期正文会被清掉,标题还在,
+    所以这条链路在清理之后照样成立。
+    """
+
+    event_id: int
+    source: str
+    title: str | None
+    occurred_at: datetime
+
+
+_SELECT_REFS = text("""
+    SELECT id, source, occurred_at, normalized ->> 'title' AS title
+      FROM raw_events
+     WHERE user_id = :user_id
+       AND id = ANY(:event_ids)
+     ORDER BY occurred_at DESC
+""")
+
+
+def fetch_refs(user_id: str, session: Session, *, event_ids: Sequence[int]) -> list[EventRef]:
+    """按 id 批量取事件的来源与标题。记忆浏览拿它显示"这条哪来的"。"""
+    if not event_ids:
+        return []
+    rows = session.execute(
+        _SELECT_REFS, {"user_id": user_id, "event_ids": list({int(i) for i in event_ids})}
+    ).all()
+    return [
+        EventRef(
+            event_id=row.id,
+            source=row.source,
+            title=row.title,
+            occurred_at=row.occurred_at,
+        )
+        for row in rows
+    ]
+
+
 def count_failed(user_id: str, session: Session, *, since: datetime) -> int:
     """统计归一化失败数,供告警使用。
 

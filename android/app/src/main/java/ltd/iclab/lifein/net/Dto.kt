@@ -67,7 +67,7 @@ data class TokenResponse(
     @SerialName("expires_at") val expiresAt: String,
 )
 
-// ---------- 查询端(06 §6.6–§6.9) ----------
+// ---------- 查询端(06 §6.6–§6.10) ----------
 
 @Serializable
 data class TodoDto(

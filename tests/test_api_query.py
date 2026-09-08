@@ -1,4 +1,4 @@
-"""查询端的集成测试(06 §6.3–§6.9)。
+"""查询端的集成测试(06 §6.3–§6.10)。
 
 需要真实 PostgreSQL:待确认那条"写入与状态更新同一个事务"只有在真库上
 才成立,而它正是这一组最要紧的用例。
@@ -124,7 +124,7 @@ class TestTheIngestCredentialCannotRead:
 
     def test_every_query_route_needs_a_token(self, client):
         for path in ("/app/todos", "/app/pending", "/app/calendar/queue",
-                     "/app/collector/status"):
+                     "/app/collector/status", "/app/memory/facts", "/app/memory/entities"):
             assert client.get(path).status_code == 401
 
 
@@ -498,3 +498,147 @@ def _count(session, table: str, user_id: str) -> int:
     return session.execute(
         text(f"SELECT count(*) FROM {table} WHERE user_id = :u"), {"u": user_id}
     ).scalar_one()
+
+
+class TestMemory:
+    """记忆浏览(06 §6.10)。
+
+    这一组盯的是 P1 的退出条件:"记忆里开始出现你不认可又说不清来源的条目"。
+    所以每个用例都在问同一件事的两半 —— **改得动吗**、**说得出来源吗**。
+    """
+
+    def event(self, pg_session, user_id, title="周五聚餐") -> int:
+        return pg_session.execute(
+            text(
+                "INSERT INTO raw_events (user_id, source, external_id, occurred_at, trust, raw,"
+                " normalized) VALUES (:u, 'email', :e, :t, 'external', '{}'::jsonb,"
+                " CAST(:n AS JSONB)) RETURNING id"
+            ),
+            {
+                "u": user_id,
+                "e": f"m-{os.urandom(4).hex()}",
+                "t": NOW,
+                "n": json.dumps({"title": title}, ensure_ascii=False),
+            },
+        ).scalar_one()
+
+    def fact(self, pg_session, user_id, statement="不吃香菜", title="周五聚餐"):
+        from lifein.models.normalized import Trust
+        from lifein.repos import facts
+
+        return facts.add_fact(
+            user_id,
+            pg_session,
+            statement=statement,
+            provenance=[self.event(pg_session, user_id, title=title)],
+            confidence=0.9,
+            trust=Trust.EXTERNAL,
+            created_by_agent="memory",
+            valid_from=NOW,
+        ).fact
+
+    def test_facts_come_with_their_sources(self, client, pg_session, user_id, token):
+        """出处和事实并排给出 —— 那是"说不清来源"这条退出条件唯一的日常验证形式。"""
+        created = self.fact(pg_session, user_id)
+
+        body = client.get("/app/memory/facts", headers=bearer(token)).json()
+
+        (item,) = body["facts"]
+        assert item["statement"] == "不吃香菜"
+        # external 推出来的封顶 0.6(06 §1.2)
+        assert item["confidence"] == 0.6
+        assert item["provenance"] == created.provenance
+
+        source = body["sources"][str(created.provenance[0])]
+        assert (source["source"], source["title"]) == ("email", "周五聚餐")
+
+    def test_search_filters(self, client, pg_session, user_id, token):
+        self.fact(pg_session, user_id, statement="不吃香菜")
+        self.fact(pg_session, user_id, statement="每周三晚上健身")
+
+        body = client.get("/app/memory/facts?q=健身", headers=bearer(token)).json()
+        assert [f["statement"] for f in body["facts"]] == ["每周三晚上健身"]
+
+    def test_confirm_is_the_only_way_past_the_cap(self, client, pg_session, user_id, token):
+        created = self.fact(pg_session, user_id)
+
+        after = client.post(
+            f"/app/memory/facts/{created.id}/confirm", headers=bearer(token)
+        ).json()
+
+        assert after["confirmed_by_user"] is True
+        assert after["confidence"] == 1.0
+
+    def test_negate_hides_it_but_keeps_the_row(self, client, pg_session, user_id, token):
+        """否定只标记不删 —— 删了明天会被重新推断出来(R7)。"""
+        from lifein.repos import facts
+
+        created = self.fact(pg_session, user_id)
+        client.post(f"/app/memory/facts/{created.id}/negate", headers=bearer(token))
+
+        body = client.get("/app/memory/facts", headers=bearer(token)).json()
+        assert body["facts"] == []
+        assert facts.get_fact(user_id, pg_session, fact_id=created.id).negated_by_user is True
+
+    def test_correcting_keeps_the_provenance_and_negates_the_old_one(
+        self, client, pg_session, user_id, token
+    ):
+        """改的是说法,不是出处(铁律 5)。"""
+        from lifein.repos import facts
+
+        created = self.fact(pg_session, user_id, statement="不吃香菜")
+
+        corrected = client.post(
+            f"/app/memory/facts/{created.id}/correct",
+            headers=bearer(token),
+            json={"statement": "不吃香菜也不吃芹菜"},
+        ).json()
+
+        assert corrected["statement"] == "不吃香菜也不吃芹菜"
+        assert corrected["provenance"] == created.provenance  # 出处照抄
+        assert corrected["confirmed_by_user"] is True
+        assert corrected["confidence"] == 1.0
+        # 用户亲手写的那条,记的不是某个 agent
+        assert corrected["created_by_agent"] == "user"
+        # 旧那条被否定,不是被改掉:系统当初推断出了什么要留得住
+        assert facts.get_fact(user_id, pg_session, fact_id=created.id).negated_by_user is True
+
+    def test_correcting_into_something_previously_negated_is_refused(
+        self, client, pg_session, user_id, token
+    ):
+        old = self.fact(pg_session, user_id, statement="讨厌香菜")
+        client.post(f"/app/memory/facts/{old.id}/negate", headers=bearer(token))
+
+        another = self.fact(pg_session, user_id, statement="不吃香菜")
+        response = client.post(
+            f"/app/memory/facts/{another.id}/correct",
+            headers=bearer(token),
+            json={"statement": "讨厌香菜"},
+        )
+        # 用户自己否定过这句话,照他的判断办
+        assert response.status_code == 409
+
+    def test_unknown_fact_is_a_404(self, client, token):
+        missing = "00000000-0000-0000-0000-000000000000"
+        assert client.post(
+            f"/app/memory/facts/{missing}/negate", headers=bearer(token)
+        ).status_code == 404
+
+    def test_entities_are_read_only(self, client, pg_session, user_id, token):
+        """别名归并走规则(铁律 9),不该在手机上手工编 —— 所以只有 GET。"""
+        pg_session.execute(
+            text(
+                "INSERT INTO entities (user_id, kind, canonical_name, first_seen_at, last_seen_at)"
+                " VALUES (:u, 'person', '张三', :t, :t)"
+            ),
+            {"u": user_id, "t": NOW},
+        )
+
+        body = client.get("/app/memory/entities?q=张", headers=bearer(token)).json()
+        assert body["entities"][0]["canonical_name"] == "张三"
+
+        # 没有写实体的路由
+        assert client.post("/app/memory/entities", headers=bearer(token), json={}).status_code in (
+            404,
+            405,
+        )
