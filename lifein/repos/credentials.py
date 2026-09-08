@@ -101,6 +101,14 @@ _SELECT_DEVICE = text("""
      LIMIT 1
 """)
 
+_REVOKE_ALL_OF_KIND = text("""
+    UPDATE credentials
+       SET revoked_at = now()
+     WHERE user_id = :user_id
+       AND kind = :kind
+       AND revoked_at IS NULL
+""")
+
 _REVOKE_DEVICE = text("""
     UPDATE credentials
        SET revoked_at = now()
@@ -235,6 +243,19 @@ def revoke_device(
             _REVOKE_DEVICE, {"user_id": user_id, "device_id": device_id, "kind": kind}
         ).rowcount
     )
+
+
+
+def revoke_all_of_kind(user_id: str, session: Session, *, kind: str) -> int:
+    """吊销这个用户**所有设备**上某一类凭据。返回受影响条数。
+
+    和 `revoke_device` 的区别是它不指定设备 —— 用在"把采集整个关掉"那一步
+    (P4 第 3 片):那时用户想的是"别再采了",而不是"停掉某一台"。
+    要求他先列出自己有几台设备再一台台停,等于把这个开关做成了一道作业。
+
+    记录保留不删,和 `revoke_device` 同一条理由。
+    """
+    return int(session.execute(_REVOKE_ALL_OF_KIND, {"user_id": user_id, "kind": kind}).rowcount)
 
 
 def list_device_credentials(user_id: str, session: Session) -> list[DeviceCredential]:

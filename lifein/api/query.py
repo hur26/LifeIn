@@ -35,6 +35,7 @@ from lifein.repos import (
     budgets,
     collector,
     credentials,
+    data_control,
     entities,
     facts,
     job_runs,
@@ -802,6 +803,64 @@ def create_transaction(
     except (transactions.TransactionError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _txn_json(result.transaction)
+
+
+
+# ---------- 自己关掉采集、自己删掉数据(P4 第 3 片,R10 改判的四前提之一) ----------
+
+
+@router.get("/collector/collection")
+def collection_state(caller: AppCaller, session: SessionDep) -> dict[str, Any]:
+    """现在在不在采。**三层里任何一层关着就算关。**"""
+    current = data_control.state(caller.user_id, session)
+    return {
+        "enabled": current.enabled,
+        "active_devices": current.active_devices,
+        "enabled_rules": current.enabled_rules,
+    }
+
+
+@router.post("/collector/stop")
+def stop_collection(caller: AppCaller, session: SessionDep) -> dict[str, Any]:
+    """关掉采集。**服务端这边做完就算数,不等 App 配合。**
+
+    [R10 改判](../../docs/05-risks.md#r10--手机端采集器的越权读取)的四个前提之一:
+    "朋友要能自己关掉采集…… **App 里要有这个开关,不是'找你帮忙'**"。
+
+    "找你帮忙"和"自己能做"的差别不在功能,在**是不是要开口** ——
+    一个人要发一条微信才能关掉采集时,他多半不会发那条微信。
+    """
+    after = data_control.stop_collecting(caller.user_id, session)
+    return {
+        "enabled": after.enabled,
+        "note": "采集密钥已吊销,白名单已全部停用。已采的数据还在,要删走另一个动作",
+    }
+
+
+@router.delete("/data/collected")
+def delete_collected(
+    caller: AppCaller, session: SessionDep, since: datetime | None = None
+) -> dict[str, Any]:
+    """删掉采集来的数据。**是真删,不是标记。**
+
+    `since` 不给就是全部。给了就只删那之后的 —— "把上周那几天删掉"是一个
+    真实的诉求,而**只能全删的删除按钮很多人不敢点**。
+
+    派生的东西一起走:交易、待确认、以及出处全部落在被删事件里的记忆条目。
+    只删原文会留下一堆看起来仍然有出处的记忆,而点开才发现出处没了 ——
+    那让"有出处"这件事变得不可信。
+    """
+    if since is not None and since.tzinfo is None:
+        raise HTTPException(status_code=422, detail="since 必须带时区")
+
+    removed = data_control.delete_collected(caller.user_id, session, since=since)
+    return {
+        "raw_events": removed.raw_events,
+        "transactions": removed.transactions,
+        "pending": removed.pending,
+        "facts": removed.facts,
+        "total": removed.total(),
+    }
 
 
 def _todo_json(item: todos.Todo) -> dict[str, Any]:

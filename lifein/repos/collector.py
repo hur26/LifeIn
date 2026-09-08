@@ -101,6 +101,12 @@ _SET_ENABLED = text("""
      WHERE user_id = :user_id AND id = :rule_id
 """)
 
+_DISABLE_ALL = text("""
+    UPDATE collector_whitelist
+       SET enabled = false
+     WHERE user_id = :user_id AND enabled
+""")
+
 _UPSERT_HEARTBEAT = text("""
     INSERT INTO collector_heartbeat
         (user_id, device_id, last_seen_at, app_version, android_version, listener_enabled)
@@ -179,6 +185,17 @@ def set_whitelist_enabled(user_id: str, session: Session, *, rule_id: int, enabl
     return session.execute(
         _SET_ENABLED, {"user_id": user_id, "rule_id": rule_id, "enabled": enabled}
     ).rowcount > 0
+
+
+
+def disable_all(user_id: str, session: Session) -> int:
+    """停用全部白名单。返回停了几条。
+
+    **停用不删除。** 关掉采集之后又想开回来时,删掉的规则要一条条重新加,
+    而那正是"关掉"这个动作最大的成本 —— 成本一高,人就不敢关了,
+    而 R10 改判要的正是"他敢关"。
+    """
+    return int(session.execute(_DISABLE_ALL, {"user_id": user_id}).rowcount)
 
 
 def record_heartbeat(
