@@ -154,6 +154,7 @@ flowchart TB
 | 入口 | 微信 iLink(推送,[ADR-018](docs/04-tech-decisions.md#adr-018--微信推送走-ilink-bot-api企微降为兜底与审批入口))· 企业微信(兜底 + 审批卡片)· 安卓 App(采集 + 查看,**不接收推送**) |
 | App(P1 起) | Compose · WorkManager · Room · OkHttp,**不接厂商推送 SDK**([ADR-021](docs/04-tech-decisions.md#adr-021--安卓端依赖清单逐条定性)) |
 | 数据源 | 邮箱 IMAP + 授权码(QQ / 163)· 企业微信日程 API · 微信通知(P1)· 交易通知(P2) |
+| 对账单(P2) | pdfplumber 读带密码的 PDF · 标准库读导出的压缩包([ADR-023](docs/04-tech-decisions.md#adr-023--对账单解析pdf-用-pdfplumber压缩包先用标准库)) |
 
 <details>
 <summary><b>为什么没有 LangGraph / MCP / hook / 多 agent?</b></summary>
