@@ -60,6 +60,9 @@ class WindowResult:
     normalize_failed: int = 0
     events_considered: int = 0
     pushed: bool = False
+    no_events: bool = False
+    """窗口里没有可用事件。**这不是失败** —— 安静的一天、或者补跑时窗口本来就短。"""
+
     error: str | None = None
     failed_sources: list[str] = field(default_factory=list)
 
@@ -70,6 +73,7 @@ class WindowResult:
             "normalize_failed": self.normalize_failed,
             "events_considered": self.events_considered,
             "pushed": self.pushed,
+            "no_events": self.no_events,
             "failed_sources": self.failed_sources,
         }
 
@@ -171,6 +175,13 @@ def _summarize_and_push(
     result: WindowResult,
 ) -> None:
     events = raw_events.fetch_normalized_between(user_id, session, start=start, end=end)
+    if not events:
+        # 没事件不是故障:安静的一天,或者补跑时窗口本来就只有几分钟。
+        # 为它告警会让告警变成噪音,而噪音会让真出事的那次被忽略(R4)
+        log.info("窗口 %s 内没有事件,跳过", start.isoformat())
+        result.no_events = True
+        return
+
     digest = run_digest(DigestInput(day=end.date(), events=events), llm=deps.llm)
     result.events_considered = digest.output.considered_events
 

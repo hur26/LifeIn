@@ -1,1 +1,6 @@
 * text=auto eol=lf
+
+# Windows 批处理必须是 CRLF。LF 行尾的 .cmd 里 goto 标签会解析错，
+# 表现是进程活着但什么都不干 —— 踩过一次
+*.cmd text eol=crlf
+*.bat text eol=crlf

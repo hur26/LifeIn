@@ -38,3 +38,4 @@ Thumbs.db
 
 # 登录时生成的二维码，不进仓库
 weixin-qr.html
+logs/

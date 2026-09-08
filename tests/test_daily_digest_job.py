@@ -241,3 +241,24 @@ def test_llm_fields_sent_is_recorded(pg_session, user_id):
 
     fields = pg_session.execute(text("SELECT llm_fields_sent FROM tool_calls")).scalar_one()
     assert "body" in fields and "标题" in fields
+
+
+def test_empty_window_is_not_a_failure(pg_session, user_id):
+    """安静的一天、或者补跑时只有几分钟的窗口 —— 这不是故障。
+
+    为它告警会让告警变成噪音,而噪音会让真出事的那次被忽略(R4)。
+    第一次真跑就撞上了:--once 之后服务启动补跑,窗口只剩 20 分钟。
+    """
+    d, handles = deps(adapters=[FakeAdapter("email", [])])
+    [result] = run_once(user_id, pg_session, deps=d, now=NOW)
+
+    assert result.no_events is True
+    assert result.error is None
+    assert result.pushed is False
+    assert handles["alerter"].alerts == []  # 一条告警都不该有
+    assert (
+        pg_session.execute(
+            text("SELECT status FROM job_runs WHERE job_name = :j"), {"j": JOB_NAME}
+        ).scalar_one()
+        == "succeeded"
+    )
