@@ -62,6 +62,7 @@ def register_tools() -> None:
         planner,
         qa,
     )
+    from lifein.tools import ledger as ledger_tools  # noqa: F401
     from lifein.tools import memory as memory_tools  # noqa: F401
     from lifein.tools import todo as todo_tools  # noqa: F401
     from lifein.tools import transaction as transaction_tools  # noqa: F401
@@ -81,6 +82,13 @@ class Services:
         default=lambda session, message: resolve_user_for_message(session, message)
     )
     """把通道内的发送者换成本系统用户。放在这里,入站通道和 HTTP 入口拿的是同一个。"""
+
+    email_channel: Channel | None = None
+    """邮件那一条,**单独留一个引用**。
+
+    它已经在 `channel` 那条降级链里了,但月度报告要**同时**发两份:
+    卡片走推送(有长度上限,会被截断),完整版走邮件。降级链只会挑一条发,
+    所以那件事拿不到这个引用就做不成(03 那句"企微卡片 + 邮件长版")。"""
 
     wecom: WecomClient | None = None
     callback: WecomCallback | None = None
@@ -154,6 +162,7 @@ def build_services(settings: Settings | None = None) -> Services:
         channel=channel,
         callback=callback,
         alerter=alerter,
+        email_channel=email_channel,
     )
 
 

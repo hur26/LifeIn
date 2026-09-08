@@ -339,7 +339,11 @@ def run_monthly_report_for_all_users(
         try:
             with open_session() as session:
                 deps = MonthlyDeps(
-                    llm=services.llm, channel=services.channel, alerter=services.alerter
+                    llm=services.llm,
+                    channel=services.channel,
+                    alerter=services.alerter,
+                    # 长版走邮件:推送通道有长度上限,而一份完整的月报一定会被截断
+                    email=services.email_channel,
                 )
                 result = run_monthly_once(user_id, session, deps=deps, now=moment)
             sent += 1 if result.delivered else 0

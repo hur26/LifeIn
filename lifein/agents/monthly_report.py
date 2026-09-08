@@ -234,6 +234,57 @@ def to_card(report: MonthlyReport, output: MonthlyOutput) -> Card:
     )
 
 
+
+def to_long_card(report: MonthlyReport, output: MonthlyOutput) -> Card:
+    """邮件长版(03 那句"企微卡片 + 邮件长版")。
+
+    **长版存在的理由是推送通道有长度上限**:企微卡片 2048 字节、微信 4000 字,
+    而一份完整的月报有十个类目加五个商户,一定会被截断 —— 而截断之后
+    **看起来仍然是一份完整的报告**,只是后面几类没了。
+
+    邮件没有这个限制,所以它是唯一能看到全貌的那一份。两份的数字来自同一个
+    `report`,不会出现"卡片上说 3120,邮件里说 3121"那种事 ——
+    那种不一致比缺几行糟得多。
+    """
+    sections = [
+        CardSection(
+            heading="按类目",
+            lines=[
+                f"{line.category}  {line.total} 元  {line.count} 笔{_delta(line.delta)}"
+                for line in report.categories
+            ],
+        )
+    ]
+    if report.merchants:
+        sections.append(
+            CardSection(
+                heading="花得最多的几家",
+                lines=[
+                    f"{m.merchant}  {m.total} 元  {m.count} 笔" for m in report.merchants
+                ],
+            )
+        )
+    if output.notes:
+        sections.append(CardSection(heading="这个月", lines=list(output.notes)))
+    if report.uncategorized > 0:
+        sections.append(
+            CardSection(
+                heading="还没归类",
+                lines=[
+                    f"{report.uncategorized} 元",
+                    "这些消费没被认出属于哪一类。数字大的话是归类那一层要修。",
+                ],
+            )
+        )
+
+    return Card(
+        title=f"{report.period} 账单(完整版)",
+        summary=f"共支出 {report.total} 元,{report.count} 笔{_delta(report.delta)}",
+        sections=sections,
+        footer=_coverage_footer(report),
+    )
+
+
 def _delta(delta: Decimal | None) -> str:
     if delta is None:
         return ""

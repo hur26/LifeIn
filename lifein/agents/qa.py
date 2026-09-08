@@ -246,6 +246,10 @@ def plan_recall(question: str, *, llm: LLMClient) -> PlanResult:
         "memory.search_entities",
         "memory.recent_events_with",
         "memory.recall_facts",
+        # 账本(P2)。**只读** —— 对话式的改账要多一次点头,走待确认那条路,
+        # 因为"把昨天星巴克那笔改成餐饮"多了一次可能理解错的机会
+        "ledger.query",
+        "ledger.spending",
     ],
     output_schema=QaOutput,
     on_uncertain=OnUncertain.DEGRADE,

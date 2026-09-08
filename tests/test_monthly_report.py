@@ -410,10 +410,9 @@ class TestTheJob:
 
 
 class Sent:
-    # push_log 的 channel 有 CHECK 约束,只认真实存在的通道名
-    name = "weixin"
-
-    def __init__(self) -> None:
+    def __init__(self, name: str = "weixin") -> None:
+        # push_log 的 channel 有 CHECK 约束,只认真实存在的通道名
+        self.name = name
         self.cards: list = []
 
     def send(self, user_id: str, card):
@@ -434,3 +433,137 @@ class Loud:
 
     def alert(self, title: str, body: str) -> None:
         self.sent.append((title, body))
+
+
+class TestTheLongEmailVersion:
+    """03 那句"企微卡片 + 邮件长版"。
+
+    **长版存在的理由是推送通道有长度上限**:企微卡片 2048 字节、微信 4000 字,
+    而一份完整的月报有十个类目加五个商户,一定会被截断 —— 截断之后
+    看起来仍然是一份完整的报告,只是后面几类没了。
+    """
+
+    def a_full_report(self) -> MonthlyReport:
+        return a_report(
+            categories=[
+                CategoryLine(name, Decimal("100.00"), 3, Decimal("90.00"))
+                for name in ("餐饮", "交通", "购物", "居住", "通信", "娱乐", "医疗")
+            ],
+            merchants=[
+                MerchantLine(f"商户{i}", Decimal("50.00"), 2) for i in range(5)
+            ],
+            uncategorized=Decimal("30.00"),
+        )
+
+    def test_the_long_card_keeps_every_category(self):
+        """短版只列前六个 —— 那是给卡片留的余量,而邮件不需要那个余量。"""
+        from lifein.agents.monthly_report import to_long_card
+
+        short = to_card(self.a_full_report(), MonthlyOutput())
+        long = to_long_card(self.a_full_report(), MonthlyOutput())
+
+        short_lines = next(s for s in short.sections if s.heading == "按类目").lines
+        long_lines = next(s for s in long.sections if s.heading == "按类目").lines
+        assert len(short_lines) == 6
+        assert len(long_lines) == 7
+
+    def test_the_long_card_lists_merchants(self):
+        """商户榜在短版里根本没有位置,而它是看出"钱去哪了"最快的一栏。"""
+        from lifein.agents.monthly_report import to_long_card
+
+        headings = [s.heading for s in to_long_card(self.a_full_report(), MonthlyOutput()).sections]
+        assert "花得最多的几家" in headings
+
+    def test_both_versions_quote_the_same_numbers(self):
+        """**两份的数字来自同一个 report。** 出现"卡片上说 3120、邮件里说 3121"
+        那种事,比缺几行糟得多 —— 那时你不知道该信哪一个。"""
+        from lifein.agents.monthly_report import to_long_card
+
+        report = self.a_full_report()
+        assert str(report.total) in to_card(report, MonthlyOutput()).summary
+        assert str(report.total) in to_long_card(report, MonthlyOutput()).summary
+
+
+@pytest.mark.integration
+class TestSendingBothVersions:
+    def test_the_email_gets_the_long_one(self, pg_session, user_id):
+        from lifein.jobs import monthly_report as job
+        from lifein.jobs.monthly_report import MonthlyDeps
+
+        TestTheNumbers().a_spend(pg_session, user_id, amount="100", when=IN_AUGUST)
+        push, mail = Sent(), Sent(name="email")
+
+        result = job.run_once(
+            user_id,
+            pg_session,
+            deps=MonthlyDeps(
+                llm=FakeLLM(["餐饮花得最多"]), channel=push, alerter=Quiet(), email=mail
+            ),
+            now=datetime(2026, 9, 3, 9, 0, tzinfo=SHANGHAI),
+        )
+
+        assert result.delivered and result.long_version_sent
+        assert "完整版" in mail.cards[0].title
+        assert "完整版" not in push.cards[0].title
+
+    def test_no_email_configured_still_sends_the_card(self, pg_session, user_id):
+        """**没配邮件是一个缺口,不是一个故障。** 卡片照发。"""
+        from lifein.jobs import monthly_report as job
+        from lifein.jobs.monthly_report import MonthlyDeps
+
+        TestTheNumbers().a_spend(pg_session, user_id, amount="100", when=IN_AUGUST)
+        push = Sent()
+
+        result = job.run_once(
+            user_id,
+            pg_session,
+            deps=MonthlyDeps(llm=FakeLLM(["还行"]), channel=push, alerter=Quiet(), email=None),
+            now=datetime(2026, 9, 3, 9, 0, tzinfo=SHANGHAI),
+        )
+
+        assert result.delivered
+        assert result.long_version_sent is False
+
+    def test_the_long_version_failing_does_not_fail_the_job(self, pg_session, user_id):
+        """卡片已经送到了。**为长版把整个月报标成失败,下个月会重发一遍。**"""
+        from lifein.jobs import monthly_report as job
+        from lifein.jobs.monthly_report import MonthlyDeps
+
+        TestTheNumbers().a_spend(pg_session, user_id, amount="100", when=IN_AUGUST)
+        push, mail = Sent(), Broken()
+
+        result = job.run_once(
+            user_id,
+            pg_session,
+            deps=MonthlyDeps(
+                llm=FakeLLM(["还行"]), channel=push, alerter=Quiet(), email=mail
+            ),
+            now=datetime(2026, 9, 3, 9, 0, tzinfo=SHANGHAI),
+        )
+
+        assert result.delivered is True
+        assert result.error is None
+        assert result.warnings  # 但要说出来
+
+    def test_an_email_only_setup_does_not_send_twice(self, pg_session, user_id):
+        """主通道就是邮件时,卡片那份已经是全的 —— 再发一封只是打扰。"""
+        from lifein.jobs import monthly_report as job
+        from lifein.jobs.monthly_report import MonthlyDeps
+
+        TestTheNumbers().a_spend(pg_session, user_id, amount="100", when=IN_AUGUST)
+        mail = Sent(name="email")
+
+        job.run_once(
+            user_id,
+            pg_session,
+            deps=MonthlyDeps(llm=FakeLLM(["还行"]), channel=mail, alerter=Quiet(), email=mail),
+            now=datetime(2026, 9, 3, 9, 0, tzinfo=SHANGHAI),
+        )
+        assert len(mail.cards) == 1
+
+
+class Broken:
+    name = "email"
+
+    def send(self, user_id: str, card):
+        raise RuntimeError("SMTP 连不上")

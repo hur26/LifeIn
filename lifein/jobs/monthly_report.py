@@ -31,6 +31,7 @@ from lifein.agents.monthly_report import (
     MonthlyInput,
     MonthlyReportFailed,
     to_card,
+    to_long_card,
     write_notes,
 )
 from lifein.alerts import Alerter
@@ -52,6 +53,13 @@ class MonthlyDeps:
     llm: LLMClient
     channel: Channel
     alerter: Alerter
+    email: Channel | None = None
+    """邮件长版的出口(03 那句"企微卡片 + 邮件长版")。
+
+    **没配邮件时是 None,那时只有卡片那一份** —— 而卡片会被通道的长度上限截断
+    (企微 2048 字节、微信 4000 字),截断之后**看起来仍然是一份完整的报告**,
+    只是后面几类没了。所以没配邮件是一个要知道的缺口,不是可有可无的增强。
+    """
 
 
 @dataclass
@@ -67,6 +75,7 @@ class MonthlyJobResult:
 
     dropped_invented: int = 0
     delivered: bool = False
+    long_version_sent: bool = False
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -77,6 +86,7 @@ class MonthlyJobResult:
             "notes_text": list(self.notes_text),
             "dropped_invented": self.dropped_invented,
             "delivered": self.delivered,
+            "long_version_sent": self.long_version_sent,
             "no_transactions": self.no_transactions,
         }
 
@@ -184,6 +194,43 @@ def _send(
         user_id, session, channel=delivery.channel, mode="active", card=card, delivered=True
     )
     result.delivered = True
+    _send_long_version(user_id, session, deps=deps, report=report, output=written.output,
+                       result=result)
+
+
+
+def _send_long_version(
+    user_id: str,
+    session: Session,
+    *,
+    deps: MonthlyDeps,
+    report,
+    output,
+    result: MonthlyJobResult,
+) -> None:
+    """再发一封完整的。**失败不算这次 job 失败** —— 卡片已经送到了,
+    而长版是锦上添花的那一份;为它把整个月报标成失败,下个月会重发一遍。
+    """
+    if deps.email is None or deps.email.name == deps.channel.name:
+        # 没配邮件,或者主通道本来就是邮件(那时卡片那份已经是全的)
+        return
+
+    card = to_long_card(report, output)
+    try:
+        delivery = deps.email.send(user_id, card)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("月报长版没发出去:%s", exc)
+        result.warnings.append(f"长版邮件没发出去:{exc}")
+        push_log.record_push(
+            user_id, session, channel=deps.email.name, mode="active", card=card,
+            delivered=False, error=f"{type(exc).__name__}: {exc}",
+        )
+        return
+
+    push_log.record_push(
+        user_id, session, channel=delivery.channel, mode="active", card=card, delivered=True
+    )
+    result.long_version_sent = True
 
 
 def _a_day_in_last_month(now: datetime) -> datetime:
