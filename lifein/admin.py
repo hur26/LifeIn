@@ -9,6 +9,7 @@
 
     python -m lifein.admin create-user --name 白杨 --wecom-userid BaiYang
     python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username me@163.com
+    python -m lifein.admin set-weixin --user <uuid> --to <iLink 对方 id>   # 微信推送(ADR-018)
     python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
@@ -22,6 +23,8 @@ import logging
 import sys
 from datetime import UTC, datetime, timedelta
 
+from lifein.channels.base import Card
+from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.config import get_settings
 from lifein.db import session_scope
 from lifein.repos import credentials, users
@@ -77,6 +80,68 @@ def cmd_set_imap(args: argparse.Namespace) -> int:
             settings=settings,
         )
     print("已加密写入。建议立刻跑 test-imap 确认能登录")
+    return 0
+
+
+def cmd_set_weixin(args: argparse.Namespace) -> int:
+    """配微信 iLink 推送会话(ADR-018)。
+
+    P0 不做扫码登录 —— 用已有客户端登录后拿到的 token 导进来。
+    token 和授权码一样从交互输入读,不走命令行参数。
+    """
+    token = getpass.getpass("iLink token(输入不回显):")
+    if not token.strip():
+        print("token 为空,没有改动", file=sys.stderr)
+        return 1
+
+    settings = get_settings()
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        credentials.revoke_credential(args.user, session, kind="weixin")
+        payload = {
+            "token": token,
+            "to_user_id": args.to,
+            "base_url": args.base_url,
+        }
+        if args.context_token:
+            payload["context_token"] = args.context_token
+        credentials.put_credential(
+            args.user,
+            session,
+            kind="weixin",
+            scope="query",
+            payload=payload,
+            settings=settings,
+        )
+    print("已加密写入。跑 test-push 确认能发到微信")
+    return 0
+
+
+def cmd_test_push(args: argparse.Namespace) -> int:
+    """真发一条测试消息,确认通道能用。
+
+    走的是完整的降级链路,所以它同时回答两个问题:能不能发出去,
+    以及**是从哪个通道发出去的** —— 后者更重要,微信没配好会静默落到企微。
+    """
+    from lifein.bootstrap import build_services
+
+    services = build_services()
+    card = Card(
+        title="LifeIn 测试消息",
+        summary="看到这条说明推送通道是通的。",
+        footer="来自 admin test-push",
+    )
+    try:
+        delivery = services.channel.send(args.user, card)
+    except Exception as exc:  # noqa: BLE001
+        print(f"全部通道都失败:{exc}", file=sys.stderr)
+        return 1
+
+    print(f"发送成功,走的是 {delivery.channel} 通道")
+    if delivery.channel != "weixin":
+        print("注意:没走微信 —— 微信会话没配或已过期,上面的告警日志里有原因")
     return 0
 
 
@@ -156,6 +221,17 @@ def build_parser() -> argparse.ArgumentParser:
     imap.add_argument("--username", required=True)
     imap.add_argument("--port", type=int, default=993)
     imap.set_defaults(func=cmd_set_imap)
+
+    weixin = sub.add_parser("set-weixin", help="配微信 iLink 推送(token 交互输入)")
+    weixin.add_argument("--user", required=True)
+    weixin.add_argument("--to", required=True, help="推送目标的 iLink user id")
+    weixin.add_argument("--base-url", default=WEIXIN_BASE_URL)
+    weixin.add_argument("--context-token", default=None)
+    weixin.set_defaults(func=cmd_set_weixin)
+
+    push = sub.add_parser("test-push", help="真发一条测试消息,并告诉你走的哪个通道")
+    push.add_argument("--user", required=True)
+    push.set_defaults(func=cmd_test_push)
 
     test = sub.add_parser("test-imap", help="实测能否登录并取信")
     test.add_argument("--user", required=True)

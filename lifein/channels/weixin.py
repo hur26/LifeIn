@@ -20,6 +20,7 @@ import json
 import logging
 import secrets
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -78,7 +79,7 @@ class WeixinChannel:
     def __init__(
         self,
         *,
-        load_session: "callable[[str], WeixinSession | None]",
+        load_session: Callable[[str], WeixinSession | None],
         client: httpx.Client | None = None,
     ) -> None:
         # 会话按用户取:P0 只有一个人,但通道不该知道这件事

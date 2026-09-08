@@ -22,9 +22,13 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from lifein.alerts import Alerter, LoggingAlerter
+from lifein.channels.base import Channel
+from lifein.channels.fallback import FallbackChannel
 from lifein.channels.wecom import WecomChannel
 from lifein.channels.wecom_callback import WecomCallback
 from lifein.channels.wecom_client import WecomClient
+from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
+from lifein.channels.weixin import WeixinChannel, WeixinSession
 from lifein.config import Settings, get_settings
 from lifein.db import session_scope
 from lifein.llm.client import LLMClient
@@ -42,7 +46,9 @@ class Services:
     settings: Settings
     llm: LLMClient
     wecom: WecomClient
-    channel: WecomChannel
+    channel: Channel
+    """推送出口。默认是"微信优先、企微兜底"的组合(ADR-018)。"""
+
     callback: WecomCallback
     alerter: Alerter
 
@@ -67,7 +73,16 @@ def build_services(settings: Settings | None = None) -> Services:
         agent_id=s.wecom_agent_id,
     )
 
-    channel = WecomChannel(wecom, resolve_userid=_resolve_wecom_userid)
+    alerter = LoggingAlerter()
+
+    # ADR-018:微信优先,企微兜底。微信没配过会话时 WeixinChannel 会抛错,
+    # 于是自动落到企微 —— 所以"还没配微信"和"微信坏了"走的是同一条路径,
+    # 不需要在这里判断配没配
+    wecom_channel = WecomChannel(wecom, resolve_userid=_resolve_wecom_userid)
+    channel = FallbackChannel(
+        [WeixinChannel(load_session=_load_weixin_session), wecom_channel],
+        alerter=alerter,
+    )
 
     callback = WecomCallback(
         token=s.wecom_callback_token.get_secret_value(),
@@ -81,7 +96,23 @@ def build_services(settings: Settings | None = None) -> Services:
         wecom=wecom,
         channel=channel,
         callback=callback,
-        alerter=LoggingAlerter(),
+        alerter=alerter,
+    )
+
+
+def _load_weixin_session(user_id: str) -> WeixinSession | None:
+    """从加密的 credentials 表取微信会话。没配过就返回 None,由降级接手。"""
+    with session_scope() as session:
+        stored = credentials.get_credential(
+            user_id, session, kind="weixin", settings=get_settings()
+        )
+    if not stored:
+        return None
+    return WeixinSession(
+        token=stored["token"],
+        to_user_id=stored["to_user_id"],
+        base_url=stored.get("base_url") or WEIXIN_BASE_URL,
+        context_token=stored.get("context_token"),
     )
 
 
