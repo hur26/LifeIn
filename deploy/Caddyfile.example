@@ -1,0 +1,22 @@
+# 反向代理 + 自动 TLS(ADR-022)。装法见 docs/08-deployment.md §6。
+#
+# 为什么用 Caddy 而不是 nginx + certbot:证书申请与续期是内置的,
+# 少一个"三个月后忘了续期"的失效点 —— 而那种失效的表现是
+# App 某天早上突然全部连不上,和它自己坏掉分不开。
+#
+# 换成 nginx 也完全可以,那时 certbot 的定时续期要单独验一次。
+
+lifein.你的域名.com {
+    encode zstd gzip
+
+    # FastAPI 仍然只监听 127.0.0.1(07 §2.1 那条不变):
+    # 对外的 TLS 在这里终结,进程本身不暴露
+    reverse_proxy 127.0.0.1:8000
+
+    # 路径原样转发,不要重写 —— **路径进签名**(06 §6.2),
+    # 改了路径手机端所有请求都会 401,而服务端按设计不说原因
+    log {
+        output file /var/log/caddy/lifein.log
+        format console
+    }
+}

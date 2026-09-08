@@ -18,6 +18,10 @@
 >
 > **手机那半边是 P1 的事,在 [§5](#5-p1装上手机那半边)** —— 摘要的 14 天数完再装,
 > 顺序反了会把那 14 天的样本口径搅了。
+>
+> **App 要一个手机够得着的 HTTPS 入口**,而家里那台机器没有 ——
+> 所以 P1 收尾时服务端搬到了云服务器,见 [§6](#6-搬到云服务器p1-收尾)
+> 与 [ADR-022](04-tech-decisions.md#adr-022--服务端搬到云服务器用已备案域名的子域名)。
 
 P0 的验收标准是"你自己每天会不会看",而那个问题只需要摘要就能回答。
 **先别为了问答去买服务器。**
@@ -440,3 +444,158 @@ LIFEIN_BASE=https://你的域名 python scripts/verify-app-api.py
 | 日程一直"未写入日历" | 日历权限没给;或者手机很久没联网。**这是看得见的延迟,不是丢失**(ADR-020) |
 | 小组件不刷新 | 各家省电策略。它是"看一眼"的入口不是提醒机制 —— 真提醒走消息通道 |
 | 心跳正常但什么都采不到 | 通知使用权被系统收走了。状态页那行会显示,服务端也会告警 |
+
+---
+
+## 6. 搬到云服务器(P1 收尾)
+
+为什么搬、代价是什么,见
+[ADR-022](04-tech-decisions.md#adr-022--服务端搬到云服务器用已备案域名的子域名)。
+这一节只讲**怎么搬**。
+
+> **搬家本身就是那次恢复演练。** [07 §6](07-config.md#6-部署前检查清单) 要求
+> "备份配了不算,演练过才算" —— 把家里的库导出、在云上还原、验证跑得通,
+> 这一整套走完,那条就打勾了。**所以别图快跳过验证那几步。**
+
+### 6.0 顺序不能反
+
+**先停家里那台,再起云上那台。** 两个进程会抢微信的长轮询会话,
+表现是"消息一会儿到一会儿不到"(`scripts/run-lifein.md` 里那条坑)。
+而且两边都在跑定时任务的话,同一个窗口会被认领两次。
+
+### 6.1 云上准备
+
+```bash
+# Ubuntu 22.04 / 24.04
+sudo apt update
+sudo apt install -y python3.12-venv postgresql-16 postgresql-16-pgvector caddy
+
+sudo -u postgres psql -c "CREATE USER lifein WITH PASSWORD '换成你的';"
+sudo -u postgres psql -c "CREATE DATABASE lifein OWNER lifein;"
+sudo -u postgres psql -d lifein -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+sudo useradd -r -m -d /opt/lifein lifein
+sudo mkdir -p /var/log/lifein && sudo chown lifein:lifein /var/log/lifein
+```
+
+**安全组只开 22 / 80 / 443。** 5432 与 8000 一律不对外 ——
+数据库和应用都只监听 `127.0.0.1`,TLS 在 Caddy 终结
+([07 §2.1](07-config.md#21-基础) 那条不变)。80 要开是因为
+Let's Encrypt 的 HTTP-01 验证走它。
+
+### 6.2 把代码和配置搬上去
+
+```bash
+git clone <你的仓库> /opt/lifein && cd /opt/lifein
+python3 -m venv .venv && .venv/bin/pip install -e .
+```
+
+`.env` **手抄一份**,不要 scp 整个文件过去(那份里有旧机器的路径习惯)。
+必须原样带过去的是这三行:
+
+```
+MASTER_KEY=...            # 一个字符都不能改
+MASTER_KEY_VERSION=...    # 和上面成对
+DATABASE_URL=...          # 改成云上那个库
+```
+
+> **这是整个迁移最容易翻车的一条。** `MASTER_KEY` 不跟着搬,
+> `credentials` 里所有凭据**全部解不开** —— 加密信封的 AAD 绑了
+> `user_id` 与 `kind`,密钥不对是 `DecryptError`,不是"读出乱码"。
+> 症状是"迁完了但采不到邮件、推不出微信",而日志里只有一行解密失败。
+
+顺便把这一期新增的两项补上(家里那台的 `.env` 里还没有):
+
+```
+NOTIFICATION_RETENTION_DAYS=7
+SMTP_HOST=...  SMTP_PORT=465  SMTP_USERNAME=...  SMTP_PASSWORD=...  SMTP_TO=...
+```
+
+**SMTP 这一组现在是必须的**:告警的唯一出口是邮件(07 §2.7),
+而"采集器掉线 1 小时内告警"是 P1 的验收标准 ——
+不配的话那条标准只会写进日志,没人看得见。
+
+`INGEST_SECRET` 那一行如果还在,删掉:密钥改成按设备签发了([07 §2.5](07-config.md#25-采集入口))。
+
+### 6.3 迁数据
+
+```bash
+# 家里那台(先停服务!)
+docker exec lifein-pg pg_dump -U lifein -d lifein --format=custom > lifein.dump
+scp lifein.dump user@云服务器:/tmp/
+
+# 云上
+sudo -u postgres pg_restore -d lifein --no-owner --role=lifein /tmp/lifein.dump
+cd /opt/lifein && .venv/bin/python -m alembic upgrade head   # 应当显示已是 head
+```
+
+还原完立刻对一遍条数,**对不上就停下**:
+
+```bash
+.venv/bin/python -c "
+from sqlalchemy import text
+from lifein.db import session_scope
+with session_scope() as s:
+    for t in ('users','raw_events','facts','entities','todos','credentials','push_log'):
+        print(t, s.execute(text(f'SELECT count(*) FROM {t}')).scalar_one())"
+```
+
+**再验一件事:凭据解得开。** 这是主密钥有没有搬对的唯一判据:
+
+```bash
+.venv/bin/python -m lifein.admin key-status --user <uuid>   # 不报错就是解得开
+.venv/bin/python -m lifein.admin test-imap --user <uuid>    # 真连一次邮箱
+```
+
+### 6.4 常驻与反代
+
+```bash
+sudo cp deploy/lifein.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now lifein
+sudo systemctl status lifein
+
+sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile   # 改成你的子域名
+sudo systemctl reload caddy
+```
+
+子域名在 DNS 里加一条 A 记录指向服务器公网 IP。**备案是按域名的**,
+主域名备过,子域名跟着走,不用再备一次。
+
+### 6.5 验证(这一步不能省)
+
+```bash
+curl https://lifein.你的域名.com/healthz                    # {"status":"ok"}
+LIFEIN_BASE=https://lifein.你的域名.com \
+    .venv/bin/python scripts/verify-app-api.py             # 必须全部通过
+sudo journalctl -u lifein -n 50                            # 微信长轮询有没有恢复
+```
+
+`verify-app-api.py` 里那条 **R11 实测**(采集密钥换不出 token)在新地址上
+必须照样是 401 —— 反代改写了路径的话,签名会对不上,表现就是全部 401,
+所以这个脚本同时也在验"反代没有动路径"(06 §6.2)。
+
+摘要那条链路等第二天早上八点自己验:收到了就是通的,没收到就看日志。
+急的话 `python -m lifein --once` 立刻跑一遍。
+
+### 6.6 家里那台怎么处理
+
+- **关掉自启**(任务计划里那条),否则下次开机它会跟云上抢微信会话
+- 代码留着当开发机。`.env` 里的 `DATABASE_URL` 指回本地测试库,
+  别指云上那个 —— 开发时一条 `alembic downgrade` 就能把线上库打回去
+- 那份 `lifein.dump` 留着。**它是这次搬家的回退路径**,
+  在云上跑满一周之前不要删
+
+### 6.7 备份从此是云上的事
+
+家里那台不再有数据,备份要在云上重新配:
+
+```bash
+# /etc/cron.daily/lifein-backup
+sudo -u postgres pg_dump -d lifein --format=custom \
+    > /var/backups/lifein-$(date +\%F).dump
+find /var/backups -name 'lifein-*.dump' -mtime +14 -delete
+```
+
+**备份和主密钥不要放同一个地方。** `.env` 在服务器上,备份也在服务器上的话,
+一次拖库就两样都拿走了 —— 加密等于没做([R1](05-risks.md#r1--代管他人凭据与支付数据)
+那张新增暴露面的表)。

@@ -1,0 +1,42 @@
+# LifeIn 常驻单元(ADR-022 之后代替 scripts/run-lifein.cmd 的角色)。
+#
+# 装法见 docs/08-deployment.md §6。三件事和那个 .cmd 是一一对应的:
+# 开机自启、崩了重启、日志落文件 —— 只是这里由 systemd 做,不用自己写循环。
+#
+# 装到 /etc/systemd/system/lifein.service
+
+[Unit]
+Description=LifeIn personal life agent
+# 数据库没起来就连不上。systemd 只保证顺序不保证就绪,所以代码里那条
+# pool_pre_ping 仍然要留着(db.py)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lifein
+Group=lifein
+WorkingDirectory=/opt/lifein
+# .env 由 pydantic-settings 从 WorkingDirectory 读,不用 EnvironmentFile
+Environment=PYTHONUTF8=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/lifein/.venv/bin/python -m lifein
+
+# 崩了就重启。30 秒和原来那个 .cmd 一致 —— 太短会在数据库没起来时空转
+Restart=always
+RestartSec=30
+
+# 日志落文件而不是只进 journal:这个系统最危险的失效方式是安静,
+# 而"它什么时候停的"要能在一个地方查到(R8 / R9)
+StandardOutput=append:/var/log/lifein/lifein.log
+StandardError=append:/var/log/lifein/lifein.log
+
+# 收一收权限:它只需要读自己的目录和连本机数据库
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/lifein /var/log/lifein
+
+[Install]
+WantedBy=multi-user.target
