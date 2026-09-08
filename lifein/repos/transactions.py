@@ -110,10 +110,12 @@ class Transaction:
     merchant_raw: str | None
     category: str | None
     account_hint: str | None
+    order_no: str | None
     channel: str
     stage: Stage
     source_event_id: int
     merged_from_event_ids: list[int]
+    matched_statement_event_id: int | None
     confidence: float
 
     @property
@@ -123,16 +125,18 @@ class Transaction:
 
 _COLUMNS = """
     id, occurred_at, amount, currency, direction, kind, merchant_raw, category,
-    account_hint, channel, stage, source_event_id, merged_from_event_ids, confidence
+    account_hint, order_no, channel, stage, source_event_id, merged_from_event_ids,
+    matched_statement_event_id, confidence
 """
 
 _INSERT = text(f"""
     INSERT INTO transactions
         (user_id, occurred_at, amount, currency, direction, kind, merchant_raw,
-         category, account_hint, channel, stage, source_event_id, confidence)
+         category, account_hint, order_no, channel, stage, source_event_id, confidence)
     VALUES
         (:user_id, :occurred_at, :amount, :currency, :direction, :kind, :merchant_raw,
-         :category, :account_hint, :channel, :stage, :source_event_id, :confidence)
+         :category, :account_hint, :order_no, :channel, :stage, :source_event_id,
+         :confidence)
     ON CONFLICT (user_id, source_event_id) DO NOTHING
     RETURNING {_COLUMNS}
 """)
@@ -206,6 +210,54 @@ _UNMERGE = text("""
 """)
 
 
+RECONCILE_WINDOW = timedelta(days=3)
+"""对账时间窗。**比跨渠道合并那 5 分钟宽得多。**
+
+因为对账单上记的往往是**入账日而不是消费日**，周末和节假日能差几天。
+开大的代价是可能认错两笔同额消费，所以金额和卡号必须同时对得上，
+而且一笔实时记录只能被回填一次。
+"""
+
+_ALREADY_RECONCILED = text("""
+    SELECT id FROM transactions
+     WHERE user_id = :user_id AND matched_statement_event_id = :statement_event_id
+     LIMIT 1
+""")
+
+_FIND_RECONCILABLE = text(f"""
+    SELECT {_COLUMNS}
+      FROM transactions
+     WHERE user_id = :user_id
+       AND amount = :amount
+       AND stage = 'realtime'
+       AND matched_statement_event_id IS NULL
+       AND occurred_at BETWEEN :window_start AND :window_end
+       -- CAST 不能省：裸参数直接跟 IS NULL 比，Postgres 推不出它的类型
+       AND (
+            account_hint IS NULL
+            OR CAST(:account_hint AS TEXT) IS NULL
+            OR account_hint = CAST(:account_hint AS TEXT)
+       )
+     -- 时间最接近的那笔。同一天两笔同额时这是唯一能用的判据，
+     -- 而它也可能选错 —— 选错了的后果只是两笔互换了商户名，
+     -- 总额不变；而不匹配的后果是账本上多出一笔
+     ORDER BY abs(EXTRACT(EPOCH FROM (occurred_at - :occurred_at)))
+     LIMIT 1
+""")
+
+_BACKFILL = text(f"""
+    UPDATE transactions
+       SET merchant_raw = COALESCE(:merchant_raw, merchant_raw),
+           order_no = COALESCE(:order_no, order_no),
+           category = COALESCE(:category, category),
+           stage = 'reconciled',
+           matched_statement_event_id = :statement_event_id
+     WHERE user_id = :user_id
+       AND id = :txn_id
+       AND matched_statement_event_id IS NULL
+ RETURNING {_COLUMNS}
+""")
+
 @dataclass(frozen=True)
 class RecordResult:
     """写入的结果。
@@ -235,6 +287,7 @@ def record(
     merchant_raw: str | None = None,
     category: str | None = None,
     account_hint: str | None = None,
+    order_no: str | None = None,
     currency: str = "CNY",
     stage: Stage = Stage.REALTIME,
     merge_window: timedelta = MERGE_WINDOW,
@@ -312,6 +365,7 @@ def record(
             "merchant_raw": merchant_raw,
             "category": category,
             "account_hint": account_hint,
+            "order_no": order_no,
             "channel": channel,
             "stage": stage.value,
             "source_event_id": source_event_id,
@@ -397,6 +451,86 @@ def undo_record(user_id: str, session: Session, *, source_event_id: int) -> bool
     return True
 
 
+
+def find_reconcilable(
+    user_id: str,
+    session: Session,
+    *,
+    amount: Decimal,
+    occurred_at: datetime,
+    account_hint: str | None = None,
+    window: timedelta = RECONCILE_WINDOW,
+) -> Transaction | None:
+    """找对账单这一行对应的**实时那一笔**。
+
+    只看 `stage = 'realtime'` 且还没被回填过的：已经对过的那些重新匹配
+    只会把一笔的商户名改成另一笔的，而那种错误在报表上看不出来。
+    """
+    row = session.execute(
+        _FIND_RECONCILABLE,
+        {
+            "user_id": user_id,
+            "amount": amount,
+            "account_hint": account_hint,
+            "occurred_at": occurred_at,
+            "window_start": occurred_at - window,
+            "window_end": occurred_at + window,
+        },
+    ).first()
+    return _to_txn(row) if row else None
+
+
+def is_reconciled(user_id: str, session: Session, *, statement_event_id: int) -> bool:
+    """这一行对账单是不是已经处理过了。**幂等的第一道。**
+
+    同一封对账单被重新解一遍是常态（补跑、手动重导），
+    而 ADR-012 写着重复入账比漏记更糟 —— 漏记你会发现，重复不会。
+    """
+    return (
+        session.execute(
+            _ALREADY_RECONCILED,
+            {"user_id": user_id, "statement_event_id": statement_event_id},
+        ).first()
+        is not None
+    )
+
+
+def backfill(
+    user_id: str,
+    session: Session,
+    *,
+    txn_id: int,
+    statement_event_id: int,
+    merchant_raw: str | None = None,
+    order_no: str | None = None,
+    category: str | None = None,
+) -> Transaction | None:
+    """把对账单上的真实商户名、订单号回填到实时那一笔上。
+
+    **金额、时间、方向一律不改。** 实时那一笔的金额来自银行短信，
+    和对账单是同一个权威来源；而对账单上的时间往往是入账日，
+    拿它覆盖消费日会让一笔周末的消费跑到周一去，而月度报表按天切。
+
+    `WHERE matched_statement_event_id IS NULL` 是幂等的第二道：
+    并发跑两遍时只有一遍能改到行，另一遍拿到 None。
+    """
+    row = session.execute(
+        _BACKFILL,
+        {
+            "user_id": user_id,
+            "txn_id": txn_id,
+            "statement_event_id": statement_event_id,
+            "merchant_raw": merchant_raw,
+            "order_no": order_no,
+            "category": category,
+        },
+    ).first()
+    if row is None:
+        log.info("回填未生效：交易 %s 已经对过账了", txn_id)
+        return None
+    return _to_txn(row)
+
+
 def _to_txn(row) -> Transaction:
     return Transaction(
         id=row.id,
@@ -408,9 +542,11 @@ def _to_txn(row) -> Transaction:
         merchant_raw=row.merchant_raw,
         category=row.category,
         account_hint=row.account_hint,
+        order_no=row.order_no,
         channel=row.channel,
         stage=Stage(row.stage),
         source_event_id=row.source_event_id,
         merged_from_event_ids=list(row.merged_from_event_ids or []),
+        matched_statement_event_id=row.matched_statement_event_id,
         confidence=float(row.confidence),
     )

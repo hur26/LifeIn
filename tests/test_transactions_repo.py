@@ -22,7 +22,10 @@ from lifein.repos.transactions import (
     Stage,
     TransactionError,
     TxnKind,
+    backfill,
+    find_reconcilable,
     get_by_event,
+    is_reconciled,
     list_between,
     record,
     spending_by_category,
@@ -228,3 +231,146 @@ class TestReading:
         """实时通道落下的那一刻,商户名多半只是代收机构 —— 要等月度账单回填。"""
         result = a_txn(pg_session, user_id, external_id="stage")
         assert result.transaction.stage is Stage.REALTIME
+
+
+class TestReconciliation:
+    """对账回填(06 §2.6 第三层,ADR-012 的两阶段入账)。
+
+    **这一组盯的是幂等。** ADR-012 写着"重复入账比漏记更糟"——
+    漏记你会发现,重复不会。而同一封对账单被重新解一遍是常态:
+    补跑、手动重导都会走到这里。
+    """
+
+    def a_statement_line(self, session, user_id, *, external_id="stmt-1") -> int:
+        return an_event(session, user_id, external_id=external_id)
+
+    def test_a_statement_line_finds_the_realtime_row(self, pg_session, user_id):
+        a_txn(pg_session, user_id, external_id="rt-1")
+
+        found = find_reconcilable(
+            user_id, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW + timedelta(days=1), account_hint="1234",
+        )
+        assert found is not None and found.stage is Stage.REALTIME
+
+    def test_the_window_is_days_not_minutes(self, pg_session, user_id):
+        """**对账单上记的往往是入账日而不是消费日**,周末和节假日能差几天。"""
+        a_txn(pg_session, user_id, external_id="rt-1")
+
+        assert find_reconcilable(
+            user_id, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW + timedelta(days=2), account_hint="1234",
+        ) is not None
+        assert find_reconcilable(
+            user_id, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW + timedelta(days=9), account_hint="1234",
+        ) is None
+
+    def test_a_different_card_is_not_the_same_transaction(self, pg_session, user_id):
+        """窗口开大之后,金额和卡号是仅剩的两道判据 —— 卡号对不上就不是它。"""
+        a_txn(pg_session, user_id, external_id="rt-1")
+
+        assert find_reconcilable(
+            user_id, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW, account_hint="9999",
+        ) is None
+
+    def test_backfill_fills_in_the_real_merchant(self, pg_session, user_id):
+        """实时那条的商户名是"财付通",归类价值为零 —— 回填的就是这个。"""
+        created = a_txn(pg_session, user_id, external_id="rt-1")
+        line = self.a_statement_line(pg_session, user_id)
+
+        after = backfill(
+            user_id, pg_session, txn_id=created.transaction.id, statement_event_id=line,
+            merchant_raw="星巴克", order_no="2026090812345", category="餐饮",
+        )
+
+        assert after.merchant_raw == "星巴克"
+        assert after.order_no == "2026090812345"
+        assert after.category == "餐饮"
+        assert after.stage is Stage.RECONCILED
+        assert after.matched_statement_event_id == line
+
+    def test_backfill_never_touches_the_money(self, pg_session, user_id):
+        """**金额、时间、方向一律不改。** 对账单上的时间往往是入账日,
+        拿它覆盖消费日会让一笔周末的消费跑到周一去,而月度报表按天切。"""
+        created = a_txn(pg_session, user_id, external_id="rt-1")
+        line = self.a_statement_line(pg_session, user_id)
+
+        after = backfill(
+            user_id, pg_session, txn_id=created.transaction.id,
+            statement_event_id=line, merchant_raw="星巴克",
+        )
+
+        before = created.transaction
+        assert (after.amount, after.occurred_at, after.direction, after.kind) == (
+            before.amount, before.occurred_at, before.direction, before.kind,
+        )
+
+    def test_a_row_can_only_be_backfilled_once(self, pg_session, user_id):
+        """幂等的第二道。并发跑两遍时只有一遍能改到行,另一遍拿到 None。"""
+        created = a_txn(pg_session, user_id, external_id="rt-1")
+        first_line = self.a_statement_line(pg_session, user_id, external_id="stmt-1")
+        second_line = self.a_statement_line(pg_session, user_id, external_id="stmt-2")
+
+        assert backfill(
+            user_id, pg_session, txn_id=created.transaction.id,
+            statement_event_id=first_line, merchant_raw="星巴克",
+        ) is not None
+        assert backfill(
+            user_id, pg_session, txn_id=created.transaction.id,
+            statement_event_id=second_line, merchant_raw="麦当劳",
+        ) is None
+
+    def test_a_reconciled_row_is_not_offered_again(self, pg_session, user_id):
+        """对过的不再参与匹配 —— 否则重跑只会把一笔的商户名改成另一笔的,
+        而那种错误在报表上看不出来。"""
+        created = a_txn(pg_session, user_id, external_id="rt-1")
+        line = self.a_statement_line(pg_session, user_id)
+        backfill(
+            user_id, pg_session, txn_id=created.transaction.id,
+            statement_event_id=line, merchant_raw="星巴克",
+        )
+
+        assert find_reconcilable(
+            user_id, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW, account_hint="1234",
+        ) is None
+
+    def test_is_reconciled_is_the_first_gate(self, pg_session, user_id):
+        """幂等的第一道:同一行对账单再解一遍时,连匹配都不用做。"""
+        created = a_txn(pg_session, user_id, external_id="rt-1")
+        line = self.a_statement_line(pg_session, user_id)
+
+        assert is_reconciled(user_id, pg_session, statement_event_id=line) is False
+        backfill(
+            user_id, pg_session, txn_id=created.transaction.id,
+            statement_event_id=line, merchant_raw="星巴克",
+        )
+        assert is_reconciled(user_id, pg_session, statement_event_id=line) is True
+
+    def test_reconciliation_does_not_reach_across_users(self, pg_session, user_id):
+        """铁律 1。对账单里带着一个人一整月去过哪些店。"""
+        a_txn(pg_session, user_id, external_id="rt-1")
+        other = "99999999-9999-9999-9999-999999999999"
+
+        assert find_reconcilable(
+            other, pg_session, amount=Decimal("38.50"),
+            occurred_at=NOW, account_hint="1234",
+        ) is None
+
+    def test_a_line_that_matches_nothing_is_recorded_as_new(self, pg_session, user_id):
+        """ADR-012:匹配不上的补为新记录。**它意味着实时那一路漏了一笔**,
+        而漏记是这条链路唯一不会自己暴露的错误。"""
+        line = self.a_statement_line(pg_session, user_id)
+
+        result = record(
+            user_id, pg_session, occurred_at=NOW, amount=Decimal("128.00"),
+            direction=Direction.DEBIT, kind=TxnKind.EXPENSE, channel="statement",
+            source_event_id=line, confidence=1.0, merchant_raw="全家便利店",
+            order_no="ORD-9", stage=Stage.RECONCILED,
+        )
+
+        assert result.created is True
+        assert result.transaction.stage is Stage.RECONCILED
+        assert result.transaction.order_no == "ORD-9"

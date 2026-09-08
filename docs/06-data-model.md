@@ -212,6 +212,7 @@ CREATE TABLE transactions (
     merchant_entity_id  UUID REFERENCES entities(id),
     category            TEXT,
     account_hint        TEXT,          -- 卡号后四位
+    order_no            TEXT,          -- 订单号,只有对账单那一道给得出
     channel             TEXT NOT NULL, -- alipay|wechat|bank_sms|bank_app|meituan|...
     stage               TEXT NOT NULL DEFAULT 'realtime'
                           CHECK (stage IN ('realtime','reconciled')),
@@ -230,7 +231,7 @@ CREATE INDEX ON transactions (user_id, stage) WHERE stage = 'realtime';
 **`kind` 是四层防误判的落地点。** 只有 `expense` 和 `income` 进统计;
 `repayment`(信用卡还款)计入支出会造成双重记账,因为消费时已经记过一次。
 
-### 2.6 去重的两个层次
+### 2.6 去重与对账的三个层次
 
 **不要用一个字段解决两个问题**,这是最容易做错的地方:
 
@@ -238,6 +239,7 @@ CREATE INDEX ON transactions (user_id, stage) WHERE stage = 'realtime';
 | --- | --- |
 | 同一条通知被重复上报(采集器重试、网络重投) | `UNIQUE (user_id, source_event_id)` —— 幂等键 |
 | 同一笔交易在多个渠道各发一条(支付宝通知 + 银行短信) | **5 分钟窗口查询**,不是唯一约束 |
+| 月度对账单里的同一笔(实时那条已经入过账) | **(金额, 时间窗, 卡号后四位)匹配查询** + `matched_statement_event_id` 幂等键 |
 
 跨渠道合并的判定:
 
@@ -252,6 +254,42 @@ CREATE INDEX ON transactions (user_id, stage) WHERE stage = 'realtime';
 
 用唯一约束做跨渠道去重会误杀真实的连续同额消费(便利店连买两次同价商品),
 所以它必须是查询判定 + 可回溯的合并记录,不是数据库约束。
+
+**第三层：对账回填(ADR-012 的两阶段入账)。**
+月度对账单到达时,它里的每一行都已经落成一条 `raw_events`
+(**一行一条,不是一封邮件一条**)—— 因为
+`UNIQUE (user_id, source_event_id)` 要求每笔交易有自己的来源事件,
+一封带 200 行的对账单共用一个 `source_event_id` 只能入账一笔。
+
+```
+对对账单里的一行：
+  先看它是不是对过了：
+      EXISTS (SELECT 1 FROM transactions
+               WHERE user_id = ? AND matched_statement_event_id = 这行的 event_id)
+    → 对过了,什么都不做(幂等)
+  再找实时那一笔：
+      同一 user_id AND amount 相等
+        AND account_hint 相等或一方为空
+        AND |occurred_at 差| <= 对账时间窗(默认 3 天)
+        AND stage = 'realtime'
+        AND matched_statement_event_id IS NULL
+    → 找到：回填真实商户名、订单号,重新归类,
+      stage 改成 reconciled,matched_statement_event_id 写上这行的 event_id
+    → 没找到：按一笔新的入账(stage = reconciled),
+      并计入覆盖率统计 —— 它意味着实时那一路漏了一笔
+```
+
+时间窗比跨渠道合并那 5 分钟宽得多,是因为
+**对账单上记的往往是入账日而不是消费日**,周末和节假日能差几天。
+窗口开大的代价是可能认错两笔同额消费,所以金额和卡号必须同时对得上,
+而且**一笔实时记录只能被对账单回填一次**(`matched_statement_event_id IS NULL`)。
+
+**幂等键不能靠“重跑不了”。** ADR-012 写着“重复入账比漏记更糟”
+—— 漏记你会发现,重复不会。同一封对账单被重新解一遍是常态
+(补跑、手动重导),所以上面那两道必须各守一边：
+`matched_statement_event_id` 挡住“回填两次”,
+`UNIQUE (user_id, source_event_id)` 挡住“补成两笔新的”。
+
 
 ### 2.7 pending_confirmations · 统一待确认队列
 
