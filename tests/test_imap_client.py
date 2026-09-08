@@ -147,3 +147,24 @@ def test_one_broken_mail_does_not_stop_the_round():
     assert len(events) == 2
     assert events[0].failed is True
     assert events[1].normalized.title == "正常邮件"
+
+
+def test_our_own_push_mail_is_skipped():
+    """采集的邮箱和发信的邮箱常常是同一个。
+
+    不跳过的话,系统昨天发出去的摘要今天会被自己采回来当成新事件,
+    进而进摘要和记忆 —— 而那条"事实"指回的来源是系统自己。
+    """
+    from lifein.channels.base import Card
+    from lifein.channels.email import build_message
+
+    own = build_message(
+        Card(title="9 月 8 日摘要", summary="今天有 2 件要紧事。"),
+        from_address="me@qq.com",
+        to_address="me@qq.com",
+    ).as_bytes()
+    server = FakeIMAP(mails={"1": own, "2": build_mail(subject="别人发来的")})
+
+    events = list(EmailAdapter(mailbox(server)).fetch(SINCE))
+
+    assert [e.normalized.title for e in events] == ["别人发来的"]

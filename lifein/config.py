@@ -16,7 +16,7 @@ import logging
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     collector_heartbeat_timeout_m: int = 60
     alert_channel: str = "email"
 
+    # ---------- 邮件兜底通道(P1,可选)----------
+    # 配了才启用。它是降级链的最后一环,也是告警的出口 —— 告警不能走
+    # 可能已经挂掉的那条通道(07 §2.6),而"挂掉"正是最需要告警的时候。
+    smtp_host: str | None = None
+    smtp_port: int = 465
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from: str | None = None
+    smtp_to: str | None = None
+    smtp_use_ssl: bool = True
+
     # ---------- 校验 ----------
 
     @field_validator("master_key", "master_key_previous")
@@ -134,6 +145,37 @@ class Settings(BaseSettings):
         if not v.get_secret_value().strip():
             raise ValueError(f"{info.field_name.upper()} 是空的,不能只写等号")
         return v
+
+    @model_validator(mode="after")
+    def _smtp_all_or_nothing(self) -> Settings:
+        """配了 SMTP_HOST 就得把这一组配全。
+
+        配一半比没配更糟:降级链会多出一条**必然失败**的通道,而失败的表现是
+        每天多一条告警 —— 告警变成噪音之后,真出事的那次就被忽略了。
+        """
+        if not self.smtp_host:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("SMTP_USERNAME", self.smtp_username),
+                ("SMTP_PASSWORD", self.smtp_password),
+                ("SMTP_TO", self.smtp_to),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(f"配了 SMTP_HOST 就必须配:{'、'.join(missing)}")
+        return self
+
+    @property
+    def smtp_enabled(self) -> bool:
+        return bool(self.smtp_host)
+
+    @property
+    def smtp_sender_address(self) -> str:
+        """发件地址。没单独配就用登录名 —— 国内邮箱两者基本一致。"""
+        return self.smtp_from or self.smtp_username or ""
 
     @field_validator("daily_digest_at")
     @classmethod

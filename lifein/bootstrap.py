@@ -23,8 +23,9 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from lifein.agents.contract import validate_all
-from lifein.alerts import Alerter, LoggingAlerter
+from lifein.alerts import Alerter, EmailAlerter, LoggingAlerter
 from lifein.channels.base import Channel, InboundMessage
+from lifein.channels.email import EmailChannel, SmtpConfig, SmtpTransport
 from lifein.channels.fallback import FallbackChannel
 from lifein.channels.wecom import WecomChannel
 from lifein.channels.wecom_callback import WecomCallback
@@ -97,8 +98,6 @@ def build_services(settings: Settings | None = None) -> Services:
         embedding_dim=s.embedding_dim,
     )
 
-    alerter = LoggingAlerter()
-
     # ADR-018:微信优先,企微兜底。微信没配过会话时 WeixinChannel 会抛错,
     # 于是自动落到企微 —— 所以"还没配微信"和"微信坏了"走的是同一条路径,
     # 不需要在这里判断配没配
@@ -123,14 +122,67 @@ def build_services(settings: Settings | None = None) -> Services:
         # 而前者是你自己选的、后者是故障 —— 启动时说一次,免得以后分不清
         log.warning("未配置企业微信:没有兜底推送通道,也没有日历数据源")
 
+    email_channel = _build_email_channel(s)
+    if email_channel is not None:
+        # 排在最后:前面两条的共同失效方式是平台(会话过期、接口改版、
+        # 账号受限),而邮件不依赖任何平台政策(R6)
+        channels.append(email_channel)
+    else:
+        log.warning("未配置 SMTP:降级链最后没有邮件兜底,告警也只写日志")
+
+    channel = FallbackChannel(channels, alerter=LoggingAlerter())
+    alerter: Alerter = (
+        # 告警走邮件而不是主通道:告警最需要发出去的时刻,正是主通道挂了的时刻。
+        # 降级链自己的告警仍然只写日志 —— 否则"邮件发不出去"会试着用邮件告诉你
+        EmailAlerter(email_channel, lambda: _first_active_user())
+        if email_channel is not None
+        else LoggingAlerter()
+    )
+
     return Services(
         settings=s,
         llm=llm,
         wecom=wecom,
-        channel=FallbackChannel(channels, alerter=alerter),
+        channel=channel,
         callback=callback,
         alerter=alerter,
     )
+
+
+def _build_email_channel(s: Settings) -> EmailChannel | None:
+    if not s.smtp_enabled:
+        return None
+    config = SmtpConfig(
+        host=s.smtp_host or "",
+        port=s.smtp_port,
+        username=s.smtp_username or "",
+        password=(s.smtp_password.get_secret_value() if s.smtp_password else ""),
+        sender=s.smtp_sender_address,
+        use_ssl=s.smtp_use_ssl,
+    )
+    return EmailChannel(
+        SmtpTransport(config),
+        from_address=config.sender,
+        # 收件人是配置里那一个:**不要填成被采集的那个邮箱**。
+        # 填了也不至于回环(发出去的信带 X-LifeIn-Push,采集侧会跳过),
+        # 但收件箱里会多一份自己给自己的抄送
+        resolve_address=lambda _user_id: s.smtp_to or "",
+    )
+
+
+def _first_active_user() -> str | None:
+    """告警发给谁。P0/P1 只有一个用户,取第一个就是他。
+
+    每次现查而不是启动时缓存:进程可能起在建用户之前,而那时缓存下来的
+    "没有用户"会让整个告警通道在余下的运行期里静默。
+    """
+    try:
+        with session_scope() as session:
+            ids = users.list_active_users(session)
+        return ids[0] if ids else None
+    except Exception:  # noqa: BLE001
+        log.exception("查不到告警收件用户")
+        return None
 
 
 def _load_weixin_session(user_id: str) -> WeixinSession | None:

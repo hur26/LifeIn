@@ -11,6 +11,7 @@ import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
+from lifein.channels.email import looks_like_our_own_push
 from lifein.models.normalized import Trust
 from lifein.sources.base import IngestedEvent
 from lifein.sources.email_source import SOURCE, normalize_email
@@ -27,6 +28,12 @@ class EmailAdapter:
 
     def fetch(self, since: datetime) -> Iterator[IngestedEvent]:
         for uid, raw in self._mailbox.fetch_raw_since(since):
+            if looks_like_our_own_push(raw):
+                # 采集的邮箱和发信的邮箱常常是同一个。不跳过的话,系统昨天
+                # 发出去的摘要今天会被自己采回来变成一条"新事件",
+                # 进而进摘要和记忆 —— 那条事实指回的来源是系统自己
+                log.debug("跳过自己发出去的推送邮件,uid=%s", uid)
+                continue
             received_at = datetime.now(UTC)
             try:
                 event = normalize_email(raw, received_at=received_at)
