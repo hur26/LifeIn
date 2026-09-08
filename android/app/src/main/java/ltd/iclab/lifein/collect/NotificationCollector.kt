@@ -13,6 +13,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import ltd.iclab.lifein.data.LifeInDatabase
 import ltd.iclab.lifein.data.QueuedEvent
+import ltd.iclab.lifein.work.UploadTrigger
 
 /**
  * 通知监听 —— 这个 App 存在的根本原因(架构 §8)。

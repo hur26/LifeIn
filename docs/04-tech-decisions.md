@@ -994,6 +994,7 @@ Play 服务变的东西**,而这个 App 要在一台被频繁清后台的主力�
 | **Room** + KSP | 上报队列、日历幂等表、离线缓存 | 新增 |
 | **OkHttp** | HTTP | 新增。签名要对**发出去的字节**签 |
 | **kotlinx.serialization** | JSON | 新增。Kotlin 官方,无反射 |
+| **kotlinx.coroutines** | 后台入口全在用 | 新增。写明版本而不是靠 ktx 传递进来 —— 传递依赖的版本会跟着别的库跳 |
 | **Android Keystore**(系统 API) | 长期凭据落地 | 零依赖,见下 |
 | **CalendarContract**(系统 API) | 写系统日历 | ADR-020 的落点 |
 | `NotificationListenerService`(系统 API) | 采集 | [ADR-010](#adr-010--微信只做只读接入走官方通知监听) 的落点 |

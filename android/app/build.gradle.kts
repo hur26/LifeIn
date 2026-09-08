@@ -42,16 +42,22 @@ android {
     buildFeatures {
         compose = true
     }
-    ksp {
-        // 迁移脚本要能进版本库:手机上的库升级失败会表现成"打开就闪退"
-        arg("room.schemaLocation", "$projectDir/schemas")
-    }
+}
+
+// 库的 schema 要能进版本库:手机上那个库升级失败的表现是"打开就闪退",
+// 而没有 schema 就写不出真正的迁移(Db.kt 里那两条)
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
+
+    // 协程写明版本而不是靠 work/room 的 ktx 传递进来:
+    // 传递依赖的版本会跟着别的库跳,而这个 App 的每个后台入口都在用它
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")
