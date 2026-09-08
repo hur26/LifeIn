@@ -26,6 +26,8 @@ from sqlalchemy.orm import Session
 
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
 from lifein.db import session_scope
+from lifein.jobs.collector_watch import WatchDeps
+from lifein.jobs.collector_watch import run_once as run_watch_once
 from lifein.jobs.daily_digest import DigestDeps, run_once
 from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
@@ -43,6 +45,17 @@ DIGEST_JOB_ID = "daily_digest"
 MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
 REMINDER_JOB_ID = "reminders"
+COLLECTOR_JOB_ID = "collector_watch"
+
+COLLECTOR_WATCH_INTERVAL_MINUTES = 5
+"""采集器掉线扫描的间隔。
+
+比提醒那个还密,因为它服务的是一条**验收标准**:掉线要在 1 小时内告警。
+超时 60 分钟 + 这里 5 分钟 = 最晚 65 分钟发出;要严格卡进一小时,
+把 COLLECTOR_HEARTBEAT_TIMEOUT_M 调到 55。
+
+它一次只读两张小表、不调模型,密一点没有成本。
+"""
 
 REMINDER_INTERVAL_MINUTES = 15
 """提醒扫描的间隔。
@@ -209,6 +222,40 @@ def run_reminders_for_all_users(
     return pushed
 
 
+def run_collector_watch_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """扫一遍所有用户的采集设备。返回这一轮新发出去的告警条数。
+
+    **正常情况下永远返回 0。** 它不是"跑出东西才算有用"的那种任务 ——
+    它存在的意义是掉线的那一天你能在一小时内知道。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    alerted = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = WatchDeps(
+                    alerter=services.alerter,
+                    timeout_minutes=services.settings.collector_heartbeat_timeout_m,
+                )
+                result = run_watch_once(user_id, session, deps=deps, now=moment)
+            alerted += len(result.alerted)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的采集器巡检失败", user_id)
+            services.alerter.alert("采集器巡检异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return alerted
+
+
 def build_scheduler(
     services: Services,
     *,
@@ -216,12 +263,14 @@ def build_scheduler(
     memory_runner: Callable[[Services], int] | None = None,
     plan_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
+    collector_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
     run_memory = memory_runner or run_memory_extract_for_all_users
     run_plan = plan_runner or run_plan_extract_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
+    run_collector_watch = collector_runner or run_collector_watch_for_all_users
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
@@ -267,6 +316,16 @@ def build_scheduler(
         coalesce=True,
         max_instances=1,
         # 错过五分钟以上就不补了:一条晚了半小时的"快到点了"只会让人困惑
+        misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        lambda: run_collector_watch(services),
+        trigger=IntervalTrigger(minutes=COLLECTOR_WATCH_INTERVAL_MINUTES),
+        id=COLLECTOR_JOB_ID,
+        name="采集器掉线巡检",
+        coalesce=True,
+        max_instances=1,
+        # 睡醒之后立刻补一次:机器停着的这段时间正是最可能掉线的时候
         misfire_grace_time=300,
     )
     return scheduler
