@@ -39,7 +39,7 @@ from lifein.llm.client import LLMBadResponse, LLMClient
 from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent, normalize_ref
 from lifein.models.normalized import PartyRole
 from lifein.repos.raw_events import StoredEvent
-from lifein.repos.transactions import TxnKind
+from lifein.repos.transactions import CATEGORIES, TxnKind
 
 log = logging.getLogger(__name__)
 
@@ -53,26 +53,6 @@ DEFAULT_MIN_CONFIDENCE = 0.8
 
 比日程那边的 0.7 严,因为代价不对称:待办多一条划掉就行,
 账本上多一笔会让每一个统计数字都不可信。
-"""
-
-CATEGORIES = (
-    "餐饮",
-    "交通",
-    "购物",
-    "居住",
-    "通信",
-    "娱乐",
-    "医疗",
-    "教育",
-    "人情",
-    "其他",
-)
-"""分类的**封闭枚举**。第 4 层复核会拿它挡住模型自创的类目。
-
-十个是起点不是终点 —— 加一个就在这里加一行。但**不要放开成自由文本**:
-那样报表上会长出"外卖""点外卖""外卖费"三个类目,而它们是同一件事
-([ADR-008](../../docs/04-tech-decisions.md#adr-008--账单归类用规则llm-混合) 说
-规则表要能沉淀,前提是类目稳定)。
 """
 
 
