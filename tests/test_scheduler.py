@@ -25,6 +25,7 @@ from lifein.scheduler import (
     BOOKKEEPING_JOB_ID,
     DIGEST_JOB_ID,
     MEMORY_JOB_ID,
+    MONTHLY_JOB_ID,
     PLAN_JOB_ID,
     RECONCILE_JOB_ID,
     build_scheduler,
@@ -103,11 +104,12 @@ class TestSchedulerShape:
             plan_runner=lambda _s: 0,
             bookkeeping_runner=lambda _s: 0,
             reconcile_runner=lambda _s: 0,
+            monthly_runner=lambda _s: 0,
         )
         times = {}
         for job_id in (
             DIGEST_JOB_ID, MEMORY_JOB_ID, PLAN_JOB_ID,
-            BOOKKEEPING_JOB_ID, RECONCILE_JOB_ID,
+            BOOKKEEPING_JOB_ID, RECONCILE_JOB_ID, MONTHLY_JOB_ID,
         ):
             fields = {f.name: str(f) for f in scheduler.get_job(job_id).trigger.fields}
             times[job_id] = (fields["hour"], fields["minute"])
@@ -119,6 +121,9 @@ class TestSchedulerShape:
         # 对账排在记账之后:反过来的话昨天那几笔还没入账,对账单里对应的行
         # 会被判成"实时那路漏了"补一笔新的,然后记账再记一遍,同一笔就有两条
         assert times[RECONCILE_JOB_ID] == ("9", "15")
+        # 月报每天都触发,但一个月只发一次 —— 挡住重复的是 job_runs 的窗口
+        # 认领,不是 cron 的日期字段:写 day=1 的话一号那天进程没起来就整月漏发
+        assert times[MONTHLY_JOB_ID] == ("9", "30")
 
     def test_scheduler_is_not_started_by_the_builder(self):
         # 由调用方决定什么时候起 —— 测试里不该有后台线程

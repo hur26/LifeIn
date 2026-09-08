@@ -34,6 +34,8 @@ from lifein.jobs.collector_watch import run_once as run_watch_once
 from lifein.jobs.daily_digest import DigestDeps, run_once
 from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
+from lifein.jobs.monthly_report import MonthlyDeps
+from lifein.jobs.monthly_report import run_once as run_monthly_once
 from lifein.jobs.plan_extract import PlanDeps
 from lifein.jobs.plan_extract import run_once as run_plan_once
 from lifein.jobs.reconcile import ReconcileDeps
@@ -51,6 +53,7 @@ MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
 BOOKKEEPING_JOB_ID = "bookkeeping"
 RECONCILE_JOB_ID = "reconcile"
+MONTHLY_JOB_ID = "monthly_report"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
@@ -80,6 +83,15 @@ REMINDER_INTERVAL_MINUTES = 15
 十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
 而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
 补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
+
+MONTHLY_DELAY_MINUTES = 90
+"""月度报告排在摘要之后多久。**它每天都触发,但一个月只发一次** ——
+挡住重复的是 `job_runs` 的窗口认领,不是 cron 的日期字段。
+
+不写 `day=1` 是刻意的:那样一号那天进程没起来就整个月都补不回来了,
+而月报是这个系统里最不该漏发的东西之一 —— 漏了不会有任何迹象。
+每天来敲一次门,认领得到就发,认领不到就走人。
 """
 
 RECONCILE_DELAY_MINUTES = 75
@@ -292,6 +304,41 @@ def run_reconcile_for_all_users(
     return backfilled
 
 
+
+def run_monthly_report_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户发上个月的报告。返回真的发出去了几份。
+
+    **每天跑,一个月只发一次。** 挡住重复的是 `job_runs`,不是日期判断 ——
+    判断"今天是不是一号"会在进程当天没起来时整月漏发,而月报漏了不会有
+    任何迹象。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    sent = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = MonthlyDeps(
+                    llm=services.llm, channel=services.channel, alerter=services.alerter
+                )
+                result = run_monthly_once(user_id, session, deps=deps, now=moment)
+            sent += 1 if result.delivered else 0
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的月度报告失败", user_id)
+            services.alerter.alert("月度报告异常", f"user={user_id}: {type(exc).__name__}: {exc}")
+
+    return sent
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -397,6 +444,7 @@ def build_scheduler(
     plan_runner: Callable[[Services], int] | None = None,
     bookkeeping_runner: Callable[[Services], int] | None = None,
     reconcile_runner: Callable[[Services], int] | None = None,
+    monthly_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
@@ -407,6 +455,7 @@ def build_scheduler(
     run_plan = plan_runner or run_plan_extract_for_all_users
     run_bookkeeping = bookkeeping_runner or run_bookkeeping_for_all_users
     run_reconcile = reconcile_runner or run_reconcile_for_all_users
+    run_monthly = monthly_runner or run_monthly_report_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
@@ -415,6 +464,7 @@ def build_scheduler(
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
     book_hour, book_minute = _shift(hour, minute, BOOKKEEPING_DELAY_MINUTES)
     recon_hour, recon_minute = _shift(hour, minute, RECONCILE_DELAY_MINUTES)
+    monthly_hour, monthly_minute = _shift(hour, minute, MONTHLY_DELAY_MINUTES)
     retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
@@ -466,6 +516,17 @@ def build_scheduler(
         ),
         id=RECONCILE_JOB_ID,
         name="对账回填",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_monthly(services),
+        trigger=CronTrigger(
+            hour=monthly_hour, minute=monthly_minute, timezone=services.settings.tzinfo
+        ),
+        id=MONTHLY_JOB_ID,
+        name="月度报告",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
