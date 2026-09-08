@@ -99,9 +99,7 @@ def test_same_person_new_display_name_is_one_entity(pg_session, user_id):
     assert second.entity.id == first.entity.id
     # 新署名作为别名也挂上去了,下次只写名字也认得出
     assert (
-        find_by_alias(
-            user_id, pg_session, alias="张三(市场部)", alias_type=AliasType.NAME
-        ).id
+        find_by_alias(user_id, pg_session, alias="张三(市场部)", alias_type=AliasType.NAME).id
         == first.entity.id
     )
 
@@ -293,6 +291,4 @@ def test_entities_are_isolated_per_user(pg_session, user_id):
 
 def test_blank_name_is_rejected(pg_session, user_id):
     with pytest.raises(AliasError):
-        resolve_or_create(
-            user_id, pg_session, kind=EntityKind.PERSON, name="   ", seen_at=NOW
-        )
+        resolve_or_create(user_id, pg_session, kind=EntityKind.PERSON, name="   ", seen_at=NOW)

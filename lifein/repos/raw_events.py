@@ -180,6 +180,44 @@ def fetch_normalized_between(
     return events
 
 
+@dataclass(frozen=True)
+class StoredEvent:
+    """一条已归一化的事件,连同它在 `raw_events` 里的 id。
+
+    记忆层非要这个 id 不可:`facts.provenance` 存的就是它(铁律 5)。
+    摘要不需要,所以上面那个 `fetch_normalized_between` 保持原样 ——
+    它是 P0 验收期间正在跑的链路,这一期一个字节都不动。
+    """
+
+    event_id: int
+    event: NormalizedEvent
+
+
+def fetch_stored_between(
+    user_id: str,
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    limit: int = 500,
+) -> list[StoredEvent]:
+    """取一个时间窗内已归一化的事件,**带上 id**。记忆抽取用它。"""
+    rows = session.execute(
+        _SELECT_BETWEEN,
+        {"user_id": user_id, "start": start, "end": end, "limit": limit},
+    ).all()
+
+    stored: list[StoredEvent] = []
+    for row in rows:
+        try:
+            stored.append(
+                StoredEvent(event_id=row.id, event=NormalizedEvent.model_validate(row.normalized))
+            )
+        except ValueError:
+            log.warning("raw_events.id=%s 的 normalized 结构已不合法,跳过", row.id)
+    return stored
+
+
 def count_failed(user_id: str, session: Session, *, since: datetime) -> int:
     """统计归一化失败数,供告警使用。
 
