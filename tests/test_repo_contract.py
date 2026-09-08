@@ -56,17 +56,31 @@ def data_access_functions():
 ALLOWED_EXEMPTIONS = {
     # 身份解析那一步手上还没有 user_id —— 它正是要算出这个值
     "users": {"find_by_wecom_userid", "create_user", "list_active_users"},
-    # 配码同理(P4 第 1 片):App 扫码那一刻只有一张码,而"这张码是谁的"
-    # 就存在那一行里。要求它先给 user_id,等于要求它先知道自己配的是谁的号。
-    # peek 是 claim 的只读版,purge_expired 按时间扫全表 ——
-    # **两者都不返回任何属于某个用户的数据**
+    # 配码(P4 第 1 片):App 扫码那一刻只有一张码,而"这张码是谁的"就存在
+    # 那一行里。peek 是 claim 的只读版,purge_expired 按时间扫全表
     "enrollment": {"claim", "peek", "purge_expired"},
+    # 控制台链接(P4 第 9 片):和上面那条**一模一样的形状** ——
+    # 浏览器带不了 Authorization 头,所以 token 在 URL 里,而"这张 token 是谁的"
+    # 正是 resolve() 要回答的
+    "console_links": {"resolve", "purge_expired"},
 }
 """哪些模块允许破例,以及破哪几个。
 
 **这份清单是这组测试真正的内容。** 上面那些签名检查任何时候都能通过 ——
 只要有人给模块加一行 `NO_USER_ID_REQUIRED`。而加进这份清单要改这个文件,
 那是一个看得见、要在 review 里解释的动作。
+"""
+
+EXEMPTION_REASONS = ("算出 user_id 的那一步", "按时间扫全表且不返回用户数据")
+"""**允许破例的只有这两种形状。**
+
+第一种:调用方手上还没有 `user_id`,而这个函数正是要算出它
+(`users.find_by_wecom_userid`、`enrollment.claim`、`console_links.resolve`)。
+第二种:按时间清理,返回的只有"删了几行"。
+
+三个模块看起来是三次破例,其实是**同一个形状的三次出现** ——
+而那正是它可以被接受的理由。第四个出现时先问一句:它是这两种里的哪一种?
+不是的话,那是设计问题,不是例外问题。
 """
 
 
@@ -86,9 +100,22 @@ def test_exemptions_are_narrow():
         assert set(exempt) == allowed, f"{module_info.name} 的例外和清单对不上"
 
 
-def test_the_exemption_list_itself_stays_short():
-    """**破例的模块只有两个。** 第三个出现时,要先回答"为什么这次也算特殊"。"""
-    assert set(ALLOWED_EXEMPTIONS) == {"users", "enrollment"}
+def test_every_exemption_is_one_of_the_two_known_shapes():
+    """**这条比"只有几个模块"更有用。**
+
+    数模块个数会在第四个出现时红一次,然后被人改成 4 —— 那时什么都没挡住。
+    而这条要求每个破例的函数说得清自己属于哪一种形状:算 user_id 的,
+    或者按时间清理且不返回用户数据的。
+    """
+    computes_user_id = {"find_by_wecom_userid", "claim", "resolve", "peek", "create_user"}
+    time_based_cleanup = {"purge_expired", "list_active_users"}
+
+    for module, names in ALLOWED_EXEMPTIONS.items():
+        for name in names:
+            assert name in computes_user_id or name in time_based_cleanup, (
+                f"{module}.{name} 不属于已知的两种破例形状"
+                f"({'、'.join(EXEMPTION_REASONS)})—— 那是设计问题,不是例外问题"
+            )
 
 
 def test_there_are_data_access_functions_to_check():

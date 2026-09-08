@@ -1283,3 +1283,29 @@ CREATE INDEX ON enrollment_codes (user_id, created_at DESC);
 **换取那一步是一条 `UPDATE ... WHERE claimed_at IS NULL AND expires_at > now`。**
 两个人同时扫同一张图时只有一个能换走 —— 先查再写的话两个都能换,
 而那时你和他各有一套**都有效**的密钥,你不会发现任何异常。
+
+### 2.14 console_links · 控制台的一次性链接
+
+[Web 控制台](../lifein/api/console.py)的认证。P4 第 9 片。
+
+```sql
+CREATE TABLE console_links (
+    id         BIGSERIAL PRIMARY KEY,
+    user_id    UUID NOT NULL,
+    token_hash TEXT NOT NULL,   -- sha256(token)。明文只在发出那一刻有
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (token_hash)
+);
+```
+
+**浏览器打开一个链接时带不了 `Authorization` 头**,所以 App 那套 Bearer token
+在 Web 上用不了。三条路里选了"一次性链接":让人粘贴 token 非技术背景的人做不到,
+而用户名密码 + 会话 cookie **多一个认证面就多一处会被攻破的地方**(R11)。
+
+**它是短命的多次可用,不是一次性的。** 页面上有链接要点(导出、隐私说明),
+每点一次就换一张的话,每次点击都要回 App 一趟。安全性靠那十五分钟,
+不靠"只能用一次"。
+
+**过期的直接删。** 和 `enrollment_codes` 不一样:那张要留"谁什么时候配上的"
+的痕迹,而"某人打开过控制台"不是那种事。
