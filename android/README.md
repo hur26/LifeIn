@@ -9,17 +9,25 @@
 
 ## 怎么编
 
-这份代码在 Windows 上没有编过:仓库所在的机器没有 Android SDK。
-第一次编要么用 Android Studio 打开 `android/` 目录(它会自己补 Gradle wrapper),
-要么装了 Gradle 之后:
+已经在 Windows 上真编过:JDK 17 + Android SDK 35 + Gradle 8.9
+(装在 `D:\environment`),`assembleDebug` 与 `testDebugUnitTest` 都过。
 
 ```bash
+export JAVA_HOME=/d/environment/jdk/jdk-17.0.20.1+1
+export ANDROID_HOME=/d/environment/android-sdk
 cd android
-gradle wrapper          # 只需要一次,补出 gradlew 和 wrapper jar
-./gradlew assembleDebug
+/d/environment/gradle/gradle-8.9/bin/gradle.bat assembleDebug testDebugUnitTest
 ```
 
-`local.properties` 里要有 `sdk.dir`,Android Studio 会自动写。
+`local.properties` 里要有 `sdk.dir=D:/environment/android-sdk`(不进版本库)。
+用 Android Studio 打开 `android/` 目录也一样,它会自己补 Gradle wrapper。
+
+产物在 `app/build/outputs/apk/debug/app-debug.apk`。
+
+**单元测试只有纯逻辑那几个**(签名、白名单、验证码),不需要模拟器。
+其中签名那一组是**跨端黄金向量**:同一组值服务端 `tests/test_api_auth.py`
+也测一遍 —— 两边算得不一样的表现是所有请求 401 且服务端不说原因,
+这是唯一能不联网就发现它的办法。
 
 ## 装好之后的三步
 
@@ -47,6 +55,13 @@ gradle wrapper          # 只需要一次,补出 gradlew 和 wrapper jar
 | 状态页"上次上报:收下 X 条" | 服务端收下了。X 是 0 而丢弃不是 0,多半是服务端白名单没放行 |
 | `python -m lifein.admin list-sources --user <uuid>` | 服务端看到的心跳与白名单 |
 | 服务端日志里的告警 | 超过一小时没心跳会发一封邮件(P1 验收标准) |
+
+## base_url 必须是 https
+
+配码里那个 `base_url` 写 `http://` 的话,安卓从 9 开始默认直接拒明文流量,
+表现是所有请求都失败。**这正是要的**(架构 §8.3:传输走 HTTPS + 独立密钥),
+所以没有开 `usesCleartextTraffic` 的口子 —— 内网自签证书也不行,
+那等于把这条防线交给"反正是内网"这个假设。
 
 ## 已知的边界
 
