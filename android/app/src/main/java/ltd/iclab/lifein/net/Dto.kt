@@ -179,3 +179,59 @@ data class DeviceStatus(
     @SerialName("listener_enabled") val listenerEnabled: Boolean = true,
     val stale: Boolean = false,
 )
+
+// ---------- 记忆与实体浏览(06 §6.10) ----------
+
+@Serializable
+data class FactDto(
+    val id: String,
+    val statement: String,
+    val confidence: Double = 0.0,
+    @SerialName("confirmed_by_user") val confirmedByUser: Boolean = false,
+    /** `raw_events.id`。**永远跟着事实一起来** —— 没有来源的记忆不该显示。 */
+    val provenance: List<Long> = emptyList(),
+    @SerialName("created_by_agent") val createdByAgent: String? = null,
+    @SerialName("valid_until") val validUntil: String? = null,
+) {
+    /** 用户亲手改出来的那条,和系统推断的要能一眼分开。 */
+    val authoredByUser: Boolean get() = createdByAgent == "user"
+}
+
+@Serializable
+data class SourceDto(
+    val source: String,
+    val title: String? = null,
+    @SerialName("occurred_at") val occurredAt: String? = null,
+)
+
+@Serializable
+data class FactsResponse(
+    val facts: List<FactDto> = emptyList(),
+    /** 键是 `raw_events.id` 的字符串形式 —— JSON 的对象键只能是字符串。 */
+    val sources: Map<String, SourceDto> = emptyMap(),
+)
+
+@Serializable
+data class CorrectionBody(val statement: String)
+
+@Serializable
+data class EntityDto(
+    val id: String,
+    val kind: String,
+    @SerialName("canonical_name") val canonicalName: String,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+)
+
+@Serializable
+data class EntitiesResponse(val entities: List<EntityDto> = emptyList())
+
+@Serializable
+data class WhitelistBody(
+    @SerialName("match_type") val matchType: String,
+    val pattern: String,
+    val purpose: String,
+    val phase: String = "P1",
+)
+
+@Serializable
+data class EnabledBody(val enabled: Boolean)

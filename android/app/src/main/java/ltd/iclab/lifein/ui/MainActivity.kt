@@ -43,7 +43,8 @@ import ltd.iclab.lifein.data.LifeInDatabase
  * 没配码之前只有一个粘贴框:**这个 App 在配好之前什么都不该做** ——
  * 没有凭据的采集器只会攒一堆送不出去的东西。
  *
- * 配好之后三个页签,对应三个问题:今天要干什么、有什么等我点头、采集器还活着吗。
+ * 配好之后四个页签,对应四个问题:今天要干什么、有什么等我点头、
+ * 它记住了什么(以及记错了没有)、采集器还活着吗。
  */
 class MainActivity : ComponentActivity() {
 
@@ -113,39 +114,37 @@ private fun Home(
 
     Column(Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tab) {
-            listOf("今天", "待确认", "状态").forEachIndexed { index, title ->
+            listOf("今天", "待确认", "记忆", "状态").forEachIndexed { index, title ->
                 Tab(selected = tab == index, onClick = { tab = index }, text = { Text(title) })
             }
         }
         when (tab) {
             0 -> TodosScreen(repo)
             1 -> PendingScreen(repo)
-            else -> Column(Modifier.fillMaxSize()) {
-                StatusScreen(
-                    repo = repo,
-                    localListenerEnabled = CollectorState.listenerEnabled(context),
-                    queued = queued,
-                )
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = onOpenListenerSettings) { Text("打开通知使用权设置") }
-                    if (!CalendarWriter(context).hasPermission()) {
-                        // 没有这个权限时,日程会一直停在"未写入日历"。
-                        // 那个状态在列表和小组件上都看得见,但原因只有这里说得清
-                        Text("没有日历权限,日程写不进系统日历")
-                        TextButton(onClick = onRequestCalendar) { Text("授予日历权限") }
-                    }
-                    CollectorState.lastUpload(context)?.let { Text("上次上报:$it") }
-                    CollectorState.lastHeartbeat(context)?.let { Text("上次心跳:$it") }
-                    CollectorState.lastError(context)?.let {
-                        Text("最近一次失败:$it", color = MaterialTheme.colorScheme.error)
-                    }
-                    TextButton(onClick = onUnenroll) { Text("解绑这台设备") }
-                    Text(
-                        "解绑只清掉手机上这份。服务端那两条凭据还有效," +
-                            "手机丢了要另外跑 revoke-device。",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+            2 -> MemoryScreen(repo)
+            else -> StatusScreen(
+                repo = repo,
+                localListenerEnabled = CollectorState.listenerEnabled(context),
+                queued = queued,
+            ) {
+                TextButton(onClick = onOpenListenerSettings) { Text("打开通知使用权设置") }
+                if (!CalendarWriter(context).hasPermission()) {
+                    // 没有这个权限时,日程会一直停在"未写入日历"。
+                    // 那个状态在列表和小组件上都看得见,但原因只有这里说得清
+                    Text("没有日历权限,日程写不进系统日历")
+                    TextButton(onClick = onRequestCalendar) { Text("授予日历权限") }
                 }
+                CollectorState.lastUpload(context)?.let { Text("上次上报:$it") }
+                CollectorState.lastHeartbeat(context)?.let { Text("上次心跳:$it") }
+                CollectorState.lastError(context)?.let {
+                    Text("最近一次失败:$it", color = MaterialTheme.colorScheme.error)
+                }
+                TextButton(onClick = onUnenroll) { Text("解绑这台设备") }
+                Text(
+                    "解绑只清掉手机上这份。服务端那两条凭据还有效," +
+                        "手机丢了要另外跑 revoke-device。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }

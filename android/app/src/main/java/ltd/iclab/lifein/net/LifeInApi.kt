@@ -5,6 +5,7 @@ import java.time.OffsetDateTime
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.json.Json
 import ltd.iclab.lifein.data.Enrollment
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -13,8 +14,10 @@ import okhttp3.RequestBody.Companion.toRequestBody
 /**
  * 服务端那两组接口的客户端。
  *
- * **两组用两把密钥,在这个类里也是分开的两条路径**(铁律 12):
- * `/ingest/*` 用采集密钥逐条签名;`/app/*` 先用查询密钥换一个短期 token,
+ * **两组用两把密钥,在这个类里也是分开的两条路径**(铁律 12)。
+ * (路径前缀不写在注释里:Kotlin 的块注释可以嵌套,`ingest` 那个星号会
+ * 开出一层新注释,而报错是文件末尾的"Unclosed comment" —— 找起来很费劲。)
+ * 采集那一组用采集密钥逐条签名;查询那一组先用查询密钥换一个短期 token,
  * 之后带 token。写成两个方法而不是一个"带上凭据"的通用方法,
  * 是为了让用错密钥变成一件写不出来的事。
  *
@@ -95,6 +98,39 @@ class LifeInApi(
         )
     }
 
+    fun facts(query: String?): FactsResponse = authed {
+        json.decodeFromString(FactsResponse.serializer(), bearerGet(PATH_FACTS, it, q(query)))
+    }
+
+    fun confirmFact(factId: String) = authed { bearerPost("$PATH_FACTS/$factId/confirm", it, "{}") }
+
+    fun negateFact(factId: String) = authed { bearerPost("$PATH_FACTS/$factId/negate", it, "{}") }
+
+    fun correctFact(factId: String, statement: String): FactDto = authed {
+        val text = bearerPost(
+            "$PATH_FACTS/$factId/correct",
+            it,
+            json.encodeToString(CorrectionBody.serializer(), CorrectionBody(statement)),
+        )
+        json.decodeFromString(FactDto.serializer(), text)
+    }
+
+    fun entities(query: String?): EntitiesResponse = authed {
+        json.decodeFromString(EntitiesResponse.serializer(), bearerGet(PATH_ENTITIES, it, q(query)))
+    }
+
+    fun addWhitelist(body: WhitelistBody) = authed {
+        bearerPost(PATH_WHITELIST, it, json.encodeToString(WhitelistBody.serializer(), body))
+    }
+
+    fun toggleWhitelist(ruleId: Int, enabled: Boolean) = authed {
+        bearerPost(
+            "$PATH_WHITELIST/$ruleId/enabled",
+            it,
+            json.encodeToString(EnabledBody.serializer(), EnabledBody(enabled)),
+        )
+    }
+
     fun collectorStatus(): CollectorStatus =
         authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
 
@@ -165,14 +201,23 @@ class LifeInApi(
         return execute(request)
     }
 
-    internal fun bearerGet(path: String, token: String): String =
-        execute(
-            Request.Builder()
-                .url(enrollment.baseUrl.trimEnd('/') + path)
-                .header("Authorization", "Bearer $token")
-                .get()
-                .build()
+    internal fun bearerGet(
+        path: String,
+        token: String,
+        query: Map<String, String> = emptyMap(),
+    ): String {
+        // 查询参数交给 HttpUrl 拼:搜索词里有中文和空格,自己拼字符串要么漏转义,
+        // 要么转义两遍 —— 两种错都表现为"搜不到",而不是报错
+        val url = (enrollment.baseUrl.trimEnd('/') + path).toHttpUrl().newBuilder()
+            .apply { query.forEach { (name, value) -> addQueryParameter(name, value) } }
+            .build()
+        return execute(
+            Request.Builder().url(url).header("Authorization", "Bearer $token").get().build()
         )
+    }
+
+    private fun q(query: String?): Map<String, String> =
+        if (query.isNullOrBlank()) emptyMap() else mapOf("q" to query.trim())
 
     internal fun bearerPost(path: String, token: String, body: String): String =
         execute(
@@ -204,6 +249,9 @@ class LifeInApi(
         const val PATH_CAL_QUEUE = "/app/calendar/queue"
         const val PATH_CAL_REPORT = "/app/calendar/report"
         const val PATH_STATUS = "/app/collector/status"
+        const val PATH_WHITELIST = "/app/collector/whitelist"
+        const val PATH_FACTS = "/app/memory/facts"
+        const val PATH_ENTITIES = "/app/memory/entities"
 
         private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 

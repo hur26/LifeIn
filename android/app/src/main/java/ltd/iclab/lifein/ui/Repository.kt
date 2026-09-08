@@ -7,12 +7,15 @@ import ltd.iclab.lifein.LifeInApp
 import ltd.iclab.lifein.collect.Whitelist
 import ltd.iclab.lifein.data.CachedTodo
 import ltd.iclab.lifein.data.LifeInDatabase
+import ltd.iclab.lifein.collect.WhitelistRule
 import ltd.iclab.lifein.net.CollectorStatus
+import ltd.iclab.lifein.net.FactsResponse
 import ltd.iclab.lifein.net.LifeInApi
 import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.ResolveBody
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.net.WhitelistBody
 import ltd.iclab.lifein.work.Schedules
 import ltd.iclab.lifein.work.WidgetRefresh
 
@@ -79,6 +82,47 @@ class Repository(private val context: Context) {
 
     suspend fun reject(id: Long) = withContext(Dispatchers.IO) {
         api().resolvePending(id, ResolveBody(action = "reject"))
+    }
+
+    // ---------- 记忆(06 §6.10) ----------
+
+    suspend fun facts(query: String? = null): FactsResponse = withContext(Dispatchers.IO) {
+        api().facts(query)
+    }
+
+    suspend fun confirmFact(factId: String) = withContext(Dispatchers.IO) {
+        api().confirmFact(factId)
+    }
+
+    suspend fun negateFact(factId: String) = withContext(Dispatchers.IO) {
+        // 否定只标记不删:删了明天会被重新推断出来(R7)
+        api().negateFact(factId)
+    }
+
+    suspend fun correctFact(factId: String, statement: String) = withContext(Dispatchers.IO) {
+        // 只送改过的说法。出处由服务端从旧那条继承(铁律 5)
+        api().correctFact(factId, statement)
+    }
+
+    suspend fun entities(query: String? = null) = withContext(Dispatchers.IO) {
+        api().entities(query).entities
+    }
+
+    // ---------- 采集器 ----------
+
+    suspend fun allowSource(packageName: String) = withContext(Dispatchers.IO) {
+        api().addWhitelist(
+            WhitelistBody(
+                matchType = WhitelistRule.MATCH_PACKAGE,
+                pattern = packageName.trim(),
+                // P1 只放消息。加银行与支付类是 P2 的动作,不该从手机上顺手打开
+                purpose = WhitelistRule.PURPOSE_MESSAGE,
+            )
+        )
+    }
+
+    suspend fun toggleSource(ruleId: Int, enabled: Boolean) = withContext(Dispatchers.IO) {
+        api().toggleWhitelist(ruleId, enabled)
     }
 
     /**

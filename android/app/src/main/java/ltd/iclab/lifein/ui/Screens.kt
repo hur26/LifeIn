@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
@@ -13,6 +15,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -199,17 +202,34 @@ private fun PendingRow(item: PendingDto, onConfirm: () -> Unit, onReject: () -> 
 }
 
 @Composable
-fun StatusScreen(repo: Repository, localListenerEnabled: Boolean, queued: Int) {
+fun StatusScreen(
+    repo: Repository,
+    localListenerEnabled: Boolean,
+    queued: Int,
+    /**
+     * 页面末尾的那几个动作(开权限、解绑)。用插槽塞进**同一个可滚动的列**里 ——
+     * 放在外面的话它们会被这一页的内容顶出屏幕,而"打开通知使用权"恰恰是
+     * 新装的手机上最需要点的那一个。
+     */
+    footer: @Composable () -> Unit = {},
+) {
     var status by remember { mutableStateOf<CollectorStatus?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var newSource by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
 
-    LaunchedEffect(Unit) {
+    suspend fun refresh() {
         runCatching { repo.collectorStatus() }
-            .onSuccess { status = it }
+            .onSuccess { status = it; error = null }
             .onFailure { error = it.message }
     }
 
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LaunchedEffect(Unit) { refresh() }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
         Text("采集器", style = MaterialTheme.typography.headlineSmall)
 
         // 手机这一侧的事实,不依赖网络 —— 权限没开时这一行就是答案
@@ -226,19 +246,57 @@ fun StatusScreen(repo: Repository, localListenerEnabled: Boolean, queued: Int) {
             }
         }
 
-        status?.whitelist?.let { rules ->
-            HorizontalDivider()
-            Text("放行的来源(默认拒绝)", style = MaterialTheme.typography.titleSmall)
-            if (rules.isEmpty()) {
-                Text("一条都没有 —— 采集器送上去的东西全会被丢掉。" +
-                    "在服务端跑 allow-source")
-            }
-            rules.forEach { rule ->
-                Text("${rule.pattern} · ${rule.purpose}" + if (rule.enabled) "" else "(已停用)")
+        HorizontalDivider()
+        Text("放行的来源(默认拒绝)", style = MaterialTheme.typography.titleSmall)
+        if (status?.whitelist?.isEmpty() == true) {
+            Text(
+                "一条都没有 —— 采集器送上去的东西全会被丢掉",
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        status?.whitelist?.forEach { rule ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("${rule.pattern} · ${rule.purpose}", modifier = Modifier.weight(1f))
+                // 只能开关,**没有删除**:留着那一行才回答得了"曾经放行过谁"(06 §6.9)
+                Switch(
+                    checked = rule.enabled,
+                    onCheckedChange = { on ->
+                        scope.launch { repo.toggleSource(rule.id, on); refresh() }
+                    },
+                )
             }
         }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = newSource,
+                onValueChange = { newSource = it },
+                label = { Text("加一个包名") },
+                placeholder = { Text("com.tencent.mm") },
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                enabled = newSource.isNotBlank(),
+                onClick = {
+                    scope.launch {
+                        runCatching { repo.allowSource(newSource) }
+                            .onSuccess { newSource = "" }
+                            .onFailure { error = it.message }
+                        refresh()
+                    }
+                },
+            ) { Text("放行") }
+        }
+        Text(
+            "只放消息类。银行与支付类是 P2 的事,不从这里打开。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+
+        HorizontalDivider()
+        footer()
     }
 }
+
 
 @Composable
 private fun Loading() {

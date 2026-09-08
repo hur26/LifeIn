@@ -3,6 +3,7 @@ package ltd.iclab.lifein.collect
 import android.content.Context
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 /**
@@ -58,6 +59,9 @@ class Whitelist(private val rules: List<WhitelistRule>) {
         private const val KEY = "rules"
         private val json = Json { ignoreUnknownKeys = true }
 
+        /** 显式给序列化器,不用 reified 那个重载:泛型擦除之后它在这里推不出类型。 */
+        private val RULES = ListSerializer(WhitelistRule.serializer())
+
         /** P1 的内置名单:只有微信(07 §4)。拉不到服务端那份时用它。 */
         val BUILT_IN = listOf(
             WhitelistRule(
@@ -70,7 +74,7 @@ class Whitelist(private val rules: List<WhitelistRule>) {
         fun load(context: Context): Whitelist {
             val stored = prefs(context).getString(KEY, null) ?: return Whitelist(BUILT_IN)
             return try {
-                val rules = json.decodeFromString<List<WhitelistRule>>(stored)
+                val rules = json.decodeFromString(RULES, stored)
                 // 服务端给了一份空名单,那是"全部停用",不是"没拉到" —— 照它办
                 Whitelist(rules)
             } catch (e: Exception) {
@@ -81,7 +85,7 @@ class Whitelist(private val rules: List<WhitelistRule>) {
 
         fun save(context: Context, rules: List<WhitelistRule>) {
             prefs(context).edit()
-                .putString(KEY, json.encodeToString(rules))
+                .putString(KEY, json.encodeToString(RULES, rules))
                 .apply()
         }
 
