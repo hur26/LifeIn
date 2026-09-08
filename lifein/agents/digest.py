@@ -103,10 +103,12 @@ class DigestResult:
     completion_tokens: int | None
 
 
-def build_blocks(events: Sequence[NormalizedEvent]) -> list[ExternalBlock]:
+def build_blocks(
+    events: Sequence[NormalizedEvent], *, max_events: int = MAX_EVENTS
+) -> list[ExternalBlock]:
     """把事件转成隔离块。结构化字段与正文分开 —— 铁律 9。"""
     blocks: list[ExternalBlock] = []
-    for event in sorted(events, key=lambda e: e.occurred_at, reverse=True)[:MAX_EVENTS]:
+    for event in sorted(events, key=lambda e: e.occurred_at, reverse=True)[:max_events]:
         fields = {
             "标题": event.title,
             "时间": event.occurred_at.isoformat(),
@@ -173,8 +175,12 @@ def _parse(payload: object, known_ids: set[str]) -> DigestOutput:
     on_uncertain=OnUncertain.DO_NOTHING,
     evalset="evals/daily_digest.jsonl",
 )
-def run_digest(payload: DigestInput, *, llm: LLMClient) -> DigestResult:
-    blocks = build_blocks(payload.events)
+def run_digest(
+    payload: DigestInput, *, llm: LLMClient, max_events: int = MAX_EVENTS
+) -> DigestResult:
+    # max_events 只给补历史那种一次性场景放宽用。日常不要动它 ——
+    # 超过这个量模型开始平均用力,反而抓不住重点
+    blocks = build_blocks(payload.events, max_events=max_events)
     if not blocks:
         raise DigestFailed("这一天没有任何事件,不生成摘要")
 

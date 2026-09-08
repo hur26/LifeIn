@@ -106,6 +106,51 @@ def insert_events(
     return InsertResult(inserted=inserted, duplicates=duplicates, failed=failed)
 
 
+_REPARSE = text("""
+    UPDATE raw_events
+       SET normalized = CAST(:normalized AS JSONB),
+           normalize_error = :normalize_error,
+           occurred_at = :occurred_at
+     WHERE user_id = :user_id
+       AND source = :source
+       AND external_id = :external_id
+""")
+
+
+def reparse_events(
+    user_id: str,
+    session: Session,
+    events: Sequence[IngestedEvent],
+) -> int:
+    """用新的解析结果覆盖已有事件的 `normalized`。返回更新条数。
+
+    06 §1.4 承诺"解析器修好后可以重跑",这就是那个重跑。
+    **只改派生列,`raw` 一个字节都不动** —— 事件流"只追加不修改"说的是事实本身,
+    而 `normalized` 是从事实算出来的,算法变了就该重算。
+
+    注意邮件的 `raw` 里只有信头没有正文,所以重跑得先回 IMAP 把信重新拉一遍
+    (`backfill --reparse` 就是这么做的)。信在服务器上删了就重跑不了了。
+    """
+    updated = 0
+    for event in events:
+        normalized_json = (
+            event.normalized.model_dump_json() if event.normalized is not None else None
+        )
+        result = session.execute(
+            _REPARSE,
+            {
+                "user_id": user_id,
+                "source": event.source,
+                "external_id": event.external_id,
+                "occurred_at": event.occurred_at,
+                "normalized": normalized_json,
+                "normalize_error": event.normalize_error,
+            },
+        )
+        updated += result.rowcount
+    return updated
+
+
 def fetch_normalized_between(
     user_id: str,
     session: Session,

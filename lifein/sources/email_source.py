@@ -86,6 +86,26 @@ def _decode_part(part: EmailMessage) -> tuple[str, bool]:
         return payload.decode("utf-8", errors="replace"), True
 
 
+STUB_PLAIN_MAX_CHARS = 50
+"""短到这个程度的 text/plain,遇到实质性的 HTML 就当它是占位段。"""
+
+STUB_RICH_MIN_CHARS = 200
+"""HTML 至少要有这么多字,才值得为它推翻 text/plain。"""
+
+
+def _is_stub(plain_text: str, rich_text: str) -> bool:
+    """判断 text/plain 是不是占位段。
+
+    判据刻意保守:**只在纯文本短得离谱、而 HTML 明显有实质内容时**才推翻它。
+    宽一点会让正常的短邮件被换成带页脚导航的 HTML 版本,那是另一种噪音。
+    """
+    return (
+        len(plain_text) <= STUB_PLAIN_MAX_CHARS
+        and len(rich_text) >= STUB_RICH_MIN_CHARS
+        and len(rich_text) > len(plain_text) * 3
+    )
+
+
 def _extract_body(msg: EmailMessage) -> tuple[str, list[Flag]]:
     flags: list[Flag] = []
     plain: str | None = None
@@ -105,10 +125,19 @@ def _extract_body(msg: EmailMessage) -> tuple[str, list[Flag]]:
         elif subtype == "html" and rich is None:
             rich = text
 
-    if plain is not None and plain.strip():
-        body = plain
-    elif rich is not None:
-        body = html_to_text(rich)
+    rich_text = html_to_text(rich) if rich is not None else ""
+    plain_text = (plain or "").strip()
+
+    if _is_stub(plain_text, rich_text):
+        # 占位纯文本段:有些邮件塞一句"新面试"当预览,真正内容全在 HTML 里。
+        # 无条件优先 text/plain 的话,抽出来的正文是三个字,而系统还觉得自己
+        # 干得挺好(连 flag 都不打)—— 真出现过,漏掉了一场面试
+        body = rich_text
+        flags.append(Flag.PARSE_DEGRADED)
+    elif plain_text:
+        body = plain_text
+    elif rich_text:
+        body = rich_text
         flags.append(Flag.PARSE_DEGRADED)  # 从 HTML 抽的,不是原生纯文本
     else:
         body = ""

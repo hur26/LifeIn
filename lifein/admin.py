@@ -26,6 +26,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from lifein.agents.digest import MAX_EVENTS
 from lifein.channels.base import Card
 from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.config import get_settings
@@ -261,6 +262,116 @@ def cmd_test_push(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """一次性往回补一段时间的邮件。
+
+    **只入库,不推送。** 刚开始用的时候手上没有任何历史,而"最近有什么安排"
+    这种问题需要素材。补完之后 digest 命令可以在这批素材上出一份总览。
+
+    补跑是幂等的:去重靠 (user_id, source, external_id),多跑几次不会重复。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from lifein.bootstrap import build_adapters, build_services
+    from lifein.repos import raw_events
+
+    services = build_services()
+    since = datetime.now(UTC) - timedelta(days=args.days)
+    print(f"回溯 {args.days} 天(自 {since.date()})…")
+
+    total_inserted = total_failed = 0
+    with session_scope() as session:
+        adapters = build_adapters(args.user, session, services)
+        if not adapters:
+            print("没有可用的数据源,先配 IMAP", file=sys.stderr)
+            return 1
+        for adapter in adapters:
+            try:
+                events = list(adapter.fetch(since))
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {adapter.source}: 采集失败 {exc}", file=sys.stderr)
+                continue
+            result = raw_events.insert_events(args.user, session, events)
+            line = (
+                f"  {adapter.source}: 取到 {len(events)}，新增 {result.inserted}，"
+                f"已有 {result.duplicates}，解析失败 {result.failed}"
+            )
+            if args.reparse and result.duplicates:
+                # 解析器改过之后,已有的那些要用新结果覆盖 —— 否则修了跟没修一样
+                updated = raw_events.reparse_events(args.user, session, events)
+                line += f"，重新解析 {updated}"
+            print(line)
+            total_inserted += result.inserted
+            total_failed += result.failed
+
+    print(f"\n共新增 {total_inserted} 条")
+    if total_failed:
+        print(f"其中 {total_failed} 条没解析出来,查 raw_events.normalize_error")
+    print(f"下一步:digest --user {args.user} --days {args.days} 看一份总览")
+    return 0
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """在指定窗口上生成一份摘要。
+
+    默认只打印不推送 —— 想看看效果、调 prompt 的时候不该往微信里发东西。
+    加 --push 才真发。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from lifein.agents.digest import DigestFailed, DigestInput, run_digest, to_card
+    from lifein.bootstrap import build_services
+    from lifein.channels.weixin import render_text
+    from lifein.repos import raw_events
+
+    services = build_services()
+    now = datetime.now(UTC)
+    since = now - timedelta(days=args.days)
+
+    with session_scope() as session:
+        events = raw_events.fetch_normalized_between(
+            args.user, session, start=since, end=now, limit=args.limit
+        )
+
+    if not events:
+        print(f"最近 {args.days} 天没有事件,先跑 backfill", file=sys.stderr)
+        return 1
+
+    cap = args.max_events
+    print(f"窗口内 {len(events)} 条事件", end="")
+    if len(events) > cap:
+        # 说出来。悄悄截断会让人以为模型漏了东西
+        print(f",按时间倒序只送最新的 {cap} 条给模型")
+    else:
+        print()
+
+    try:
+        result = run_digest(
+            DigestInput(day=now.date(), events=events),
+            llm=services.llm,
+            max_events=cap,
+        )
+    except DigestFailed as exc:
+        print(f"生成失败:{exc}", file=sys.stderr)
+        return 1
+
+    out = result.output
+    card = to_card(out, now.date())
+    print("\n" + "=" * 52)
+    print(render_text(card)[0])
+    print("=" * 52)
+    print(
+        f"\n条目 {len(out.items)} | 丢弃无法溯源 {out.dropped_hallucinated} | "
+        f"没有引用 {sum(1 for i in out.items if i.unverified)} | "
+        f"token {result.prompt_tokens}/{result.completion_tokens}"
+    )
+
+    if args.push:
+        delivery = services.channel.send(args.user, card)
+        print(f"已推送,走的是 {delivery.channel} 通道")
+    return 0
+
+
 def cmd_test_imap(args: argparse.Namespace) -> int:
     """真连一次。163 的 ID 握手对不对,只有这一步能证明。"""
     settings = get_settings()
@@ -353,6 +464,29 @@ def build_parser() -> argparse.ArgumentParser:
     push = sub.add_parser("test-push", help="真发一条测试消息,并告诉你走的哪个通道")
     push.add_argument("--user", required=True)
     push.set_defaults(func=cmd_test_push)
+
+    back = sub.add_parser("backfill", help="一次性往回补一段时间的邮件(只入库不推送)")
+    back.add_argument("--user", required=True)
+    back.add_argument("--days", type=int, default=14, help="回溯多少天")
+    back.add_argument(
+        "--reparse",
+        action="store_true",
+        help="用当前解析器覆盖已有事件的 normalized(改了归一化之后用)",
+    )
+    back.set_defaults(func=cmd_backfill)
+
+    dg = sub.add_parser("digest", help="在指定窗口上生成摘要(默认只打印)")
+    dg.add_argument("--user", required=True)
+    dg.add_argument("--days", type=int, default=1)
+    dg.add_argument("--limit", type=int, default=500, help="从库里最多取多少条")
+    dg.add_argument(
+        "--max-events",
+        type=int,
+        default=MAX_EVENTS,
+        help=f"最多送多少条给模型(默认 {MAX_EVENTS})。补历史时可以调大",
+    )
+    dg.add_argument("--push", action="store_true", help="真发到微信,不加就只打印")
+    dg.set_defaults(func=cmd_digest)
 
     test = sub.add_parser("test-imap", help="实测能否登录并取信")
     test.add_argument("--user", required=True)

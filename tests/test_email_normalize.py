@@ -159,3 +159,32 @@ def test_garbage_bytes_do_not_raise():
 )
 def test_html_to_text(raw_html, expected):
     assert html_to_text(raw_html) == expected
+
+
+class TestStubPlainPart:
+    """真跑第一天漏掉一场面试的原因。
+
+    有些邮件塞一句"新面试"当预览纯文本段,真正内容全在 HTML 里。无条件优先
+    text/plain 的话,抽出来的正文是三个字 —— 而系统连 flag 都不打,
+    看起来一切正常,只是那封邮件对摘要毫无贡献。
+    """
+
+    def build(self, plain: str, html_len: int = 600) -> bytes:
+        return build_mail(plain=plain, html_body=f"<p>{'详情' * (html_len // 2)}</p>")
+
+    def test_stub_plain_falls_back_to_html(self):
+        e = normalize_email(self.build("新面试"), received_at=RECEIVED)
+        assert len(e.normalized.body) > 200
+        assert Flag.PARSE_DEGRADED in e.normalized.flags  # 换过来了要留痕
+
+    def test_substantial_plain_still_wins(self):
+        """判据刻意保守 —— 正常的纯文本不该被带页脚导航的 HTML 版本顶掉。"""
+        real = "这是一封正常的纯文本邮件正文" * 6
+        e = normalize_email(self.build(real), received_at=RECEIVED)
+        assert e.normalized.body.startswith("这是一封正常")
+        assert Flag.PARSE_DEGRADED not in e.normalized.flags
+
+    def test_short_plain_with_short_html_is_left_alone(self):
+        # HTML 也没多少内容时,没有理由推翻纯文本
+        e = normalize_email(build_mail(plain="收到", html_body="<p>收到</p>"), received_at=RECEIVED)
+        assert e.normalized.body == "收到"
