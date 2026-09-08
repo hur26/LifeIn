@@ -132,6 +132,8 @@ private fun Home(
                 localListenerEnabled = CollectorState.listenerEnabled(context),
                 queued = queued,
             ) {
+                // R10 改判四前提之一:App 里要有这个开关,不是"找你帮忙"
+                CollectionControls(repo)
                 TextButton(onClick = onOpenListenerSettings) { Text("打开通知使用权设置") }
                 if (!CalendarWriter(context).hasPermission()) {
                     // 没有这个权限时,日程会一直停在"未写入日历"。

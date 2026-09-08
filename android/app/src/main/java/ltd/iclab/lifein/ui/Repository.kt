@@ -10,11 +10,14 @@ import ltd.iclab.lifein.data.LifeInDatabase
 import ltd.iclab.lifein.collect.WhitelistRule
 import ltd.iclab.lifein.net.BudgetBody
 import ltd.iclab.lifein.net.BudgetDto
+import ltd.iclab.lifein.net.CollectionStateDto
 import ltd.iclab.lifein.net.CollectorStatus
+import ltd.iclab.lifein.net.DeletedDto
 import ltd.iclab.lifein.net.FactsResponse
 import ltd.iclab.lifein.net.LifeInApi
 import ltd.iclab.lifein.net.ManualTxnBody
 import ltd.iclab.lifein.net.MonthlyReportDto
+import ltd.iclab.lifein.net.StopCollectionResult
 import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.ResolveBody
@@ -187,6 +190,28 @@ class Repository(private val context: Context) {
     /** 手动补一笔。现金和纸质票据那条长尾,实时通知那一路永远采不到。 */
     suspend fun addTransaction(body: ManualTxnBody): TransactionDto =
         withContext(Dispatchers.IO) { api().addTransaction(body) }
+
+
+    // ---------- 关掉采集、删掉数据(P4 第 3 片) ----------
+
+    suspend fun collectionState(): CollectionStateDto =
+        withContext(Dispatchers.IO) { api().collectionState() }
+
+    /**
+     * 关掉采集。**服务端吊销采集密钥并停掉全部白名单**,不等这个 App 配合 ——
+     * App 有 bug、被降级、被别人装了旧版本,上报都可能继续。
+     *
+     * 关完把本地那份白名单也刷成空的,免得采集器在下一次同步之前还照旧过滤。
+     */
+    suspend fun stopCollection(): StopCollectionResult = withContext(Dispatchers.IO) {
+        val result = api().stopCollection()
+        Whitelist.save(context, emptyList())
+        result
+    }
+
+    /** 删掉采集来的数据。**是真删,不是标记。** */
+    suspend fun deleteCollected(since: String? = null): DeletedDto =
+        withContext(Dispatchers.IO) { api().deleteCollected(since) }
 
     private suspend fun cache(items: List<TodoDto>) {
         LifeInDatabase.get(context).cachedTodos().replace(

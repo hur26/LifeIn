@@ -32,6 +32,8 @@ import kotlinx.coroutines.launch
 import ltd.iclab.lifein.net.CollectorStatus
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.TodoDto
+import androidx.compose.material3.AlertDialog
+import ltd.iclab.lifein.net.CollectionStateDto
 
 /**
  * 三个页面:今天、待确认、状态。
@@ -305,4 +307,87 @@ private fun Loading() {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) { CircularProgressIndicator() }
+}
+
+/**
+ * 关掉采集、删掉已采数据(P4 第 3 片)。
+ *
+ * [R10 那节的改判](../../../../../../../docs/05-risks.md)写着四个前提,
+ * **少一件就不该开放**,而这是第 2 件:
+ *
+ * > 朋友要能自己关掉采集、并删掉已采的数据。**App 里要有这个开关,
+ * > 不是"找你帮忙"。**
+ *
+ * "找你帮忙"和"自己能做"的差别不在功能,在**是不是要开口** ——
+ * 一个人要发一条微信才能删掉自己的数据时,他多半不会发那条微信。
+ *
+ * 两个动作分开,不合并成一个:合成一个的话,"我想先停下来想想"就变成了
+ * "要么继续采要么全删"。
+ */
+@Composable
+fun CollectionControls(repo: Repository) {
+    val scope = rememberCoroutineScope()
+    var state by remember { mutableStateOf<CollectionStateDto?>(null) }
+    var note by remember { mutableStateOf<String?>(null) }
+    var confirmingDelete by remember { mutableStateOf(false) }
+
+    suspend fun refresh() {
+        runCatching { repo.collectionState() }.onSuccess { state = it }
+    }
+
+    LaunchedEffect(Unit) { refresh() }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("你的数据", style = MaterialTheme.typography.titleMedium)
+        Text(
+            if (state?.enabled == true) "正在采集" else "没有在采集",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        note?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
+        if (state?.enabled == true) {
+            TextButton(onClick = {
+                scope.launch {
+                    runCatching { repo.stopCollection() }
+                        .onSuccess { note = it.note }
+                        .onFailure { note = "没关成:${it.message}" }
+                    refresh()
+                }
+            }) { Text("关掉采集") }
+        }
+
+        TextButton(onClick = { confirmingDelete = true }) { Text("删掉已采的数据") }
+        Text(
+            "关掉采集不会删数据,删数据也不会自动关掉采集 —— 两件事分开。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+
+    if (confirmingDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmingDelete = false },
+            title = { Text("删掉已采的数据?") },
+            text = {
+                // **是真删,不是标记。** 说清楚,因为它不可撤销
+                Text(
+                    "通知原文、由它们记下的账、待确认的条目,以及出处只剩这些的记忆," +
+                        "会一起删掉。删了就找不回来了。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        runCatching { repo.deleteCollected() }
+                            .onSuccess { note = "删掉了 ${it.total} 条" }
+                            .onFailure { note = "没删成:${it.message}" }
+                        confirmingDelete = false
+                        refresh()
+                    }
+                }) { Text("删") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmingDelete = false }) { Text("算了") }
+            },
+        )
+    }
 }

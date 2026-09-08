@@ -186,6 +186,26 @@ class LifeInApi(
         json.decodeFromString(TransactionDto.serializer(), text)
     }
 
+
+    // ---------- 关掉采集、删掉数据(P4 第 3 片) ----------
+
+    fun collectionState(): CollectionStateDto = authed {
+        json.decodeFromString(CollectionStateDto.serializer(), bearerGet(PATH_COLLECTION, it))
+    }
+
+    /** 关掉采集。**服务端那边做完就算数** —— 不等这个 App 配合。 */
+    fun stopCollection(): StopCollectionResult = authed {
+        json.decodeFromString(
+            StopCollectionResult.serializer(), bearerPost(PATH_STOP_COLLECT, it, "{}")
+        )
+    }
+
+    /** 删掉采集来的数据。`since` 不给就是全部。 */
+    fun deleteCollected(since: String? = null): DeletedDto = authed {
+        val params = if (since.isNullOrBlank()) emptyMap() else mapOf("since" to since)
+        json.decodeFromString(DeletedDto.serializer(), bearerDelete(PATH_COLLECTED, it, params))
+    }
+
     fun collectorStatus(): CollectorStatus =
         authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
 
@@ -342,6 +362,9 @@ class LifeInApi(
         const val PATH_TXNS = "/app/ledger/transactions"
         const val PATH_REPORT = "/app/ledger/report"
         const val PATH_BUDGETS = "/app/ledger/budgets"
+        const val PATH_COLLECTION = "/app/collector/collection"
+        const val PATH_STOP_COLLECT = "/app/collector/stop"
+        const val PATH_COLLECTED = "/app/data/collected"
 
         private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 

@@ -329,3 +329,25 @@ data class ManualTxnBody(
     @SerialName("merchant_raw") val merchantRaw: String? = null,
     val note: String? = null,
 )
+
+// ---------- 关掉采集、删掉数据(P4 第 3 片,R10 改判的四前提之一) ----------
+
+@Serializable
+data class CollectionStateDto(
+    /** 还在采不在采。**三层里任何一层关着就算关**(凭据、白名单、手机端)。 */
+    val enabled: Boolean,
+    @SerialName("active_devices") val activeDevices: Int = 0,
+    @SerialName("enabled_rules") val enabledRules: Int = 0,
+)
+
+@Serializable
+data class StopCollectionResult(val enabled: Boolean, val note: String = "")
+
+@Serializable
+data class DeletedDto(
+    @SerialName("raw_events") val rawEvents: Int = 0,
+    val transactions: Int = 0,
+    val pending: Int = 0,
+    val facts: Int = 0,
+    val total: Int = 0,
+)
