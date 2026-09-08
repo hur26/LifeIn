@@ -191,6 +191,21 @@ _SPENDING_BY_CATEGORY = text("""
 """)
 
 
+_FIND_MERGED_FROM = text("""
+    SELECT id FROM transactions
+     WHERE user_id = :user_id AND :event_id = ANY(merged_from_event_ids)
+     LIMIT 1
+""")
+
+_DELETE = text("DELETE FROM transactions WHERE user_id = :user_id AND id = :txn_id")
+
+_UNMERGE = text("""
+    UPDATE transactions
+       SET merged_from_event_ids = array_remove(merged_from_event_ids, :event_id)
+     WHERE user_id = :user_id AND id = :txn_id
+""")
+
+
 @dataclass(frozen=True)
 class RecordResult:
     """写入的结果。
@@ -342,6 +357,44 @@ def get_by_event(user_id: str, session: Session, *, source_event_id: int) -> Tra
         _SELECT_BY_EVENT, {"user_id": user_id, "source_event_id": source_event_id}
     ).first()
     return _to_txn(row) if row else None
+
+
+
+def undo_record(user_id: str, session: Session, *, source_event_id: int) -> bool:
+    """`record()` 的反面 —— **一次调用撤掉那一次写入,不管它当时走的是哪条路。**
+
+    `record()` 有三种落地方式,撤销就有三种形态,而调用方没有办法自己分辨:
+
+    - 新建了一行 —— 删掉那行。删而不是标记作废,是因为这一行完全是派生的:
+      源事件还在 `raw_events` 里,重跑一遍会一模一样地长回来
+    - 并进了已有的一笔 —— 把这个事件从 `merged_from_event_ids` 里摘掉。
+      **不删那一笔**:它是另一条通知记下的,和这次撤销无关
+    - 什么都没做(重复上报)—— 也就没有东西要撤
+
+    分成两个函数让调用方自己判断的话,判断错的那次要么删掉别人的交易,
+    要么留下一笔撤不掉的。所以对外只有这一个入口。
+
+    返回有没有真的动过东西。撤一条不存在的交易返回 False 而不是抛异常:
+    回滚经常是重试的一部分,第二次撤同一条不该炸。
+    """
+    row = session.execute(
+        _SELECT_BY_EVENT, {"user_id": user_id, "source_event_id": source_event_id}
+    ).first()
+    if row is not None:
+        session.execute(_DELETE, {"user_id": user_id, "txn_id": row.id})
+        return True
+
+    merged = session.execute(
+        _FIND_MERGED_FROM, {"user_id": user_id, "event_id": source_event_id}
+    ).first()
+    if merged is None:
+        return False
+
+    session.execute(
+        _UNMERGE, {"user_id": user_id, "txn_id": merged.id, "event_id": source_event_id}
+    )
+    log.info("撤销合并:事件 %s 从交易 %s 里摘出", source_event_id, merged.id)
+    return True
 
 
 def _to_txn(row) -> Transaction:

@@ -192,7 +192,7 @@ def build_blocks(
 @agent(
     name="bookkeeper",
     inputs=BookkeeperInput,
-    tools=[],  # 落账由调度层过网关做,这个 agent 只产出判断
+    tools=["txn.record"],
     output_schema=BookkeeperOutput,
     on_uncertain=OnUncertain.PENDING_CONFIRMATION,
     evalset="evals/bookkeeper.jsonl",
