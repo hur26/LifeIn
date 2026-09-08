@@ -508,12 +508,12 @@ DATABASE_URL=...          # 改成云上那个库
 
 ```
 NOTIFICATION_RETENTION_DAYS=7
-SMTP_HOST=...  SMTP_PORT=465  SMTP_USERNAME=...  SMTP_PASSWORD=...  SMTP_TO=...
 ```
 
-**SMTP 这一组现在是必须的**:告警的唯一出口是邮件(07 §2.7),
-而"采集器掉线 1 小时内告警"是 P1 的验收标准 ——
-不配的话那条标准只会写进日志,没人看得见。
+**SMTP 那一组通常不用填**:没配时发信配置从 `imap` 凭据派生
+(QQ/163/126 的 IMAP 与 SMTP 是同一个授权码,07 §2.7)。
+搬完之后跑一次 `python -m lifein.admin test-alert --user <uuid>` 确认 ——
+告警是"采集器掉线 1 小时内"那条验收标准的唯一出口。
 
 `INGEST_SECRET` 那一行如果还在,删掉:密钥改成按设备签发了([07 §2.5](07-config.md#25-采集入口))。
 

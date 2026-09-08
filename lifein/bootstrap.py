@@ -150,9 +150,34 @@ def build_services(settings: Settings | None = None) -> Services:
 
 
 def _build_email_channel(s: Settings) -> EmailChannel | None:
+    """建邮件通道。**先看环境变量,没有就复用邮箱采集的那把授权码。**
+
+    第二条是有理由的:QQ / 163 / 126 的 IMAP 与 SMTP **是同一个授权码**,
+    而它已经加密躺在 `credentials` 里了。再要人往 `.env` 里抄一份明文,
+    正好撞上 [07 §1](../docs/07-config.md) 那句"最容易做错的是把 IMAP 授权码
+    写进环境变量",也和 [ADR-009](../docs/04-tech-decisions.md) 冲突 ——
+    同一份秘密不该同时存在于加密的库里和明文的文件里。
+
+    环境变量那条路留着:换一个专门发信的邮箱(不被采集的那个)时用它。
+    """
+    config = _smtp_from_env(s) or _smtp_from_mailbox(s)
+    if config is None:
+        return None
+
+    # 没单独配收件人就发给自己。**不会回环** —— 发出去的信带 X-LifeIn-Push,
+    # 采集侧见到就跳过(email.py 那条),而告警发到你天天看的那个邮箱正是要的
+    to_address = s.smtp_to or config.sender
+    return EmailChannel(
+        SmtpTransport(config),
+        from_address=config.sender,
+        resolve_address=lambda _user_id: to_address,
+    )
+
+
+def _smtp_from_env(s: Settings) -> SmtpConfig | None:
     if not s.smtp_enabled:
         return None
-    config = SmtpConfig(
+    return SmtpConfig(
         host=s.smtp_host or "",
         port=s.smtp_port,
         username=s.smtp_username or "",
@@ -160,14 +185,51 @@ def _build_email_channel(s: Settings) -> EmailChannel | None:
         sender=s.smtp_sender_address,
         use_ssl=s.smtp_use_ssl,
     )
-    return EmailChannel(
-        SmtpTransport(config),
-        from_address=config.sender,
-        # 收件人是配置里那一个:**不要填成被采集的那个邮箱**。
-        # 填了也不至于回环(发出去的信带 X-LifeIn-Push,采集侧会跳过),
-        # 但收件箱里会多一份自己给自己的抄送
-        resolve_address=lambda _user_id: s.smtp_to or "",
+
+
+def _smtp_from_mailbox(s: Settings) -> SmtpConfig | None:
+    """从 `imap` 凭据派生发信配置。取不到就返回 None,不猜。"""
+    user_id = _first_active_user()
+    if user_id is None:
+        return None
+
+    try:
+        with session_scope() as session:
+            imap = credentials.get_credential(user_id, session, kind="imap", settings=s)
+    except Exception:  # noqa: BLE001 —— 解不开或连不上库,都只是"没有邮件通道"
+        log.exception("读邮箱凭据失败,邮件通道不可用")
+        return None
+
+    if not imap:
+        return None
+
+    host = _smtp_host_for(str(imap.get("host", "")))
+    if host is None:
+        # 猜不出来就不猜:发信主机猜错的表现是每次告警都失败,
+        # 而告警失败本身是不会被告警的
+        log.warning("从 %s 推不出发信主机,要用邮件通道请配 SMTP_*", imap.get("host"))
+        return None
+
+    username = str(imap.get("username", ""))
+    return SmtpConfig(
+        host=host,
+        # 465 + SSL:QQ / 163 / 126 都支持,而 587 在部分网络上被封
+        port=465,
+        username=username,
+        password=str(imap.get("auth_code", "")),
+        sender=username,
+        use_ssl=True,
     )
+
+
+def _smtp_host_for(imap_host: str) -> str | None:
+    """`imap.qq.com` → `smtp.qq.com`。
+
+    只认这一种形状。国内几家邮箱都是这么排的,而**猜不出来时宁可不启用** ——
+    一个连不上的发信主机会让降级链多出一条必然失败的通道(07 §2.7 那条理由)。
+    """
+    host = imap_host.strip().lower()
+    return "smtp." + host[len("imap.") :] if host.startswith("imap.") else None
 
 
 def _first_active_user() -> str | None:

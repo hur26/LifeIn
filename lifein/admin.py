@@ -11,6 +11,7 @@
     python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username me@163.com
     python -m lifein.admin login-weixin --user <uuid>    # 扫码连微信(ADR-018)
     python -m lifein.admin test-push --user <uuid>       # 真发一条，看走的哪个通道
+    python -m lifein.admin test-alert --user <uuid>      # 真发一条告警(07 §6 要求实测)
     python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
@@ -586,6 +587,62 @@ def cmd_list_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_test_alert(args: argparse.Namespace) -> int:
+    """真发一条告警,验证那条路走得通(07 §6 那条"告警通道实测能收到")。
+
+    **这条比 `test-push` 更要紧。** 推送发不出去你当天就会发现;
+    告警发不出去,你是在采集器已经掉线两周之后才发现 ——
+    而那正是这个系统最危险的失效方式(R8 / R9)。
+
+    走的是和真实告警完全相同的路径:`Alerter` → 邮件通道 → SMTP,
+    不是另写一段发信代码。**另写一段就只能证明那段代码能跑。**
+    """
+    from lifein.bootstrap import build_services
+
+    services = build_services()
+    channel = _email_channel_of(services)
+    if channel is None:
+        print("没有邮件通道:既没配 SMTP_*,也没有能派生出发信主机的邮箱凭据", file=sys.stderr)
+        print("先跑 set-imap(QQ/163/126 的授权码 IMAP 与 SMTP 通用),或配 SMTP_*", file=sys.stderr)
+        return 1
+
+    print(f"发信:{channel._from} → {channel._resolve(args.user)}")
+
+    # 告警器**按设计吞掉发送异常**(不许拖垮调用方),所以这里挂个耳朵去听 ——
+    # 否则这条命令只能靠"我没看见报错"来判断成功,那和没验一样
+    failures: list[logging.LogRecord] = []
+    listener = logging.Handler()
+    listener.setLevel(logging.ERROR)
+    listener.emit = lambda record: (  # type: ignore[method-assign]
+        failures.append(record) if record.exc_info else None
+    )
+    alert_log = logging.getLogger("lifein.alert")
+    alert_log.addHandler(listener)
+    try:
+        services.alerter.alert(
+            "这是一条测试告警",
+            "看到它说明告警通道是通的。真实告警长这样:采集器掉线、解析失败、待确认积压。",
+        )
+    finally:
+        alert_log.removeHandler(listener)
+
+    if failures:
+        print("\n发送失败,告警现在只剩日志:", file=sys.stderr)
+        print(f"  {failures[0].exc_info[1]}", file=sys.stderr)
+        return 1
+
+    print("已发出。去邮箱看一眼 —— 收不到就查垃圾箱,QQ 常把自己发给自己的信归进去")
+    return 0
+
+
+def _email_channel_of(services) -> object | None:
+    """从降级链里把邮件那一环找出来。找不到就是没配。"""
+    from lifein.channels.email import EmailChannel
+
+    channels = getattr(services.channel, "_channels", [])
+    return next((c for c in channels if isinstance(c, EmailChannel)), None)
+
+
 def cmd_rules(args: argparse.Namespace) -> int:
     """看主动规则的状态与**影子期的数据**。
 
@@ -771,6 +828,10 @@ def build_parser() -> argparse.ArgumentParser:
     sources = sub.add_parser("list-sources", help="看白名单与采集器心跳")
     sources.add_argument("--user", required=True)
     sources.set_defaults(func=cmd_list_sources)
+
+    alert = sub.add_parser("test-alert", help="真发一条告警,验证那条路走得通")
+    alert.add_argument("--user", required=True)
+    alert.set_defaults(func=cmd_test_alert)
 
     rules = sub.add_parser("rules", help="看主动规则的状态与影子期数据")
     rules.add_argument("--user", required=True)
