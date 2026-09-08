@@ -44,6 +44,7 @@ from lifein.channels.base import Card, Channel, InboundMessage
 from lifein.governance.audit import ToolCallRecord
 from lifein.governance.gateway import CallContext, Gateway
 from lifein.governance.registry import ToolLevel
+from lifein.jobs import approval_reply
 from lifein.llm.client import LLMClient, LLMError
 from lifein.models.normalized import Trust
 from lifein.repos import raw_events, users
@@ -135,6 +136,14 @@ def handle_message(
     question = message.content.strip()[:MAX_QUESTION_CHARS]
     if not question:
         return ReplyResult(handled=False, user_id=user.id, reason="empty")
+
+    # 审批指令排在问答前面:"同意 12" 送进问答 agent 的话,模型会认真地去回答
+    # "12 是什么" —— 既花钱又答非所问(P3 第 6 片)
+    decided = approval_reply.handle(session, user_id=user.id, text=question, now=now)
+    if decided.handled:
+        if decided.card is not None:
+            deps.channel.send(user.id, decided.card)
+        return ReplyResult(handled=True, user_id=user.id, reason=decided.action or "approval")
 
     events = raw_events.fetch_normalized_between(user.id, session, start=now - lookback, end=now)
     recalled, recalled_facts = _recall(session, user_id=user.id, question=question, deps=deps)

@@ -27,6 +27,8 @@ from sqlalchemy.orm import Session
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
 from lifein.db import session_scope
 from lifein.jobs import notification_retention
+from lifein.jobs.approval_execute import ExecuteDeps
+from lifein.jobs.approval_execute import run_once as run_approvals_once
 from lifein.jobs.bookkeeping import BookkeepingDeps
 from lifein.jobs.bookkeeping import run_once as run_bookkeeping_once
 from lifein.jobs.collector_watch import WatchDeps
@@ -57,6 +59,7 @@ BOOKKEEPING_JOB_ID = "bookkeeping"
 RECONCILE_JOB_ID = "reconcile"
 MONTHLY_JOB_ID = "monthly_report"
 COVERAGE_JOB_ID = "coverage_watch"
+APPROVAL_JOB_ID = "approval_execute"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
@@ -86,6 +89,16 @@ REMINDER_INTERVAL_MINUTES = 15
 十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
 而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
 补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
+
+APPROVAL_INTERVAL_MINUTES = 3
+"""审批执行多久跑一次。**比别的 job 勤得多。**
+
+点完同意之后等一整天才发出去,那条消息多半已经没意义了;而"点了没反应"
+会让人下次不敢再点 —— 而 P3 的目标正是"你敢让它代你发一条真实消息"。
+
+三分钟是"感觉上立刻"和"不至于空转太多次"之间的折中。空跑一次的成本是
+一次查库,而队列九成时间是空的。
 """
 
 COVERAGE_DELAY_MINUTES = 105
@@ -388,6 +401,46 @@ def run_coverage_watch_for_all_users(
     return unhealthy
 
 
+
+def run_approvals_for_all_users(
+    services: Services,
+    *,
+    now: Callable[[], datetime] | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """把点过同意的 L3 调用做掉。返回真的执行了几条。
+
+    **它跑得比别的 job 勤。** 别的都是一天一次,这个几分钟一次 ——
+    因为点完同意之后等一整天才发出去,那条消息多半已经没意义了,
+    而"点了没反应"会让人下次不敢再点(而 P3 的目标正是"你敢点")。
+    """
+    open_session = session_factory or session_scope
+    clock = now or (lambda: datetime.now(UTC))
+    executed = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                result = run_approvals_once(
+                    user_id,
+                    session,
+                    deps=ExecuteDeps(
+                        channel=services.channel, alerter=services.alerter, now=clock
+                    ),
+                )
+            executed += result.executed
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的审批执行失败", user_id)
+            services.alerter.alert(
+                "审批执行异常", f"user={user_id}: {type(exc).__name__}: {exc}"
+            )
+
+    return executed
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -495,6 +548,7 @@ def build_scheduler(
     reconcile_runner: Callable[[Services], int] | None = None,
     monthly_runner: Callable[[Services], int] | None = None,
     coverage_runner: Callable[[Services], int] | None = None,
+    approval_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
@@ -507,6 +561,7 @@ def build_scheduler(
     run_reconcile = reconcile_runner or run_reconcile_for_all_users
     run_monthly = monthly_runner or run_monthly_report_for_all_users
     run_coverage = coverage_runner or run_coverage_watch_for_all_users
+    run_approvals = approval_runner or run_approvals_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
@@ -591,6 +646,17 @@ def build_scheduler(
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_approvals(services),
+        trigger=IntervalTrigger(minutes=APPROVAL_INTERVAL_MINUTES),
+        id=APPROVAL_JOB_ID,
+        name="审批执行",
+        coalesce=True,
+        max_instances=1,
+        # 错过就等下一轮,不补。**审批不该被补跑** —— 一条几小时前批准的
+        # 代发消息,补跑发出去时内容可能已经不合时宜(和过期那条同一个道理)
+        misfire_grace_time=120,
     )
     scheduler.add_job(
         lambda: run_reminders(services),

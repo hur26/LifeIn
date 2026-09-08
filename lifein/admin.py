@@ -28,6 +28,7 @@
     python -m lifein.admin budget --user <uuid> --amount 5000            # 总预算
     python -m lifein.admin budget --user <uuid> --category 餐饮 --amount 1500
     python -m lifein.admin budgets --user <uuid>                         # 看进度
+    python -m lifein.admin approvals --user <uuid>       # L3 审批队列与最近的执行
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+
+from sqlalchemy import text as sqltext
 
 from lifein.agents.digest import MAX_EVENTS
 from lifein.channels.base import Card
@@ -944,6 +947,72 @@ def cmd_budgets(args: argparse.Namespace) -> int:
 
 
 
+def cmd_approvals(args: argparse.Namespace) -> int:
+    """看 L3 审批队列(P3 第 8 片)。
+
+    **这是 20 次演练时要盯的那块屏。** 03 给 P3 的验收标准是"完成 20 次真实
+    L3 操作,零重复执行、零越权",而这条命令要能一眼回答三件事:
+
+    - 现在有几条等着(等太久说明卡片没被看见)
+    - 最近做成了几条、失败几条(失败不会自动重试,要人来看)
+    - **有没有出现过 failed 之外的异常状态** —— 那是退出条件的信号
+    """
+    from lifein.repos import approvals
+
+    now = datetime.now(get_settings().tzinfo)
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        waiting = approvals.list_open(args.user, session, now=now)
+        recent = approvals.list_recent(args.user, session, limit=args.limit)
+
+    if waiting:
+        print(f"等你批的({len(waiting)} 条):")
+        for item in waiting:
+            left = item.expires_at - now
+            hours = max(int(left.total_seconds() // 3600), 0)
+            print(f"  #{item.id:<5} {item.preview_text}   (还有 {hours} 小时过期)")
+    else:
+        print("没有等你批的。")
+
+    print()
+    print(f"最近 {len(recent)} 条:")
+    counts: dict[str, int] = {}
+    for item in recent:
+        counts[item.status.value] = counts.get(item.status.value, 0) + 1
+        print(f"  #{item.id:<5} {item.status.value:<10} {item.tool_name:<16} {item.preview_text}")
+        if item.result and "error" in item.result:
+            print(f"        └ {item.result['error']}")
+
+    print()
+    print("  ".join(f"{name}={count}" for name, count in sorted(counts.items())) or "  (空)")
+    if counts.get("failed"):
+        # 失败不会自动重试(可能是"对面已经收到了,只是响应超时")
+        print()
+        print("有失败的。不会自动重试 —— 失败的原因可能是对面已经收到了,")
+        print("只是响应超时,那时重试就是发第二条。要重来就重新提一次。")
+
+    # 03 那条"20 次真实 L3 操作,零重复执行、零越权"要盯的就是下面这两行。
+    # **主动查一次**,不能等它报警:那条 CHECK 拦住的东西不留痕迹
+    print()
+    print(f"演练进度:做成 {counts.get('executed', 0)} 次(03 要 20 次)")
+    with session_scope() as session:
+        leaked = session.execute(
+            sqltext(
+                "SELECT count(*) FROM approvals"
+                " WHERE user_id = :u AND trigger_trust <> 'user_input'"
+            ),
+            {"u": args.user},
+        ).scalar_one()
+    if leaked:
+        print(f"⚠ 有 {leaked} 条不是由 user_input 触发的 —— 那条 CHECK 被绕过了,停下来查")
+    else:
+        print("越权:0 条(approvals 里没有非 user_input 触发的行)")
+    print("重复执行:看告警里有没有出现过“可能的重复执行”——它不会自己冒出来")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1126,6 +1195,11 @@ def build_parser() -> argparse.ArgumentParser:
     budget_list = sub.add_parser("budgets", help="看每条预算当期花到哪儿了")
     budget_list.add_argument("--user", required=True)
     budget_list.set_defaults(func=cmd_budgets)
+
+    approvals_cmd = sub.add_parser("approvals", help="看 L3 审批队列与最近的执行")
+    approvals_cmd.add_argument("--user", required=True)
+    approvals_cmd.add_argument("--limit", type=int, default=20, help="最近几条,默认 20")
+    approvals_cmd.set_defaults(func=cmd_approvals)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)

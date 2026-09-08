@@ -22,6 +22,7 @@ from lifein.bootstrap import Services
 from lifein.config import Settings
 from lifein.repos import users
 from lifein.scheduler import (
+    APPROVAL_JOB_ID,
     BOOKKEEPING_JOB_ID,
     COVERAGE_JOB_ID,
     DIGEST_JOB_ID,
@@ -191,3 +192,28 @@ class TestRunForAllUsers:
 def test_master_key_shape_is_what_the_fixture_assumes():
     # 上面那些 services() 依赖 BASE 里的主密钥是合法的,这里钉一下
     assert len(base64.b64decode(BASE["master_key"])) == 32
+
+
+def test_approvals_run_far_more_often_than_the_daily_jobs():
+    """**点完同意之后等一整天才发出去,那条消息多半已经没意义了。**
+
+    而"点了没反应"会让人下次不敢再点 —— 而 P3 的目标正是"你敢让它代你发
+    一条真实消息"。所以它是间隔触发,不是每天一次。
+    """
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    scheduler = build_scheduler(services(), runner=lambda _s: 0)
+    job = scheduler.get_job(APPROVAL_JOB_ID)
+
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval.total_seconds() <= 600
+
+
+def test_a_missed_approval_run_is_not_made_up():
+    """**审批不该被补跑。** 一条几小时前批准的代发消息,补跑发出去时内容
+    可能已经不合时宜 —— 和"超过 24 小时自动过期"是同一个道理。"""
+    scheduler = build_scheduler(services(), runner=lambda _s: 0)
+    job = scheduler.get_job(APPROVAL_JOB_ID)
+
+    assert job.misfire_grace_time is not None
+    assert job.misfire_grace_time <= 300
