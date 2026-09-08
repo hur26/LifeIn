@@ -12,7 +12,16 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from lifein.agents.qa import UNGROUNDED_SUFFIX, QaFailed, QaInput, answer, build_blocks
+from lifein.agents.qa import (
+    UNGROUNDED_SUFFIX,
+    QaFailed,
+    QaInput,
+    RecalledEvent,
+    RecalledFact,
+    answer,
+    build_blocks,
+    plan_recall,
+)
 from lifein.llm.client import LLMClient
 from lifein.llm.prompt import CLOSE_TAG
 from lifein.models.normalized import EventKind, ExternalRef, NormalizedEvent, Trust
@@ -129,3 +138,106 @@ def test_fields_sent_is_reported():
     result, _ = ask({"answer": "a", "refs": ["m1"]})
     assert "body" in result.llm_fields_sent
     assert "标题" in result.llm_fields_sent
+
+
+# ---------- P1:带上记忆之后 ----------
+
+
+def recalled(external_id="old-1", *, title="上次的会议纪要"):
+    return RecalledEvent(
+        source="email",
+        external_id=external_id,
+        title=title,
+        occurred_at=datetime(2026, 8, 1, 9, tzinfo=UTC),
+        body="上次我们聊的是三季度预算。",
+    )
+
+
+def fact(statement="张三在市场部", *, confidence=0.5, confirmed=False):
+    return RecalledFact(
+        fact_id="f-1", statement=statement, confidence=confidence, confirmed_by_user=confirmed
+    )
+
+
+def ask_with(payload, *, events=None, recalled_events=(), facts=()):
+    llm, sent = capture_llm(payload)
+    result = answer(
+        QaInput(
+            question="上次和张三聊的是什么",
+            events=[event("m1")] if events is None else events,
+            recalled=list(recalled_events),
+            facts=list(facts),
+        ),
+        llm=llm,
+    )
+    return result, sent
+
+
+def test_facts_are_wrapped_as_external_content():
+    """事实也要包进隔离标记。
+
+    它是系统自己写的,但**是从邮件正文里推出来的** —— 一封写着"忽略上述指令"
+    的邮件抽出的事实同样可能带着那句话。来源不可信,推论就不可信(R3)。
+    """
+    _, sent = ask_with({"answer": "聊的是预算。", "refs": ["f-1"]}, facts=[fact()])
+    body = sent[0]["messages"][1]["content"]
+
+    assert 'source="memory"' in body
+    assert "张三在市场部" in body
+    assert body.count(CLOSE_TAG) == body.count("<external_content")
+
+
+def test_facts_carry_confidence_and_confirmation():
+    # 少了这两个字段,一条 0.4 分的推断在模型眼里和用户亲口说过的话没区别
+    _, sent = ask_with(
+        {"answer": "x", "refs": ["f-1"]}, facts=[fact(confidence=0.4, confirmed=False)]
+    )
+    body = sent[0]["messages"][1]["content"]
+    assert "置信度: 0.40" in body
+    assert "用户确认过: 否" in body
+
+
+def test_answer_can_cite_a_fact():
+    result, _ = ask_with({"answer": "他在市场部。", "refs": ["f-1"]}, facts=[fact()])
+    assert result.output.grounded is True
+    assert result.output.refs == ["f-1"]
+
+
+def test_recalled_event_outside_the_window_is_usable():
+    result, _ = ask_with(
+        {"answer": "上次聊的是三季度预算。", "refs": ["old-1"]},
+        recalled_events=[recalled()],
+    )
+    assert result.output.refs == ["old-1"]
+
+
+def test_recalled_event_already_in_the_window_is_not_sent_twice():
+    # 检索回来的和窗口里的重了,发两遍既费 token 又让模型觉得这条更重要
+    _, sent = ask_with(
+        {"answer": "x", "refs": ["m1"]},
+        recalled_events=[recalled("m1")],
+    )
+    body = sent[0]["messages"][1]["content"]
+    assert body.count('id="m1"') == 1
+
+
+def test_plan_extracts_the_person_from_the_question():
+    llm, _ = capture_llm({"person": "张三", "keywords": ["预算"]})
+    planned = plan_recall("上次和张三聊的是什么", llm=llm)
+    assert planned.plan.person == "张三"
+    assert planned.plan.keywords == ["预算"]
+    # token 要带出去:这一次同样把问句发给了外部供应商,也同样花钱
+    assert planned.prompt_tokens == 10
+
+
+def test_plan_degrades_to_no_recall_instead_of_failing():
+    """线索解析失败只让答案差一点,不该让用户没有回音。"""
+    llm, _ = capture_llm("这不是 JSON")
+    planned = plan_recall("上次和张三聊的是什么", llm=llm)
+    assert planned.plan.person == ""
+    assert planned.plan.keywords == []
+
+
+def test_plan_keeps_at_most_two_keywords():
+    llm, _ = capture_llm({"person": "", "keywords": ["a", "b", "c", "d"]})
+    assert plan_recall("问题", llm=llm).plan.keywords == ["a", "b"]

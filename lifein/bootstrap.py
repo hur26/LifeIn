@@ -22,6 +22,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from lifein.agents.contract import validate_all
 from lifein.alerts import Alerter, LoggingAlerter
 from lifein.channels.base import Channel, InboundMessage
 from lifein.channels.fallback import FallbackChannel
@@ -40,6 +41,22 @@ from lifein.sources.email_adapter import EmailAdapter
 from lifein.sources.imap_client import ImapConfig, ImapMailbox
 
 log = logging.getLogger(__name__)
+
+
+def register_tools() -> None:
+    """把能力层的工具挂上注册表,并校验每个 agent 的白名单都指向真实存在的工具。
+
+    **导入即注册**(架构 §9.2),所以"哪些工具在线"取决于谁被 import 过 ——
+    这种事不能碰运气,放在装配这一步显式做一次。
+
+    `validate_all` 放在这里而不是注册时,是因为导入顺序不可控:agent 模块
+    可能先于工具模块加载。晚几十毫秒,换来的是不用关心谁先谁后
+    (contract.py 里写着同一件事)。
+    """
+    from lifein.agents import digest, memory, qa  # noqa: F401
+    from lifein.tools import memory as memory_tools  # noqa: F401
+
+    validate_all()
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,8 @@ class Services:
 def build_services(settings: Settings | None = None) -> Services:
     """建进程级组件。配置有问题会在这里炸,而不是等第一次用到。"""
     s = settings or get_settings()
+
+    register_tools()
 
     llm = LLMClient(
         base_url=s.llm_base_url,

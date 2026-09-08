@@ -16,7 +16,13 @@ import pytest
 from sqlalchemy import text
 
 from lifein.channels.base import Card, Delivery, InboundMessage
-from lifein.jobs.qa_reply import FAILED_REPLY, UNSUPPORTED_REPLY, QaDeps, handle_message
+from lifein.jobs.qa_reply import (
+    FAILED_REPLY,
+    UNSUPPORTED_REPLY,
+    QaDeps,
+    default_gateway,
+    handle_message,
+)
 from lifein.llm.client import LLMClient
 from lifein.models.normalized import EventKind, ExternalRef, NormalizedEvent, Trust
 from lifein.repos import users
@@ -216,3 +222,213 @@ def test_only_events_inside_the_lookback_window_are_used(pg_session, registered_
     # 于是 refs 里那个 m1 无效,答案被标成没依据
     row = pg_session.execute(text("SELECT args_digest FROM tool_calls")).scalar_one()
     assert row["events"]["len"] == 0
+
+
+# ---------- P1:接上记忆之后 ----------
+
+
+@pytest.fixture(autouse=True)
+def _tools_registered():
+    # 别的测试文件会 clear_registry() 做隔离,而模块级的 @tool 只在第一次
+    # import 时执行 —— 整套跑起来顺序一变,这里就会拿到空注册表
+    import importlib
+
+    import lifein.agents.qa as qa_agent
+    import lifein.tools.memory as memory_tools
+    from lifein.agents import contract
+    from lifein.governance import registry
+
+    if "memory.recall_facts" not in registry.registered_tools():
+        importlib.reload(memory_tools)
+    if "qa" not in contract.registered_agents():
+        importlib.reload(qa_agent)
+
+
+def scripted_llm(payloads) -> LLMClient:
+    """按顺序回一串响应:第一次是检索线索,第二次才是答案。"""
+    queue = list(payloads)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        out = queue.pop(0) if queue else {}
+        return httpx.Response(
+            200,
+            json={
+                "model": "m",
+                "choices": [{"message": {"content": json.dumps(out, ensure_ascii=False)}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+            },
+        )
+
+    return LLMClient(
+        base_url="https://llm.example.com/v1",
+        api_key="k",
+        model="m",
+        max_retries=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _s: None,
+    )
+
+
+def seed_memory(pg_session, user_id: str) -> None:
+    """一封七天窗口之外的旧邮件 + 一条记忆里的事实。"""
+    from lifein.models.normalized import IdentifierType, Party, PartyRole
+    from lifein.repos import facts
+    from lifein.repos.entities import AliasType, EntityKind, resolve_or_create
+
+    long_ago = NOW - timedelta(days=90)
+    insert_events(
+        user_id,
+        pg_session,
+        [
+            IngestedEvent(
+                source="email",
+                external_id="old-1",
+                occurred_at=long_ago,
+                trust=Trust.EXTERNAL,
+                raw={},
+                normalized=NormalizedEvent(
+                    kind=EventKind.MESSAGE,
+                    title="三季度预算",
+                    occurred_at=long_ago,
+                    external_ref=ExternalRef(source="email", external_id="old-1"),
+                    trust=Trust.EXTERNAL,
+                    confidence=1.0,
+                    body="预算定在 30 万。",
+                    parties=[
+                        Party(
+                            role=PartyRole.FROM,
+                            display_name="张三",
+                            identifier="zhang@qq.com",
+                            identifier_type=IdentifierType.EMAIL,
+                        )
+                    ],
+                ),
+            )
+        ],
+    )
+    resolve_or_create(
+        user_id,
+        pg_session,
+        kind=EntityKind.PERSON,
+        name="张三",
+        seen_at=long_ago,
+        identifier="zhang@qq.com",
+        identifier_type=AliasType.EMAIL,
+        evidence_event_id=1,
+    )
+    facts.add_fact(
+        user_id,
+        pg_session,
+        statement="张三负责三季度预算",
+        provenance=[1],
+        confidence=0.5,
+        trust=Trust.EXTERNAL,
+        created_by_agent="memory",
+        valid_from=long_ago,
+    )
+
+
+def recall_deps(llm, channel=None) -> tuple[QaDeps, FakeChannel]:
+    channel = channel or FakeChannel()
+    return (
+        QaDeps(
+            llm=llm,
+            channel=channel,
+            resolve_user=resolve_wecom,
+            gateway_factory=default_gateway,
+        ),
+        channel,
+    )
+
+
+def tool_rows(pg_session, user_id: str):
+    return pg_session.execute(
+        text("""
+            SELECT tool_name, args_digest FROM tool_calls
+             WHERE user_id = :u ORDER BY created_at
+        """),
+        {"u": user_id},
+    ).all()
+
+
+def test_recall_reaches_events_outside_the_lookback_window(pg_session, registered_user):
+    """"上次和张三聊的是什么" —— 那封信在七天窗口之外。
+
+    P1 验收标准第一条就是这个:没有检索时它只能答"最近没有和张三的往来"。
+    """
+    seed_memory(pg_session, registered_user)
+    llm = scripted_llm(
+        [
+            {"person": "张三", "keywords": ["预算"]},
+            {"answer": "上次聊的是三季度预算。", "refs": ["old-1"], "confident": True},
+        ]
+    )
+    d, channel = recall_deps(llm)
+
+    result = handle_message(
+        pg_session, message=message("上次和张三聊的是什么"), deps=d, now=NOW
+    )
+
+    assert result.handled is True
+    assert channel.sent[0].summary == "上次聊的是三季度预算。"
+    assert channel.sent[0].footer == "依据 1 条记录"
+
+    names = [row.tool_name for row in tool_rows(pg_session, registered_user)]
+    assert "memory.recent_events_with" in names
+    assert "memory.recall_facts" in names
+
+
+def test_both_llm_calls_are_audited(pg_session, registered_user):
+    """检索线索那一次也把问句发给了外部供应商,也花了钱(R12)。"""
+    seed_memory(pg_session, registered_user)
+    llm = scripted_llm([{"person": "张三"}, {"answer": "x", "refs": [], "confident": False}])
+    d, _ = recall_deps(llm)
+
+    handle_message(pg_session, message=message("上次和张三聊的是什么"), deps=d, now=NOW)
+
+    stages = [
+        row.args_digest.get("stage")
+        for row in tool_rows(pg_session, registered_user)
+        if row.tool_name == "llm.chat"
+    ]
+    assert "plan" in stages
+    assert len(stages) == 2, "一次问答两次调用,两次都要记"
+
+
+def test_recall_failure_still_produces_an_answer(pg_session, registered_user):
+    """检索炸了只让答案差一点,不该让用户没有回音。"""
+    seed_event(pg_session, registered_user)
+
+    def exploding_gateway(user_id, session):
+        class Boom:
+            def call(self, *_args, **_kwargs):
+                raise RuntimeError("记忆层挂了")
+
+        return Boom()
+
+    llm = scripted_llm(
+        [{"person": "张三"}, {"answer": "批了,1280 元。", "refs": ["m1"], "confident": True}]
+    )
+    channel = FakeChannel()
+    d = QaDeps(
+        llm=llm,
+        channel=channel,
+        resolve_user=resolve_wecom,
+        gateway_factory=exploding_gateway,
+    )
+
+    result = handle_message(pg_session, message=message(), deps=d, now=NOW)
+
+    assert result.handled is True
+    assert channel.sent[0].summary == "批了,1280 元。"
+
+
+def test_without_a_gateway_nothing_is_recalled(pg_session, registered_user):
+    # 记忆层还没数据的部署照样该能问答,而且不该白花那次检索的钱
+    seed_event(pg_session, registered_user)
+    d, _ = deps()
+
+    handle_message(pg_session, message=message(), deps=d, now=NOW)
+
+    names = [row.tool_name for row in tool_rows(pg_session, registered_user)]
+    assert names == ["llm.chat"], "没有网关时连检索线索那一次都不该调"

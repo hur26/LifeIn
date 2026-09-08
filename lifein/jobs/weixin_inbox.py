@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from lifein.channels import weixin_inbound
 from lifein.channels.weixin import WeixinSessionExpired, WeixinUnavailable
-from lifein.jobs.qa_reply import QaDeps, handle_message
+from lifein.jobs.qa_reply import QaDeps, default_gateway, handle_message
 from lifein.repos import channel_state, credentials
 
 log = logging.getLogger(__name__)
@@ -137,6 +137,7 @@ def _handle_one(user_id: str, message, *, services, session_factory: SessionFact
                     llm=services.llm,
                     channel=services.channel,
                     resolve_user=services.resolve_user,
+                    gateway_factory=default_gateway,
                 ),
                 now=datetime.now(UTC),
             )
