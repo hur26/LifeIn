@@ -147,6 +147,16 @@ async def _verify_signed(
     kind: str,
     for_ingest: bool,
 ) -> Caller:
+    """签名校验。
+
+    这个函数是 `async` 的,只因为要 `await request.body()` —— 而它里面那次
+    取凭据是阻塞的库调用,严格说会占住事件循环几毫秒。
+
+    **知道且接受**:本项目的 QPS 是个位数,瓶颈从头到尾在 LLM 侧
+    ([ADR-016](../../docs/04-tech-decisions.md#adr-016--服务端用-python--fastapi))。
+    真要改的时候,改法是把取凭据挪进线程池,不是把整条链路改成异步 ——
+    后者会把 SQLAlchemy 那一层一起拖进来。
+    """
     user_id = request.headers.get(auth.HEADER_USER, "").strip()
     device_id = request.headers.get(auth.HEADER_DEVICE, "").strip()
     timestamp = request.headers.get(auth.HEADER_TIMESTAMP, "").strip()
