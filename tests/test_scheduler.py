@@ -23,6 +23,7 @@ from lifein.config import Settings
 from lifein.repos import users
 from lifein.scheduler import (
     BOOKKEEPING_JOB_ID,
+    COVERAGE_JOB_ID,
     DIGEST_JOB_ID,
     MEMORY_JOB_ID,
     MONTHLY_JOB_ID,
@@ -105,11 +106,12 @@ class TestSchedulerShape:
             bookkeeping_runner=lambda _s: 0,
             reconcile_runner=lambda _s: 0,
             monthly_runner=lambda _s: 0,
+            coverage_runner=lambda _s: 0,
         )
         times = {}
         for job_id in (
             DIGEST_JOB_ID, MEMORY_JOB_ID, PLAN_JOB_ID,
-            BOOKKEEPING_JOB_ID, RECONCILE_JOB_ID, MONTHLY_JOB_ID,
+            BOOKKEEPING_JOB_ID, RECONCILE_JOB_ID, MONTHLY_JOB_ID, COVERAGE_JOB_ID,
         ):
             fields = {f.name: str(f) for f in scheduler.get_job(job_id).trigger.fields}
             times[job_id] = (fields["hour"], fields["minute"])
@@ -124,6 +126,9 @@ class TestSchedulerShape:
         # 月报每天都触发,但一个月只发一次 —— 挡住重复的是 job_runs 的窗口
         # 认领,不是 cron 的日期字段:写 day=1 的话一号那天进程没起来就整月漏发
         assert times[MONTHLY_JOB_ID] == ("9", "30")
+        # 巡检排在最后:它读的是别的 job 刚写下的数,排在前面看的永远是昨天,
+        # 而 R8 要的是早期信号,晚一天就少一天
+        assert times[COVERAGE_JOB_ID] == ("9", "45")
 
     def test_scheduler_is_not_started_by_the_builder(self):
         # 由调用方决定什么时候起 —— 测试里不该有后台线程

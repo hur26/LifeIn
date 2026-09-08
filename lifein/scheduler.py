@@ -31,6 +31,8 @@ from lifein.jobs.bookkeeping import BookkeepingDeps
 from lifein.jobs.bookkeeping import run_once as run_bookkeeping_once
 from lifein.jobs.collector_watch import WatchDeps
 from lifein.jobs.collector_watch import run_once as run_watch_once
+from lifein.jobs.coverage_watch import CoverageDeps
+from lifein.jobs.coverage_watch import run_once as run_coverage_once
 from lifein.jobs.daily_digest import DigestDeps, run_once
 from lifein.jobs.memory_extract import MemoryDeps
 from lifein.jobs.memory_extract import run_once as run_memory_once
@@ -54,6 +56,7 @@ PLAN_JOB_ID = "plan_extract"
 BOOKKEEPING_JOB_ID = "bookkeeping"
 RECONCILE_JOB_ID = "reconcile"
 MONTHLY_JOB_ID = "monthly_report"
+COVERAGE_JOB_ID = "coverage_watch"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
@@ -83,6 +86,14 @@ REMINDER_INTERVAL_MINUTES = 15
 十五分钟是精度和成本的折中:提前半小时的提醒最多会晚十五分钟发出去,
 而它一天只查两次库、不调模型,几乎没有成本。它也**不认领窗口** ——
 补跑一个两小时前的提醒没有意义,那正是 job_runs 那套补偿不适用的场景。
+"""
+
+COVERAGE_DELAY_MINUTES = 105
+"""覆盖率巡检排在最后。
+
+它读的是别的 job 刚写下的数(记账的归类计数、对账的回填结果),所以排在
+它们后面才看得到今天的情况 —— 排在前面的话,看的永远是昨天,
+而 R8 要的是**早期**信号,晚一天就少一天。
 """
 
 MONTHLY_DELAY_MINUTES = 90
@@ -339,6 +350,40 @@ def run_monthly_report_for_all_users(
     return sent
 
 
+
+def run_coverage_watch_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户看一遍那几个数。返回**有几个人的数字不对劲**。
+
+    返回的不是"看了几个人":这个 job 每天都会把所有人看一遍,那个数字没有信息量。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    unhealthy = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                report = run_coverage_once(
+                    user_id, session, deps=CoverageDeps(alerter=services.alerter), now=moment
+                )
+            unhealthy += 0 if report.healthy else 1
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的覆盖率巡检失败", user_id)
+            services.alerter.alert(
+                "覆盖率巡检异常", f"user={user_id}: {type(exc).__name__}: {exc}"
+            )
+
+    return unhealthy
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -445,6 +490,7 @@ def build_scheduler(
     bookkeeping_runner: Callable[[Services], int] | None = None,
     reconcile_runner: Callable[[Services], int] | None = None,
     monthly_runner: Callable[[Services], int] | None = None,
+    coverage_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
@@ -456,6 +502,7 @@ def build_scheduler(
     run_bookkeeping = bookkeeping_runner or run_bookkeeping_for_all_users
     run_reconcile = reconcile_runner or run_reconcile_for_all_users
     run_monthly = monthly_runner or run_monthly_report_for_all_users
+    run_coverage = coverage_runner or run_coverage_watch_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
@@ -465,6 +512,7 @@ def build_scheduler(
     book_hour, book_minute = _shift(hour, minute, BOOKKEEPING_DELAY_MINUTES)
     recon_hour, recon_minute = _shift(hour, minute, RECONCILE_DELAY_MINUTES)
     monthly_hour, monthly_minute = _shift(hour, minute, MONTHLY_DELAY_MINUTES)
+    cov_hour, cov_minute = _shift(hour, minute, COVERAGE_DELAY_MINUTES)
     retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
@@ -527,6 +575,15 @@ def build_scheduler(
         ),
         id=MONTHLY_JOB_ID,
         name="月度报告",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        lambda: run_coverage(services),
+        trigger=CronTrigger(hour=cov_hour, minute=cov_minute, timezone=services.settings.tzinfo),
+        id=COVERAGE_JOB_ID,
+        name="覆盖率巡检",
         coalesce=True,
         max_instances=1,
         misfire_grace_time=3600,
