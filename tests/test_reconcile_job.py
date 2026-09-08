@@ -354,3 +354,71 @@ def _ledger_size(session, user_id) -> int:
     return session.execute(
         text("SELECT count(*) FROM transactions WHERE user_id = :u"), {"u": user_id}
     ).scalar_one()
+
+
+@pytest.mark.integration
+class TestTheWholeChain:
+    """解析 → 入库 → 对账,一路走到底。**这一组回答"接起来是不是空的"。**
+
+    前面每一片自己都绿,但它们之间靠的是约定:解析器产出的 `raw` 形状、
+    `raw_events.source` 和 `raw.channel` 的取值、对账 job 那句
+    `WHERE raw ->> 'channel' = 'statement'`。**约定对不上的表现不是报错,
+    是对账 job 每天查到零行**,而零行和"这个月没有账单"长得一模一样。
+    """
+
+    def a_statement_file(self) -> bytes:
+        csv = (
+            "支付宝交易记录明细查询\n"
+            "账号:[139****8888]\n"
+            "---------------------------------交易记录明细列表----------------------\n"
+            "交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号\n"
+            "2026-08-20 12:00:00,餐饮美食,星巴克,大杯拿铁,支出,38.50,"
+            "招商银行储蓄卡(1234),交易成功,ORD-1\n"
+            "2026-08-21 09:00:00,转账,余额宝,余额宝-转出,不计收支,1000.00,"
+            "余额宝,交易成功,ORD-2\n"
+            "----------------------------------------------------------------------\n"
+            "共 2 笔记录\n"
+        )
+        return csv.encode("gbk")
+
+    def ingest(self, session, user_id) -> int:
+        from lifein.repos import raw_events
+        from lifein.sources import statement_csv, statement_ingest
+
+        rows = statement_csv.rows_from_rows(
+            statement_csv.open_rows(self.a_statement_file()), year=2026
+        )
+        events = statement_ingest.to_events(rows, issuer="alipay", tz=UTC, period="2026-08")
+        return raw_events.insert_events(user_id, session, events).inserted
+
+    def test_a_parsed_statement_reaches_the_reconcile_job(self, pg_session, user_id):
+        a_realtime_txn(
+            pg_session, user_id, amount="38.50", occurred_at=BOUGHT_AT, merchant="财付通"
+        )
+
+        assert self.ingest(pg_session, user_id) == 1  # 转账那行在解析时就被丢了
+        result = run(pg_session, user_id)
+
+        assert result.lines_seen == 1
+        assert result.backfilled == 1
+        after = transactions.list_between(
+            user_id, pg_session,
+            start=BOUGHT_AT - timedelta(days=2), end=BOUGHT_AT + timedelta(days=2),
+        )
+        assert after[0].merchant_raw == "星巴克"
+        assert after[0].order_no == "ORD-1"
+
+    def test_importing_the_same_file_twice_does_not_double_the_ledger(
+        self, pg_session, user_id
+    ):
+        """**两道幂等各守一边。** raw_events 的唯一键挡住重复导入,
+        matched_statement_event_id 挡住重复回填 —— 而 ADR-012 写着
+        重复入账比漏记更糟,漏记你会发现,重复不会。"""
+        a_realtime_txn(pg_session, user_id, amount="38.50", occurred_at=BOUGHT_AT)
+
+        assert self.ingest(pg_session, user_id) == 1
+        assert self.ingest(pg_session, user_id) == 0  # 第二遍一行都没进
+        run(pg_session, user_id)
+        run(pg_session, user_id)
+
+        assert _ledger_size(pg_session, user_id) == 1

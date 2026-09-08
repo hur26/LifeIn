@@ -22,6 +22,7 @@
     python -m lifein.admin list-sources --user <uuid>   # 白名单 + 采集器心跳
     python -m lifein.admin rules --user <uuid> --detail # 影子期数据,判断误报率
     python -m lifein.admin rule-mode --user <uuid> --rule upcoming_schedule --mode active
+    python -m lifein.admin import-statement --user <uuid> --file 账单.pdf --issuer cmb
 """
 
 from __future__ import annotations
@@ -722,6 +723,116 @@ def cmd_rule_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_statement(args: argparse.Namespace) -> int:
+    """导一份月度对账单进 `raw_events`(P2 第 6/7/8 片的入口)。
+
+    **是手动的,而且按 [ADR-012](../docs/04-tech-decisions.md) 本来就该是手动的** ——
+    那张表把支付宝/微信导出标成"半自动,每月手动触发"。信用卡对账单邮件
+    标的是"完全自动",那条路要走邮箱附件,还没接上(见 AGENTS §9)。
+
+    这条命令只负责**入库**,不负责入账。落进 `raw_events` 之后,对账 job
+    下一次跑起来会去匹配实时那些记录、回填真实商户名,匹配不上的补成新记录。
+    分开的理由是那一步有幂等键,而这一步的幂等靠 `UNIQUE (user_id, source,
+    external_id)` —— **两道各守一边,同一份账单导十次和导一次一样**。
+
+    密码走交互输入,和 `set-imap` 一个理由:命令行参数会进 shell history、
+    会出现在 `ps` 的输出里。
+    """
+    from lifein.repos import raw_events as raw_events_repo
+    from lifein.sources import statement_csv, statement_ingest, statement_pdf
+
+    path = Path(args.file)
+    if not path.exists():
+        print(f"文件不存在:{path}", file=sys.stderr)
+        return 1
+    data = path.read_bytes()
+
+    password = None
+    if args.password_prompt:
+        password = getpass.getpass("打开密码(直接回车表示没有):") or None
+
+    settings = get_settings()
+    year = args.year or datetime.now(settings.tzinfo).year
+
+    try:
+        rows = _parse_statement(
+            data,
+            password=password,
+            year=year,
+            path=path,
+            pdf=statement_pdf,
+            csv_source=statement_csv,
+        )
+    except ValueError as exc:
+        # 三种失败都在这里落地:密码错、AES 包、读不开。它们各自的信息
+        # 已经写成了人话,直接打出来 —— 密码错那一种用户自己就能修
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not rows:
+        print("这份文件里一行交易都没认出来。", file=sys.stderr)
+        print("PDF 的话多半是表格定位没认出来(见 ADR-023 的触发条件),", file=sys.stderr)
+        print("导出的话看看是不是拿错了文件。", file=sys.stderr)
+        return 1
+
+    period = statement_ingest.period_of(rows)
+    events = statement_ingest.to_events(
+        rows, issuer=args.issuer, tz=settings.tzinfo, period=period
+    )
+    counts = statement_ingest.summarize(events)
+
+    if args.dry_run:
+        print(f"解出 {counts['lines']} 行(支出 {counts['outbound']},进账 {counts['inbound']})")
+        for row in rows[:10]:
+            print(
+                f"  {row.occurred_on}  {row.amount:>10}  {row.direction.value:<6}"
+                f"  {row.kind.value if row.kind else '(类型不明)':<10}  {row.merchant_raw or ''}"
+            )
+        if len(rows) > 10:
+            print(f"  ...(还有 {len(rows) - 10} 行)")
+        print("这是 --dry-run,没有入库。")
+        return 0
+
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        result = raw_events_repo.insert_events(args.user, session, events)
+
+    print(f"入库 {result.inserted} 行,重复跳过 {result.duplicates} 行(周期 {period or '跨月'})")
+    if result.duplicates and not result.inserted:
+        # 不是错误,是幂等在起作用 —— 但要说出来,否则看起来像什么都没干
+        print("这一份之前已经导过了。重导不会变成两份账。")
+    print("对账 job 下一次跑起来会把它们和实时记录对上。")
+    return 0
+
+
+def _parse_statement(
+    data: bytes,
+    *,
+    password: str | None,
+    year: int,
+    path: Path,
+    pdf,
+    csv_source,
+):
+    """按文件内容挑解析器,**不按扩展名**。
+
+    扩展名是用户改得动的,而 PDF 和 ZIP 的魔数改不动。挑错了的表现是
+    "一行都认不出来",而那和"这份账单格式不认识"长得一模一样 ——
+    排查时会往完全错误的方向走。
+    """
+    if data[:4] == b"%PDF":
+        rows = []
+        for table in pdf.open_tables(data, password=password):
+            rows.extend(pdf.rows_from_table(table, year=year))
+        return rows
+
+    parsed_rows = csv_source.open_rows(data, password=password)
+    return csv_source.rows_from_rows(parsed_rows, year=year)
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -855,6 +966,27 @@ def build_parser() -> argparse.ArgumentParser:
     rules.add_argument("--days", type=int, default=7, help="看最近几天,默认一周")
     rules.add_argument("--detail", action="store_true", help="逐条列影子期的内容")
     rules.set_defaults(func=cmd_rules)
+
+    stmt = sub.add_parser("import-statement", help="导一份月度对账单(PDF 或支付宝/微信导出)")
+    stmt.add_argument("--user", required=True)
+    stmt.add_argument("--file", required=True, help="对账单文件。PDF 还是压缩包按内容认,不看扩展名")
+    stmt.add_argument(
+        "--issuer",
+        required=True,
+        help="发卡行或平台,如 cmb / alipay / wechat。它进 external_id,同一家要一直用同一个词",
+    )
+    stmt.add_argument(
+        "--year",
+        type=int,
+        help="账单周期的年份。日期列只有月日时用得上 —— 不给就用今年,而一月导上个月的账单要显式给",
+    )
+    stmt.add_argument(
+        "--password-prompt",
+        action="store_true",
+        help="交互输入打开密码(PDF 的密码或压缩包密码)。不走命令行参数",
+    )
+    stmt.add_argument("--dry-run", action="store_true", help="只解析打印,不入库")
+    stmt.set_defaults(func=cmd_import_statement)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)
