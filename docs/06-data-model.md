@@ -618,11 +618,11 @@ CREATE TABLE rule_state (
 
 诚实记录,不要假装完备:
 
-- **接口契约**(`/ingest` payload、App 查询与待办 API 路由、日历回报的 payload)
-  —— P1 的 App 那几片开工前补
+- ~~**接口契约**(`/ingest` payload、App 查询与待办 API 路由、日历回报的 payload)~~
+  ✅ 已定,见 §6
 - ~~**prompt 结构**(外部内容的隔离标记格式)~~ ✅ 已定,见 §5
 
-- **评测集格式**(agent 契约第 5 项)—— 同上
+- **评测集格式**(agent 契约第 5 项)—— 仍然欠着,P1 收尾时补
 - 配置项清单见 [07 配置清单](07-config.md)
 
 ---
@@ -657,3 +657,289 @@ CREATE TABLE rule_state (
 它降低的是"模型把外部文本里的祈使句当成用户指令"的概率,**不能归零**。
 真正兜底的是另外两道:L3 永远不由外部内容触发(网关 + `approvals` 的 CHECK),
 以及 L2 必须可回滚。没有那两道,这里写得再漂亮也只是心理安慰。
+
+---
+
+## 6. 接口契约
+
+[§4](#4-这份文档还缺什么) 欠的那一条。**P1 第 10 / 11 片开工前补** ——
+App 改一次要重新发版,接口还在变的时候不动它([AGENTS.md §9](../AGENTS.md#9-当前状态))。
+
+服务端默认只监听 `127.0.0.1`([07 §2.1](07-config.md#21-基础)),
+公网走反向代理 + TLS。下面所有路径都是反代之后的路径。
+
+### 6.1 两组接口,两套凭据
+
+[R11](05-risks.md#r11--app-直连服务端的认证面) 那句"**最重要的一条**"在这里落地,
+也就是[铁律 12](../AGENTS.md#1-铁律):
+
+| | 采集端 | 查询端 |
+| --- | --- | --- |
+| 路径前缀 | `/ingest/*` | `/app/*` |
+| 凭据 `kind` | `collector` | `app_device` |
+| 凭据 `scope` | `ingest` | `query` |
+| 能做什么 | **只能写**:上报通知、上报心跳 | 读待办 / 待确认 / 同步队列,写自己地盘 |
+| 认证方式 | 每次请求 HMAC 签名(§6.2) | 长期凭据换短期 token(§6.3) |
+| 丢了的后果 | 别人能往你的事件流里塞垃圾 | 别人能读到你的待办与待确认内容 |
+
+**分离是结构性的,不是约定**:两组路由各挂各的依赖函数,
+采集端那个只认 `for_ingest=True` 取出来的凭据,查询端那个只认 `query` 的。
+`credentials.get_credential` 的 scope 过滤是最后一道 ——
+就算路由挂错了依赖,采集密钥也解不出查询凭据那一行。
+
+**两条凭据都按设备签发**(`credentials.device_id` 非空),同一台手机上是两条独立的行。
+手机丢了,吊销这台设备的那两条即可,别的设备不受影响 ——
+这就是 R11 要求的"token 服务端可单点吊销"。
+
+### 6.2 采集端:每次请求签名
+
+```
+POST /ingest/events
+X-LifeIn-User:      <user_id>
+X-LifeIn-Device:    <device_id>
+X-LifeIn-Timestamp: <unix 秒>
+X-LifeIn-Signature: <hex(HMAC-SHA256(secret, signing_string))>
+```
+
+```
+signing_string = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + sha256_hex(BODY)
+```
+
+`secret` 是 `credentials`(`kind=collector`, `scope=ingest`)那条里的
+`secret` 字段,32 字节随机数的 base64,在设备上存安卓 Keystore。
+
+校验顺序,任何一步不过一律 **401 且不说原因**(理由与企微回调那条一样 ——
+告诉对方错在哪一步等于帮他调试):
+
+1. 三个头齐全,`timestamp` 与服务端时间相差不超过 `INGEST_MAX_SKEW_S`
+2. 按 `(user_id, device_id, kind=collector)` 取出未吊销的凭据,取不到即拒
+3. 用取出的 secret 重算签名,**常数时间比较**
+
+**重放保护靠两条,都不是 nonce:** 五分钟时间窗,以及
+`raw_events (user_id, source, external_id)` 的唯一键 ——
+重放一次上报写不进任何新东西([§2.6](#26-去重的两个层次))。
+不存 nonce 是因为它要么无限增长要么得多一个清理任务,
+而在幂等已经成立的地方,它挡不住任何新的东西。
+**心跳是这条推理唯一的缺口**:五分钟内重放一次心跳,能让一台刚掉线的采集器
+看起来还活着,最多延后五分钟告警 —— 接受这个代价,不为它引入 nonce 表。
+
+### 6.3 查询端:长期凭据换短期 token
+
+`POST /app/token` 用 §6.2 同样的签名方式,只是 secret 换成
+`kind=app_device`(`scope=query`)那条。返回:
+
+```json
+{ "token": "v1.<base64url(payload)>.<hex 签名>", "expires_at": "2026-09-09T10:00:00+00:00" }
+```
+
+`payload` 是 `{"u": user_id, "d": device_id, "exp": <unix 秒>}`,
+签名用的还是那台设备的查询密钥。有效期 `APP_TOKEN_TTL_H`(默认 24 小时)。
+
+其余 `/app/*` 请求带 `Authorization: Bearer <token>`。校验:
+解出 `u` 与 `d` → **回库取那台设备未吊销的查询凭据** → 用它验签 → 看 `exp`。
+
+**为什么验签要回库读那条凭据**,而不是拿一把全局密钥签一个自洽的 JWT:
+因为 R11 要求"token 服务端可单点吊销"。自洽的 token 在过期前谁也拦不住,
+除非再建一张吊销表;而把签名密钥绑在设备凭据上,
+`revoked_at` 一填,那台设备已经发出去的 token **下一次请求就失效**,
+不需要第二张表,也不存在"忘了同步吊销名单"这种状态。
+
+代价是每次请求多一次带索引的单行查询和一次解密。P1 的 QPS 是个位数,
+这个代价不值得优化 —— 真到了要优化的时候,加缓存也必须带吊销的失效路径。
+
+### 6.4 采集上报 `POST /ingest/events`
+
+```json
+{
+  "device_id": "pixel-7a",
+  "events": [
+    {
+      "channel": "notification",
+      "source_app": "com.tencent.mm",
+      "posted_at": "2026-09-08T10:11:12+08:00",
+      "title": "项目组",
+      "text": "老王:明天下午三点开会",
+      "external_id": "0f2c9a"
+    }
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+| --- | :-: | --- |
+| `channel` | ✓ | `notification` / `sms`。P1 只有前者会被放行(白名单里没有短信来源) |
+| `source_app` | notification | 包名。白名单按它匹配 |
+| `sender` | sms | 发件号码。白名单按它匹配 |
+| `posted_at` | ✓ | 通知**展示**的时间,带时区。它就是 `occurred_at` |
+| `title` / `text` | ✓ / | 通知标题与正文,原样上报,设备端不解析(架构 §8.1) |
+| `external_id` | ✓ | 设备生成的去重键。服务端会再拼上 `device_id`,跨设备不会撞 |
+
+**服务端逐条按这个顺序处理,顺序本身是安全机制:**
+
+1. **白名单**(`collector_whitelist`,默认拒绝)。不匹配就丢弃,计
+   `not_whitelisted`。手机端已经过滤过一次,这里是第二道 ——
+   [R10](05-risks.md#r10--手机端采集器的越权读取) 不假设手机端规则永远正确
+2. **`purpose` 闸门**。P1 只放行 `purpose=message`;命中一条
+   `purpose=transaction` 的规则也丢弃,计 `phase_not_open` ——
+   记账链路 P2 才打开([产品定义 §6](01-product-spec.md#6-数据源)),
+   这条闸门让"白名单提前配好"不等于"账目提前开始流入"
+3. **验证码正则**(铁律 11 的服务端那一道)。命中就丢弃,计 `verification_code`。
+   **不入库、不记原文**,日志里也只记条数
+4. **归一化**:`kind=message`、`trust=external`、`title` 进标题、`text` 进 body。
+   系统折叠出来的"[3 条] ……"打上 `aggregated`
+5. **入库**,`ON CONFLICT DO NOTHING`,重复的计 `duplicates`
+
+响应:
+
+```json
+{
+  "accepted": 3,
+  "duplicates": 1,
+  "dropped": {"not_whitelisted": 2, "verification_code": 1, "phase_not_open": 0}
+}
+```
+
+**返回计数不违反"只能写"**:这些数字是设备刚刚提交的那一批的处理结果,
+不是库里已有的任何数据。采集端需要它才能在状态面板上说清"我发出去的东西
+有没有被收下",而这正是[静默失败](05-risks.md#r8--数据源格式变动)最需要被打破的地方。
+
+### 6.5 心跳 `POST /ingest/heartbeat`
+
+```json
+{ "device_id": "pixel-7a", "app_version": "1.0.0", "android_version": "14", "listener_enabled": true }
+```
+
+upsert 进 `collector_heartbeat`,`last_seen_at` 由**服务端**取当前时间 ——
+设备时钟不可信,而这个值是掉线告警的判据。
+
+`listener_enabled=false` 是一种特殊的活着:进程还在,但通知监听权限被系统收走了。
+**这种情况要照样告警** —— 它和掉线的后果一样(采不到东西),
+但表现更隐蔽(心跳一切正常)。
+
+超过 `COLLECTOR_HEARTBEAT_TIMEOUT_M`(默认 60)分钟没有心跳即告警,
+对应 P1 验收标准里的"采集器掉线能在 1 小时内告警"。
+
+### 6.6 待办读写 `/app/todos`
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/app/todos?until=<ISO8601>&limit=50` | 未完成的待办与日程。`until` 不给就按用户时区算到今天结束 —— **桌面小组件用的就是这个默认值** |
+| POST | `/app/todos` | 用户手动加一条。`source=user`,不带 provenance |
+| POST | `/app/todos/{id}/status` | `{"status": "done"}` 或 `{"status": "cancelled"}` |
+
+返回的每一条都带 `device_ref` 与 `synced_at`。
+**App 必须把 `synced_at` 为空的日程显示成"未写入日历"** ——
+[ADR-020](04-tech-decisions.md#adr-020--待办与日程落在自己的-app企微退出主链路) 的
+"看得见的延迟可以接受,静默丢失不行"就落在这一个字段上。
+
+#### 为什么 App 的写操作不过治理层网关
+
+[铁律 4](../AGENTS.md#1-铁律) 说的是"**能力层的工具不许被编排层直接调用**"。
+App 里用户自己点的"新建 / 完成 / 撤销"不属于编排层 ——
+那是用户在自己的地盘上直接动自己的数据,和 `admin` CLI 写凭据是同一类动作。
+
+判据在 `todos.source` 这一列上,它本来就把两种来源分开了:
+
+| 来源 | 走哪 | 为什么 |
+| --- | --- | --- |
+| `source=agent` | **必须过网关** | `tool_calls` 里那条带 `rollback_info` 的记录,是"这条待办哪来的、怎么撤"唯一的答案 |
+| `source=user` | 直接调仓储 | 用户知道自己点了什么,回滚就是再点一下。为它伪造一个 agent 名字,只会让审计表里多出一个查不到契约的调用方 |
+
+**唯一的例外是确认待确认队列**(§6.7):那条内容是 agent 提出来的,
+只是由用户点头,所以它照旧过网关,`agent` 记的是当初把它排进队列的那个。
+
+### 6.7 待确认队列 `/app/pending`
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/app/pending?limit=50` | 还没处理、还没过期的 |
+| POST | `/app/pending/{id}/resolve` | `{"action": "confirm"}` 或 `{"action": "reject"}`,confirm 可带 `payload` |
+
+返回体里给的是 `payload` 原样,**不是渲染好的文本**([§2.7](#27-pending_confirmations--统一待确认队列)
+那句"人看的那份由展示层从它渲染")。同时给 `target_table`:
+
+> **App 遇到不认识的 `target_table` 只展示,不给确认按钮。**
+> P1 只有 `todos` 一种,P2 的 `transactions` 进来时,旧版本 App 会把它列出来
+> 但不让点 —— 这样服务端加一类待确认不必等 App 发版,而没发版的 App
+> 也不会拿错误的形状去确认。
+
+`action=confirm` 带 `payload` 就是"修改后确认"(`edited`),不带就是原样确认。
+两条硬规则:
+
+1. **写入目标表与更新 `status` 在同一个事务里**,由 `pending.confirm(writer=…)`
+   保证(§2.7 那条硬要求)。写入失败就整个事务回滚,那条仍然是 `pending`,
+   不会出现"确认了但没写进去"
+2. **客户端只能改人看得懂的那几项**:`title` / `notes` / `starts_at` / `ends_at`。
+   `provenance` 与 `created_by_agent` 一律沿用队列里那份 ——
+   出处不由客户端说了算(铁律 5)
+
+### 6.8 日历回报 `/app/calendar`
+
+这是 ADR-020 里"**副作用发生在服务端之外**"那件事的接口面。
+
+`GET /app/calendar/queue` 返回两个列表,一个都不能少:
+
+```json
+{
+  "to_create": [{"todo_id": "…", "title": "…", "starts_at": "…", "ends_at": null, "notes": null}],
+  "to_delete": [{"todo_id": "…", "device_ref": "…"}]
+}
+```
+
+| 列表 | 取自 | 设备该做什么 |
+| --- | --- | --- |
+| `to_create` | `kind=schedule` 且 `status=open` 且 `synced_at IS NULL` | 写 `CalendarContract`,回报 event id |
+| `to_delete` | `status=cancelled` 且 `device_ref IS NOT NULL` | 删掉那条日历事件,回报删完了 |
+
+**`status=done` 的不进 `to_delete`。** 一场已经开完的会该留在日历里 ——
+删掉它等于篡改历史,而用户看日历正是为了回想"那天我干了什么"。
+
+`POST /app/calendar/report`:
+
+```json
+{ "todo_id": "…", "action": "created", "device_ref": "系统日历的 event id" }
+```
+
+- `action=created` 就 `mark_synced`,`device_ref` 落库。**那个 id 就是 L2 的回滚信息**
+- `action=deleted` 就清空 `device_ref` 与 `synced_at`。清空之后这条自然掉出
+  `to_delete`,不会被反复要求删除。审计里那条 `rollback_info` 仍然留着 event id,
+  所以"设备上曾经有过一条"查得出来
+
+**幂等责任在设备端**:服务端只记最后一次回报,同一条 todo 写两次日历会留下
+两条事件而服务端只知道后一条。App 端以 `todo_id` 为主键记住自己写过什么,
+**先查本地再写日历**。
+
+### 6.9 采集器状态与白名单 `/app/collector`
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/app/collector/status` | 每台设备的心跳 + 当前白名单 |
+| POST | `/app/collector/whitelist` | 加一条来源 |
+| POST | `/app/collector/whitelist/{id}/enabled` | `{"enabled": false}` 停用 |
+
+**没有删除。** 停用即不放行,而留着那一行能回答"曾经放行过谁" ——
+排查 [R10](05-risks.md#r10--手机端采集器的越权读取) 那类问题时,那是唯一的线索。
+
+白名单在**查询端**读写,不在采集端 —— 采集端只能写。
+App 打开时把它同步到本地,采集器按本地那份过滤;
+**服务端入库前照样再过一次**,两道是独立的(架构 §8.3)。
+
+### 6.10 状态码约定
+
+| 码 | 什么时候 | 注意 |
+| --- | --- | --- |
+| 200 | 处理完了(**哪怕全被丢弃**) | 丢弃的条数在响应体里,不用状态码表达 |
+| 401 | 签名或 token 不过 | **不带任何原因**,响应体是空的 |
+| 404 | 那条 todo / pending 不属于这个用户,或不存在 | 两者不区分 —— 区分等于告诉对方"这个 id 存在" |
+| 409 | 待确认那条已经被处理过或已过期 | 两个入口同时点确认是正常的用户行为,不是错误 |
+| 422 | 请求体形状不对 | FastAPI 默认行为,只对已经通过认证的请求发生 |
+
+### 6.11 这份契约还缺什么
+
+诚实记录,不要假装完备:
+
+- **账本、报表、预算、待确认里的账目** —— P2,那时 `/app` 下加一组路由
+- **记忆与实体浏览**(查看、否定、纠正 `facts`)—— P1 范围内,
+  但不在第 10 / 11 片里,服务端与 App 一起补
+- **审批卡片的回调** —— P3,走企微不走 App(ADR-001)
+- **评测集格式**(agent 契约第 5 项)—— 仍然欠着
