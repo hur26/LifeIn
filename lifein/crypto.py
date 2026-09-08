@@ -28,7 +28,9 @@ import struct
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from lifein import keys
 from lifein.config import Settings
+from lifein.keys import KeyProvider, KeyUnavailable
 
 _MAGIC = b"LI"
 _FORMAT_VERSION = 1
@@ -41,11 +43,29 @@ class DecryptError(RuntimeError):
     """解密失败。密钥不对、密文被改、或信封格式不认识。"""
 
 
-def _key_bytes(b64: str) -> bytes:
-    raw = base64.b64decode(b64, validate=True)
-    if len(raw) != 32:
-        raise DecryptError("主密钥长度不是 32 字节")
-    return raw
+def _provider(settings: Settings) -> KeyProvider:
+    """密钥从哪来。**这个文件只认协议,不认 `.env`**(P4 第 4 片)。
+
+    换 KMS 那天改的是 `keys.for_settings()`,不是这里 ——
+    而这里是所有凭据加解密的唯一入口,是这个系统里最不该为了换个密钥来源
+    而被改动的地方。
+    """
+    return keys.for_settings(settings)
+
+
+
+def _key_for(provider: KeyProvider, version: int) -> bytes:
+    """取密钥,并把"拿不到"翻译成这一层的异常。
+
+    `KeyUnavailable` 说的是"密钥源出了问题",`DecryptError` 说的是
+    "这条密文处理不了" —— 对调用方来说是同一件事(这条凭据用不了),
+    所以在这里统一。**但原始异常挂在 `__cause__` 上**:
+    换成 KMS 之后,"网络不通"和"密钥被删了"要能分得开。
+    """
+    try:
+        return provider.key(version)
+    except KeyUnavailable as exc:
+        raise DecryptError(str(exc)) from exc
 
 
 def _aad(user_id: str, kind: str) -> bytes:
@@ -58,9 +78,11 @@ def encrypt(plaintext: str, *, user_id: str, kind: str, settings: Settings) -> b
 
     永远用**当前**主密钥加密。轮换时重新加密一遍存量,不会出现新数据用旧钥匙。
     """
-    key = _key_bytes(settings.master_key.get_secret_value())
+    provider = _provider(settings)
+    version = provider.current_version
+    key = _key_for(provider, version)
     nonce = os.urandom(_NONCE_LEN)
-    header = _HEADER.pack(_MAGIC, _FORMAT_VERSION, settings.master_key_version)
+    header = _HEADER.pack(_MAGIC, _FORMAT_VERSION, version)
     blob = AESGCM(key).encrypt(nonce, plaintext.encode(), _aad(user_id, kind))
     return header + nonce + blob
 
@@ -84,21 +106,12 @@ def decrypt(ciphertext: bytes, *, user_id: str, kind: str, settings: Settings) -
     没配旧密钥就直接报错 —— 说明轮换做了一半,这种情况必须让人看见,不能静默失败。
     """
     key_version = key_version_of(ciphertext)
-    if key_version == settings.master_key_version:
-        key_b64 = settings.master_key.get_secret_value()
-    elif settings.master_key_previous is not None:
-        key_b64 = settings.master_key_previous.get_secret_value()
-    else:
-        raise DecryptError(
-            f"这条密文用的是主密钥版本 {key_version},当前版本 "
-            f"{settings.master_key_version},且未配置 MASTER_KEY_PREVIOUS —— "
-            "轮换做了一半,见 docs/07-config.md §2.2"
-        )
+    key = _key_for(_provider(settings), key_version)
 
     nonce = ciphertext[_HEADER_LEN : _HEADER_LEN + _NONCE_LEN]
     body = ciphertext[_HEADER_LEN + _NONCE_LEN :]
     try:
-        return AESGCM(_key_bytes(key_b64)).decrypt(nonce, body, _aad(user_id, kind)).decode()
+        return AESGCM(key).decrypt(nonce, body, _aad(user_id, kind)).decode()
     except InvalidTag as exc:
         # 不把底层异常直接抛出去:它的措辞会让人以为是数据损坏,
         # 而最常见的原因其实是 user_id/kind 对不上,或者换了密钥没重加密。
