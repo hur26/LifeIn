@@ -15,7 +15,7 @@
     python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
-    python -m lifein.admin issue-device --user <uuid> --device-id pixel-7a
+    python -m lifein.admin issue-device --user <uuid>   # 设备名不给就自动生成
     python -m lifein.admin revoke-device --user <uuid> --device-id pixel-7a  # 手机丢了
     python -m lifein.admin list-devices --user <uuid>
     python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm
@@ -30,6 +30,7 @@ import argparse
 import getpass
 import json
 import logging
+import secrets as secrets_module
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -451,6 +452,7 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
     """
     from lifein import qr as qr_render
 
+    device_id = args.device_id or _default_device_id()
     purposes = (
         [("collector", "ingest"), ("app_device", "query")]
         if args.purpose == "all"
@@ -464,7 +466,7 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
         "v": 1,
         "base_url": args.base_url,
         "user_id": args.user,
-        "device_id": args.device_id,
+        "device_id": device_id,
     }
 
     with session_scope() as session:
@@ -475,7 +477,7 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
         for kind, scope in purposes:
             # 先吊销这台设备同类的旧凭据:留着两把有效的,验签用哪把取决于
             # 排序,而"换了密钥但旧的还能用"是最难发现的一类问题
-            credentials.revoke_device(args.user, session, device_id=args.device_id, kind=kind)
+            credentials.revoke_device(args.user, session, device_id=device_id, kind=kind)
             secret = new_shared_secret()
             credentials.put_credential(
                 args.user,
@@ -484,21 +486,21 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
                 scope=scope,
                 payload={"secret": secret},
                 settings=settings,
-                device_id=args.device_id,
+                device_id=device_id,
             )
             provisioning["collector_secret" if scope == "ingest" else "query_secret"] = secret
 
     blob = json.dumps(provisioning, ensure_ascii=False, separators=(",", ":"))
-    print(f"\n已签发 {len(purposes)} 条设备凭据,device_id={args.device_id}")
+    print(f"\n已签发 {len(purposes)} 条设备凭据,device_id={device_id}")
     print("下面这串只显示这一次,配进 App 之后就把窗口关了:\n")
     print(blob)
 
-    qr_path = Path(f"device-{args.device_id}.html").resolve()
+    qr_path = Path(f"device-{device_id}.html").resolve()
     try:
         qr_render.write_qr_html(
             blob,
             qr_path,
-            title=f"配置 LifeIn 采集端 · {args.device_id}",
+            title=f"配置 LifeIn 采集端 · {device_id}",
             hint="在 App 的扫码配置页里扫它。密钥只显示这一次",
         )
         print(f"\n二维码:{qr_path}")
@@ -514,6 +516,18 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
             # 控制台是 GBK,画不出方块字符。上面的文件照样能扫
             print("(终端编码画不出字符版二维码,用上面的文件)")
     return 0
+
+
+def _default_device_id() -> str:
+    """没给名字就生成一个。
+
+    **人不该被迫现编一个设备名。** 它只在两个地方露面:吊销时你要指认哪一台,
+    以及状态页上那一行 —— 两处都只要求"能认出来",不要求好听。
+
+    P4 会把这件事整个挪走:那时 `device_id` 由 App 自己生成并在配码时上报
+    (03 的 P4 范围),因为朋友连服务器都不会碰,更不会给设备起名。
+    """
+    return "phone-" + secrets_module.token_hex(2)
 
 
 def cmd_revoke_device(args: argparse.Namespace) -> int:
@@ -782,7 +796,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     issue = sub.add_parser("issue-device", help="给一台手机签发采集/查询密钥(分开签发)")
     issue.add_argument("--user", required=True)
-    issue.add_argument("--device-id", required=True, help="自己起,比如 pixel-7a。吊销按它")
+    issue.add_argument(
+        "--device-id",
+        help="这台手机叫什么,吊销时按它指认。不给就自动生成一个(phone-xxxx)",
+    )
     issue.add_argument(
         "--purpose",
         choices=("all", "collect", "query"),
