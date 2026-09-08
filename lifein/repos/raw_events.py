@@ -50,6 +50,18 @@ _SELECT_BETWEEN = text("""
      LIMIT :limit
 """)
 
+_SELECT_TRANSACTIONS_BETWEEN = text("""
+    SELECT id, normalized, raw
+      FROM raw_events
+     WHERE user_id = :user_id
+       AND occurred_at >= :start
+       AND occurred_at < :end
+       AND normalized IS NOT NULL
+       AND normalized ->> 'kind' = 'transaction'
+     ORDER BY occurred_at DESC
+     LIMIT :limit
+""")
+
 _COUNT_FAILED = text("""
     SELECT count(*)
       FROM raw_events
@@ -191,6 +203,14 @@ class StoredEvent:
 
     event_id: int
     event: NormalizedEvent
+    raw: dict | None = None
+    """采集时留下的原始载荷。**只有交易那条链路会用到**,别的取法不填。
+
+    记账的第 4 层复核要拿 `raw["parsed"]["matched"]`(规则抠金额时匹配到的
+    那一小段原文)做逐字比对。不带它的话那一层在生产里是空转的:
+    交易正文按 R10 脱敏之后 `event.body` 是空的,比对无从下手,
+    而"没法比对"和"比对通过"在代码里长得一模一样。
+    """
 
 
 def fetch_stored_between(
@@ -212,6 +232,40 @@ def fetch_stored_between(
         try:
             stored.append(
                 StoredEvent(event_id=row.id, event=NormalizedEvent.model_validate(row.normalized))
+            )
+        except ValueError:
+            log.warning("raw_events.id=%s 的 normalized 结构已不合法,跳过", row.id)
+    return stored
+
+
+
+def fetch_transactions_between(
+    user_id: str,
+    session: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    limit: int = 500,
+) -> list[StoredEvent]:
+    """取一个时间窗内的**交易事件**,连原始载荷一起。记账 job 用它。
+
+    在 SQL 里就按 `kind = 'transaction'` 筛掉,而不是取回来再过滤:
+    一天的事件里交易只占很小一部分,把群消息也捞出来只是白白解析一遍 JSON。
+    """
+    rows = session.execute(
+        _SELECT_TRANSACTIONS_BETWEEN,
+        {"user_id": user_id, "start": start, "end": end, "limit": limit},
+    ).all()
+
+    stored: list[StoredEvent] = []
+    for row in rows:
+        try:
+            stored.append(
+                StoredEvent(
+                    event_id=row.id,
+                    event=NormalizedEvent.model_validate(row.normalized),
+                    raw=row.raw if isinstance(row.raw, dict) else None,
+                )
             )
         except ValueError:
             log.warning("raw_events.id=%s 的 normalized 结构已不合法,跳过", row.id)

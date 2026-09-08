@@ -329,21 +329,35 @@ def _review(
 def _amount_is_verbatim(stored: StoredEvent) -> bool:
     """**金额必须能在原文里逐字找到。**
 
-    正文已经被脱敏(R10)的那些没法比对 —— 那时认这一条通过:
-    金额本来就不是模型给的,它来自采集那一步的正则,而那一步的输入正是原文。
-    这条复核挡的是"归一化之后有人改过金额",不是"原文还在不在"。
+    比对的对象优先是 `raw["parsed"]["matched"]` —— 采集那一步用正则抠金额时
+    匹配到的那一小段原文。**不能只看 `event.body`**:交易正文按 R10 脱敏之后
+    body 是空的,那时"没法比对"和"比对通过"在代码里长得一模一样,
+    这一层就变成了空转,而空转的复核比没有复核更糟,因为它看起来在起作用。
+
+    两个都没有的时候才认这条通过:金额本来就不是模型给的,它来自采集那一步
+    的正则,而那一步的输入正是原文。这一层挡的是"归一化之后有人改过金额"。
     """
     event = stored.event
     if event.amount is None:
         return False
-    body = event.body
-    if not body:
+
+    haystack = _matched_text(stored) or event.body
+    if not haystack:
         return True
 
     value: Decimal = event.amount.value
     # 38.50 在原文里可能写成 38.5 或 38.50,两种都算逐字
     candidates = {f"{value}", f"{value:f}".rstrip("0").rstrip("."), f"{value:,}"}
-    return any(candidate and candidate in body for candidate in candidates)
+    return any(candidate and candidate in haystack for candidate in candidates)
+
+
+def _matched_text(stored: StoredEvent) -> str | None:
+    """采集时正则匹配到的那一小段。取不到就返回 None,不抛 —— 老数据没有这个字段。"""
+    parsed = (stored.raw or {}).get("parsed")
+    if not isinstance(parsed, dict):
+        return None
+    matched = parsed.get("matched")
+    return matched if isinstance(matched, str) and matched else None
 
 
 def _judgment_of(value: object) -> Judgment | None:

@@ -70,9 +70,11 @@ def an_event(
     body: str = "您尾号1234的卡9月8日20:15消费人民币38.50元",
     external_id: str = "pixel:t-1",
     direction: Direction = Direction.DEBIT,
+    matched: str | None = None,
 ) -> StoredEvent:
     return StoredEvent(
         event_id=event_id,
+        raw={"parsed": {"matched": matched}} if matched else None,
         event=NormalizedEvent(
             kind=EventKind.TRANSACTION,
             title="招商银行",
@@ -160,12 +162,28 @@ class TestTheFourthLayer:
         assert output.items[0].route is Route.PENDING
         assert output.items[0].reason == "check_failed"
 
-    def test_a_redacted_body_does_not_fail_the_check(self):
-        """正文按 R10 脱敏之后没法比对 —— 那时认这条通过。
+    def test_the_check_uses_the_text_the_regex_matched(self):
+        """**这条是生产里真正走的路。** 交易正文按 R10 脱敏之后 body 是空的,
+        只看 body 的话这一层永远返回"通过",变成一个看起来在起作用的空转。"""
+        event = an_event(body="", amount="99.00", matched="消费人民币38.50元")
+        output, _ = run(
+            [{"ref": "pixel:t-1", "judgment": "expense", "category": "餐饮", "confidence": 0.99}],
+            [event],
+        )
+        assert output.items[0].route is Route.PENDING
+        assert output.items[0].reason == "check_failed"
 
-        这条复核挡的是"归一化之后有人改过金额",不是"原文还在不在":
-        金额本来就来自采集那一步的正则,而那一步的输入正是原文。
-        """
+    def test_matching_the_regex_snippet_passes(self):
+        event = an_event(body="", matched="消费人民币38.50元")
+        output, _ = run(
+            [{"ref": "pixel:t-1", "judgment": "expense", "category": "餐饮", "confidence": 0.99}],
+            [event],
+        )
+        assert output.items[0].route is Route.DIRECT
+
+    def test_nothing_to_compare_against_is_not_a_failure(self):
+        """两个都没有(老数据)时认这条通过:金额本来就来自采集那一步的正则,
+        而那一步的输入正是原文。这一层挡的是归一化之后有人改过金额。"""
         event = an_event(body="")
         output, _ = run(
             [{"ref": "pixel:t-1", "judgment": "expense", "category": "餐饮", "confidence": 0.99}],
