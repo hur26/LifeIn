@@ -360,7 +360,7 @@ CREATE TABLE tool_calls (
     rollback_info     JSONB,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT l2_needs_rollback
-        CHECK (level <> 'L2' OR rollback_info IS NOT NULL)
+        CHECK (level <> 'L2' OR result_status <> 'allowed' OR rollback_info IS NOT NULL)
 );
 CREATE INDEX ON tool_calls (user_id, created_at DESC);
 ```
@@ -373,7 +373,14 @@ CREATE INDEX ON tool_calls (user_id, created_at DESC);
   "我到底把什么发给外部供应商了"是个能回答的问题
   ([R12](05-risks.md#r12--外部-llm-供应商侧的数据暴露))。
 
-`CHECK` 约束保证 L2 工具没有回滚信息就写不进审计表 —— 也就等于执行不了。
+`CHECK` 约束保证**放行了的** L2 工具没有回滚信息就写不进审计表 —— 也就等于执行不了。
+
+**为什么要带上 `result_status <> 'allowed'` 这一段**(改于 P1,见迁移 0006):
+不带的话,被拒和出错的 L2 调用同样写不进来 —— 它们本来就没有回滚信息可写。
+而写入被库拒之后 `record_tool_call` 按设计吞掉异常(审计失败不该让业务失败),
+结果是**审计里悄悄少了一整类记录**:谁都不知道有人试过一次 L2 并被拦下。
+网关第 5 道写的是"无论结果如何都记审计,包括被拒的",那句话对 L2 此前是空的。
+`error` 一档尤其要留:它意味着副作用可能已经发生却拿不到回滚信息。
 
 ### 2.10 其余表
 
@@ -535,6 +542,9 @@ CREATE TABLE todos (
     created_by_agent TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT todos_kind_known   CHECK (kind IN ('todo', 'schedule')),
+    CONSTRAINT todos_status_known CHECK (status IN ('open', 'done', 'cancelled')),
+    CONSTRAINT todos_source_known CHECK (source IN ('agent', 'user')),
     CONSTRAINT todos_schedule_needs_time
         CHECK (kind <> 'schedule' OR starts_at IS NOT NULL),
     CONSTRAINT todos_agent_needs_provenance

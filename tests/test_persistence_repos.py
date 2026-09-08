@@ -130,3 +130,80 @@ class TestPushLog:
             record_push(
                 user_id, pg_session, channel="wecom", mode="试试", card=card(), delivered=True
             )
+
+
+def test_denied_l2_call_is_still_audited(pg_session, user_id):
+    """被拒的 L2 调用也要留下痕迹。
+
+    旧约束要求所有 L2 审计都带回滚信息,而被拒的调用根本没执行、没有回滚
+    信息可写 —— 写入被库拒之后又被"审计失败不影响业务"那层吞掉,结果是
+    审计里悄悄少了一整类记录:谁都不知道有人试过一次 L2 并被拦下(迁移 0006)。
+    """
+    record_tool_call(
+        user_id,
+        pg_session,
+        ToolCallRecord(
+            user_id=user_id,
+            agent="planner",
+            tool_name="todo.create",
+            level=ToolLevel.L2,
+            args_digest={"title": {"type": "str", "len": 3}},
+            result_status="denied",
+        ),
+    )
+
+    row = pg_session.execute(
+        text("""
+            SELECT result_status, rollback_info FROM tool_calls
+             WHERE user_id = :u AND tool_name = 'todo.create' ORDER BY id DESC LIMIT 1
+        """),
+        {"u": user_id},
+    ).one()
+    assert row.result_status == "denied"
+    assert row.rollback_info is None
+
+
+def test_errored_l2_call_is_audited_even_without_rollback(pg_session, user_id):
+    # 这一档最要紧:副作用可能已经发生,却拿不到回滚信息 ——
+    # 以前它反而是唯一记不下来的一种
+    record_tool_call(
+        user_id,
+        pg_session,
+        ToolCallRecord(
+            user_id=user_id,
+            agent="planner",
+            tool_name="todo.create",
+            level=ToolLevel.L2,
+            args_digest={},
+            result_status="error",
+        ),
+    )
+    count = pg_session.execute(
+        text("SELECT count(*) FROM tool_calls WHERE user_id = :u AND result_status = 'error'"),
+        {"u": user_id},
+    ).scalar_one()
+    assert count == 1
+
+
+def test_allowed_l2_call_still_requires_rollback(pg_session, user_id):
+    """放行了的 L2 没有回滚信息,照样写不进去 —— 安全性一点没松。
+
+    写不进审计等于执行不了(06 §2.9)。
+    """
+    record_tool_call(
+        user_id,
+        pg_session,
+        ToolCallRecord(
+            user_id=user_id,
+            agent="planner",
+            tool_name="todo.create",
+            level=ToolLevel.L2,
+            args_digest={},
+            result_status="allowed",
+        ),
+    )
+    count = pg_session.execute(
+        text("SELECT count(*) FROM tool_calls WHERE user_id = :u AND result_status = 'allowed'"),
+        {"u": user_id},
+    ).scalar_one()
+    assert count == 0, "库层面拒掉了,而且没有把外层事务拖成 aborted"
