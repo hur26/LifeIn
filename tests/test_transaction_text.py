@@ -164,8 +164,10 @@ class TestIngestingATransaction:
         assert result.events == []
         assert result.dropped == {DropReason.NOT_A_TRANSACTION: 1}
 
-    def test_the_gate_is_still_shut_by_default(self):
-        """P2 第 12 片之前,交易类照旧被 purpose 闸门挡在外面。"""
+    def test_the_gate_is_open_since_the_twelfth_slice(self):
+        """P2 第 12 片之前这条是反的(交易类被 purpose 闸门挡在外面)。
+        **现在它是正的,而这个模块一个字都没改** —— 闸门只有一个开关,
+        改的是 `notification.OPEN_PURPOSES` 那一行。"""
         adapter = NotificationAdapter(self.rules(), device_id=DEVICE)
         result = adapter.screen(
             {
@@ -181,8 +183,9 @@ class TestIngestingATransaction:
                 ]
             }
         )
-        assert result.events == []
-        assert result.dropped == {DropReason.PHASE_NOT_OPEN: 1}
+        assert result.dropped == {}
+        (event,) = result.events
+        assert event.normalized.amount.value == Decimal("38.50")
 
     def test_a_verification_code_from_a_bank_is_still_dropped_first(self, monkeypatch):
         """铁律 11 排在交易解析前面 —— 银行的验证码短信里也有数字。"""

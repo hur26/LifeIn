@@ -11,6 +11,7 @@ from datetime import datetime
 
 from lifein.models.normalized import EventKind, Flag, Trust
 from lifein.repos.collector import MATCH_PACKAGE, MATCH_SMS_SENDER, WhitelistRule
+from lifein.sources import notification
 from lifein.sources.notification import DropReason, NotificationAdapter
 from lifein.sources.verification_code import looks_like_verification_code
 
@@ -90,10 +91,32 @@ def test_disabled_rule_stops_letting_things_through():
     assert result.dropped == {DropReason.NOT_WHITELISTED: 1}
 
 
-def test_transaction_purpose_is_not_open_in_p1():
-    """白名单可以提前配好,记账链路 P2 才打开(产品定义 §6)。"""
-    result = screen([item(source_app="com.eg.android.AlipayGphone")],
-                    rules=[rule("com.eg.android.AlipayGphone", purpose="transaction")])
+def test_the_transaction_gate_is_open_since_p2():
+    """P2 第 12 片打开的那一行。**它排在那一期倒数第三片是刻意的** ——
+    闸门一开真钱的数据就开始流进来,那之后再出的错发生在真实账本上,
+    所以四层防误判、两阶段入账、覆盖率巡检全部先建好了才动它。"""
+    result = screen(
+        [item(source_app="com.eg.android.AlipayGphone", text="消费人民币38.50元")],
+        rules=[rule("com.eg.android.AlipayGphone", purpose="transaction")],
+    )
+
+    assert result.dropped == {}
+    (event,) = result.events
+    assert event.normalized.kind is EventKind.TRANSACTION
+
+
+def test_closing_the_gate_again_is_safe(monkeypatch):
+    """03 的退出条件写着"出现错记 → 停下来补防误判层",而"停下来"的动作
+    就是把 `PURPOSE_TRANSACTION` 从 `OPEN_PURPOSES` 里去掉。
+
+    **去掉之后交易类退回 phase_not_open,已经入账的一笔都不动** ——
+    这条钉住的是"关得掉",而不是"关了会怎样"。
+    """
+    monkeypatch.setattr(notification, "OPEN_PURPOSES", frozenset({"message"}))
+    result = screen(
+        [item(source_app="com.eg.android.AlipayGphone", text="消费人民币38.50元")],
+        rules=[rule("com.eg.android.AlipayGphone", purpose="transaction")],
+    )
 
     assert result.events == []
     assert result.dropped == {DropReason.PHASE_NOT_OPEN: 1}
@@ -168,3 +191,42 @@ class TestVerificationCodePattern:
 
     def test_none_and_empty_are_safe(self):
         assert not looks_like_verification_code(None, "")
+
+
+class TestTheP2Presets:
+    """P2 建议放行的那些来源。**它们只是建议,加了才生效** —— 默认拒绝不变。"""
+
+    def test_bank_numbers_are_prefixes(self):
+        """**95555 是主号,银行实际发短信用的是 955550、9555501……**
+        全等匹配会漏掉绝大多数,而这种漏是静默的。"""
+        from lifein.repos.collector import MATCH_SMS_SENDER
+        from lifein.sources import bank_sources
+
+        assert all(item.match_type == MATCH_SMS_SENDER for item in bank_sources.BANK_SMS)
+        result = screen(
+            [item(sender="9555501", text="消费人民币38.50元", source_app=None)],
+            rules=[rule("95555", match_type=MATCH_SMS_SENDER, purpose="transaction")],
+        )
+        assert len(result.events) == 1
+
+    def test_package_names_are_exact(self):
+        """包名是精确的。前缀会误伤 —— `com.icbc` 会连上 `com.icbcxxx`,
+        而那可能是别人的应用。"""
+        from lifein.repos.collector import MATCH_PACKAGE
+        from lifein.sources import bank_sources
+
+        assert all(item.match_type == MATCH_PACKAGE for item in bank_sources.PAYMENT_APPS)
+
+    def test_every_preset_is_a_transaction_source(self):
+        from lifein.repos.collector import PURPOSE_TRANSACTION
+        from lifein.sources import bank_sources
+
+        assert all(item.purpose == PURPOSE_TRANSACTION for item in bank_sources.ALL)
+        assert all(item.phase == "P2" for item in bank_sources.ALL)
+
+    def test_presets_are_findable_by_name_or_number(self):
+        from lifein.sources import bank_sources
+
+        assert [i.pattern for i in bank_sources.by_label("招商")] == ["95555", "cmb.pb"]
+        assert [i.label for i in bank_sources.by_label("95533")] == ["建设银行"]
+        assert bank_sources.by_label("没有这家") == []

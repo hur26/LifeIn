@@ -56,9 +56,19 @@ SOURCE = "notification"
 CHANNEL_NOTIFICATION = "notification"
 CHANNEL_SMS = "sms"
 
-OPEN_PURPOSES = frozenset({PURPOSE_MESSAGE})
-"""P1 放行的 purpose。加 `transaction` 是 P2 的动作,**改这一行就是打开记账链路** ——
-放在这里而不是散在判断里,是为了让那件事只有一个开关。"""
+OPEN_PURPOSES = frozenset({PURPOSE_MESSAGE, PURPOSE_TRANSACTION})
+"""放行的 purpose。**改这一行就是打开或关掉记账链路** ——
+放在这里而不是散在判断里,是为了让那件事只有一个开关。
+
+`transaction` 是 P2 第 12 片加进来的,而**它排在那一期的倒数第三片是刻意的**:
+闸门一开,真钱的数据就开始流进来,那之后再出的错发生在真实账本上。
+所以四层防误判(白名单 → 5 分钟去重 → LLM 判定 → 代码复核)、
+两阶段入账、覆盖率巡检全部先建好了,这一行才动。
+
+**关掉它是安全的**:去掉 `PURPOSE_TRANSACTION`,交易类通知会退回
+`phase_not_open`,已经入账的一笔都不动。03 的退出条件写着
+"出现错记 → 停下来补防误判层",这一行就是"停下来"的那个动作。
+"""
 
 _AGGREGATED = re.compile(r"^\s*\[\s*\d+\s*条\s*\]")
 """系统把多条折叠成"[3 条] 张三: ……"。归一化留不下被折叠掉的那些,

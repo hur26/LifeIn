@@ -19,6 +19,8 @@
     python -m lifein.admin revoke-device --user <uuid> --device-id pixel-7a  # 手机丢了
     python -m lifein.admin list-devices --user <uuid>
     python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm
+    python -m lifein.admin list-presets                 # P2 建议放行哪些来源
+    python -m lifein.admin allow-source --user <uuid> --preset 招商   # 一次加一组
     python -m lifein.admin list-sources --user <uuid>   # 白名单 + 采集器心跳
     python -m lifein.admin rules --user <uuid> --detail # 影子期数据,判断误报率
     python -m lifein.admin rule-mode --user <uuid> --rule upcoming_schedule --mode active
@@ -565,24 +567,65 @@ def cmd_allow_source(args: argparse.Namespace) -> int:
     **默认拒绝**,所以新装的采集器在这条跑之前一个字都送不进来。
     P1 只该放行微信;银行与支付类是 P2 的事,提前加了也会被 purpose 闸门挡住。
     """
-    match_type = collector.MATCH_PACKAGE if args.package else collector.MATCH_SMS_SENDER
-    pattern = args.package or args.sms_sender
+    from lifein.sources import bank_sources
+
+    if args.preset:
+        wanted = bank_sources.by_label(args.preset)
+        if not wanted:
+            print(f"没有叫 {args.preset} 的预设。看看有哪些:list-presets", file=sys.stderr)
+            return 1
+    else:
+        match_type = collector.MATCH_PACKAGE if args.package else collector.MATCH_SMS_SENDER
+        wanted = [
+            bank_sources.Suggested(
+                match_type=match_type,
+                pattern=args.package or args.sms_sender,
+                label="",
+                purpose=args.purpose,
+                phase=args.phase,
+            )
+        ]
 
     with session_scope() as session:
         if users.get_user(args.user, session) is None:
             print(f"用户不存在:{args.user}", file=sys.stderr)
             return 1
-        rule = collector.add_whitelist(
-            args.user,
-            session,
-            match_type=match_type,
-            pattern=pattern,
-            purpose=args.purpose,
-            phase=args.phase,
-        )
-    print(f"已放行 {rule.match_type}={rule.pattern}(purpose={rule.purpose}, {rule.phase})")
-    if rule.purpose == collector.PURPOSE_TRANSACTION:
-        print("注意:P1 不放行 transaction,这条要等记账链路打开才生效")
+        added = [
+            collector.add_whitelist(
+                args.user,
+                session,
+                match_type=item.match_type,
+                pattern=item.pattern,
+                purpose=item.purpose,
+                phase=item.phase,
+            )
+            for item in wanted
+        ]
+
+    for rule in added:
+        print(f"已放行 {rule.match_type}={rule.pattern}(purpose={rule.purpose}, {rule.phase})")
+    if any(rule.purpose == collector.PURPOSE_TRANSACTION for rule in added):
+        # 闸门在 P2 第 12 片打开了,所以这条现在真的会入账 —— 说清楚
+        print()
+        print("这些会直接进记账链路。四层防误判都在,但**第一周盯一下待确认队列**:")
+        print("  admin budgets --user <uuid>     看有没有被记成支出的还款")
+        print("  出现错记就把 notification.OPEN_PURPOSES 里的 transaction 去掉(03 的退出条件)")
+    return 0
+
+
+def cmd_list_presets(_args: argparse.Namespace) -> int:
+    """列出 P2 建议放行的来源。**只是建议,加了才生效**(默认拒绝不变)。"""
+    from lifein.sources import bank_sources
+
+    print("银行短信(号段前缀匹配):")
+    for item in bank_sources.BANK_SMS:
+        print(f"  {item.pattern:<8} {item.label}")
+    print()
+    print("支付与银行 App(包名全等匹配):")
+    for item in bank_sources.PAYMENT_APPS:
+        print(f"  {item.pattern:<32} {item.label}")
+    print()
+    print("加一条:allow-source --user <uuid> --preset 招商")
     return 0
 
 
@@ -1012,14 +1055,21 @@ def build_parser() -> argparse.ArgumentParser:
     source = allow.add_mutually_exclusive_group(required=True)
     source.add_argument("--package", help="安卓包名,全等匹配,如 com.tencent.mm")
     source.add_argument("--sms-sender", help="短信发件号,前缀匹配(号段)")
+    source.add_argument(
+        "--preset",
+        help="按名字加一组预设,如 招商 / 支付宝。看有哪些:list-presets",
+    )
     allow.add_argument(
         "--purpose",
         choices=(collector.PURPOSE_MESSAGE, collector.PURPOSE_TRANSACTION),
         default=collector.PURPOSE_MESSAGE,
-        help="P1 只有 message 会被放行",
+        help="transaction 从 P2 第 12 片起真的会入账",
     )
     allow.add_argument("--phase", default="P1")
     allow.set_defaults(func=cmd_allow_source)
+
+    presets = sub.add_parser("list-presets", help="看 P2 建议放行哪些来源(只是建议)")
+    presets.set_defaults(func=cmd_list_presets)
 
     sources = sub.add_parser("list-sources", help="看白名单与采集器心跳")
     sources.add_argument("--user", required=True)
