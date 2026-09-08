@@ -29,5 +29,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!--
+          通知监听。系统绑定它,被杀了系统会重新绑 —— 所以不给它加前台服务
+          (ADR-021)。真掉线了靠服务端的心跳告警发现,一小时内(P1 验收标准)。
+        -->
+        <service
+            android:name=".collect.NotificationCollector"
+            android:exported="false"
+            android:label="@string/collector_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
