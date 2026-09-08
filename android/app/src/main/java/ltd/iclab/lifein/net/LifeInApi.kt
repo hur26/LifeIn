@@ -1,6 +1,7 @@
 package ltd.iclab.lifein.net
 
 import java.io.IOException
+import java.time.OffsetDateTime
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.json.Json
 import ltd.iclab.lifein.data.Enrollment
@@ -54,7 +55,94 @@ class LifeInApi(
         return json.decodeFromString(TokenResponse.serializer(), text)
     }
 
+    // ---------- 查询端:带 token ----------
+
+    fun todos(): TodosResponse =
+        authed { json.decodeFromString(TodosResponse.serializer(), bearerGet(PATH_TODOS, it)) }
+
+    fun createTodo(body: NewTodoBody): TodoDto = authed {
+        val text = bearerPost(PATH_TODOS, it, json.encodeToString(NewTodoBody.serializer(), body))
+        json.decodeFromString(TodoDto.serializer(), text)
+    }
+
+    fun setTodoStatus(todoId: String, status: String) = authed {
+        bearerPost(
+            "$PATH_TODOS/$todoId/status",
+            it,
+            json.encodeToString(StatusBody.serializer(), StatusBody(status)),
+        )
+    }
+
+    fun pending(): PendingResponse =
+        authed { json.decodeFromString(PendingResponse.serializer(), bearerGet(PATH_PENDING, it)) }
+
+    fun resolvePending(id: Long, body: ResolveBody) = authed {
+        bearerPost(
+            "$PATH_PENDING/$id/resolve",
+            it,
+            json.encodeToString(ResolveBody.serializer(), body),
+        )
+    }
+
+    fun calendarQueue(): CalendarQueue =
+        authed { json.decodeFromString(CalendarQueue.serializer(), bearerGet(PATH_CAL_QUEUE, it)) }
+
+    fun reportCalendar(body: CalendarReportBody) = authed {
+        bearerPost(
+            PATH_CAL_REPORT,
+            it,
+            json.encodeToString(CalendarReportBody.serializer(), body),
+        )
+    }
+
+    fun collectorStatus(): CollectorStatus =
+        authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
+
     // ---------- 内部 ----------
+
+    /**
+     * 带着 token 跑一次,401 就换一把再跑一次 —— **只重试一次**。
+     *
+     * 换完还是 401,说明这台设备的凭据被吊销了(R11 要的单点吊销),
+     * 那时候再试第三次只是浪费电。
+     *
+     * token 只放在内存里:进程重启就重新换一把,代价是一次签名请求,
+     * 换掉的是"又多一处静态存放的凭据"。手机丢了以后,拖走那个进程的内存
+     * 比拖走一个文件难得多。
+     */
+    private fun <T> authed(block: (String) -> T): T {
+        val token = currentToken()
+        return try {
+            block(token)
+        } catch (e: HttpError) {
+            if (!e.isAuth) throw e
+            synchronized(this) { cached = null }
+            block(currentToken())
+        }
+    }
+
+    private fun currentToken(): String {
+        synchronized(this) {
+            cached?.let { (token, expiresAt) ->
+                // 提前五分钟换:正好在有效期边缘发出去的请求,到服务端时可能刚过期
+                if (expiresAt - System.currentTimeMillis() > RENEW_MARGIN_MS) return token
+            }
+        }
+        val issued = issueToken()
+        val expiresAt = runCatching {
+            OffsetDateTime.parse(issued.expiresAt).toInstant().toEpochMilli()
+        }.getOrElse {
+            // 服务端给的时间解不出来时,当它只活一个小时。宁可多换几次,
+            // 也不要拿一个永不过期的 token 一直撞 401
+            System.currentTimeMillis() + 3_600_000
+        }
+        synchronized(this) { cached = issued.token to expiresAt }
+        return issued.token
+    }
+
+    @Volatile
+    private var cached: Pair<String, Long>? = null
+
 
     private fun signedPost(path: String, body: String, secret: String): String {
         // 序列化一次、签一次、发同一份:签的必须是**实际发出去的那串字节**
@@ -111,6 +199,13 @@ class LifeInApi(
         const val PATH_INGEST = "/ingest/events"
         const val PATH_HEARTBEAT = "/ingest/heartbeat"
         const val PATH_TOKEN = "/app/token"
+        const val PATH_TODOS = "/app/todos"
+        const val PATH_PENDING = "/app/pending"
+        const val PATH_CAL_QUEUE = "/app/calendar/queue"
+        const val PATH_CAL_REPORT = "/app/calendar/report"
+        const val PATH_STATUS = "/app/collector/status"
+
+        private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 
         private val JSON = "application/json; charset=utf-8".toMediaType()
         internal val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }

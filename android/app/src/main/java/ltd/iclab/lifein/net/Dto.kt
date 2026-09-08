@@ -2,6 +2,9 @@ package ltd.iclab.lifein.net
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * 线上那几种形状 —— [06 §6](../../../../../../../docs/06-data-model.md#6-接口契约) 的可执行版本。
@@ -62,4 +65,117 @@ data class TokenRequest(@SerialName("device_id") val deviceId: String)
 data class TokenResponse(
     val token: String,
     @SerialName("expires_at") val expiresAt: String,
+)
+
+// ---------- 查询端(06 §6.6–§6.9) ----------
+
+@Serializable
+data class TodoDto(
+    val id: String,
+    val kind: String,
+    val title: String,
+    val notes: String? = null,
+    @SerialName("starts_at") val startsAt: String? = null,
+    @SerialName("ends_at") val endsAt: String? = null,
+    val status: String = "open",
+    val source: String = "agent",
+    @SerialName("created_by_agent") val createdByAgent: String? = null,
+    @SerialName("device_ref") val deviceRef: String? = null,
+    /** 空 = 还没写进系统日历。**这个字段必须在界面上看得见**(ADR-020)。 */
+    @SerialName("synced_at") val syncedAt: String? = null,
+) {
+    val isSchedule: Boolean get() = kind == "schedule"
+
+    /** 要写日历、但设备还没确认写进去。看得见的延迟可以接受,静默丢失不行。 */
+    val awaitingCalendar: Boolean get() = isSchedule && syncedAt.isNullOrBlank()
+}
+
+@Serializable
+data class TodosResponse(val until: String? = null, val todos: List<TodoDto> = emptyList())
+
+@Serializable
+data class NewTodoBody(
+    val title: String,
+    val notes: String? = null,
+    @SerialName("starts_at") val startsAt: String? = null,
+)
+
+@Serializable
+data class StatusBody(val status: String)
+
+@Serializable
+data class PendingDto(
+    val id: Long,
+    val agent: String,
+    val kind: String,
+    @SerialName("target_table") val targetTable: String,
+    val payload: Map<String, JsonElement> = emptyMap(),
+    val reason: String,
+    val confidence: Double? = null,
+    @SerialName("expires_at") val expiresAt: String? = null,
+) {
+    /**
+     * 认不认识这一类。**不认识的只展示,不给确认按钮**(06 §6.7)——
+     * P2 的账目进来时,这个版本的 App 会把它列出来但不让点,
+     * 而不是拿错误的形状去确认。
+     */
+    val isKnown: Boolean get() = targetTable == "todos"
+
+    val title: String
+        get() = (payload["title"] as? JsonPrimitive)?.content ?: "(没有标题)"
+
+    val startsAt: String?
+        get() = (payload["starts_at"] as? JsonPrimitive)?.contentOrNull
+}
+
+@Serializable
+data class PendingResponse(val pending: List<PendingDto> = emptyList())
+
+@Serializable
+data class ResolveBody(
+    val action: String,
+    /** 只放人看得懂的那几项。出处不由客户端说了算(铁律 5)。 */
+    val payload: Map<String, String>? = null,
+)
+
+@Serializable
+data class CalendarQueue(
+    @SerialName("to_create") val toCreate: List<CalendarCreate> = emptyList(),
+    @SerialName("to_delete") val toDelete: List<CalendarDelete> = emptyList(),
+)
+
+@Serializable
+data class CalendarCreate(
+    @SerialName("todo_id") val todoId: String,
+    val title: String,
+    val notes: String? = null,
+    @SerialName("starts_at") val startsAt: String? = null,
+    @SerialName("ends_at") val endsAt: String? = null,
+)
+
+@Serializable
+data class CalendarDelete(
+    @SerialName("todo_id") val todoId: String,
+    @SerialName("device_ref") val deviceRef: String,
+)
+
+@Serializable
+data class CalendarReportBody(
+    @SerialName("todo_id") val todoId: String,
+    val action: String,
+    @SerialName("device_ref") val deviceRef: String? = null,
+)
+
+@Serializable
+data class CollectorStatus(
+    val devices: List<DeviceStatus> = emptyList(),
+    val whitelist: List<ltd.iclab.lifein.collect.WhitelistRule> = emptyList(),
+)
+
+@Serializable
+data class DeviceStatus(
+    @SerialName("device_id") val deviceId: String,
+    @SerialName("last_seen_at") val lastSeenAt: String? = null,
+    @SerialName("listener_enabled") val listenerEnabled: Boolean = true,
+    val stale: Boolean = false,
 )
