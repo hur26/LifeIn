@@ -163,6 +163,17 @@ def _resolve_wecom_userid(user_id: str) -> str:
         return user.wecom_userid
 
 
+def build_own_identifiers(user_id: str, session: Session, services: Services) -> list[str]:
+    """这个用户"自己"是谁。记忆抽取拿它把用户本人排除在实体之外。
+
+    目前只有邮箱地址一项 —— 企微 userid 由记忆 job 自己从 `users` 里取,
+    那张表它本来就要读。凭据只在这个模块里被读,别处拿不到明文。
+    """
+    imap = credentials.get_credential(user_id, session, kind="imap", settings=services.settings)
+    username = (imap or {}).get("username", "")
+    return [username] if username else []
+
+
 def build_adapters(user_id: str, session: Session, services: Services) -> list[PullAdapter]:
     """建这个用户的数据源适配器。
 

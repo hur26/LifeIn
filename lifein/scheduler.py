@@ -23,9 +23,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
 
-from lifein.bootstrap import Services, build_adapters
+from lifein.bootstrap import Services, build_adapters, build_own_identifiers
 from lifein.db import session_scope
 from lifein.jobs.daily_digest import DigestDeps, run_once
+from lifein.jobs.memory_extract import MemoryDeps
+from lifein.jobs.memory_extract import run_once as run_memory_once
 from lifein.repos import users
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -33,6 +35,17 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 log = logging.getLogger(__name__)
 
 DIGEST_JOB_ID = "daily_digest"
+MEMORY_JOB_ID = "memory_extract"
+
+MEMORY_DELAY_MINUTES = 30
+"""记忆抽取排在摘要之后多久。
+
+**必须在后面。** 当天的事件是摘要那一步采进来的,记忆抽取只读 `raw_events`;
+排在前面的话它永远看的是昨天,记忆会稳定地慢一天。
+
+半小时是给采集留的余量:邮箱慢一点、日历接口抖一下都还在这个窗口内。
+两个 job 各自认领自己的窗口,所以就算真的错开了,下一次也会补上。
+"""
 
 
 def run_digest_for_all_users(
@@ -73,14 +86,55 @@ def run_digest_for_all_users(
     return pushed
 
 
+def run_memory_extract_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个未停用的用户抽一遍记忆。返回新写入的事实条数。
+
+    和摘要那个函数是一样的形状,连"一个人失败不影响别人"都一样 ——
+    区别只有一个:**抽取失败不告诉用户,只告警。** 记忆没更新当天没有任何
+    外部表现,不该为它打扰用户;但运维要知道,不然它能悄悄停一个月。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    written = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                deps = MemoryDeps(
+                    llm=services.llm,
+                    alerter=services.alerter,
+                    own_identifiers=build_own_identifiers(user_id, session, services),
+                )
+                results = run_memory_once(user_id, session, deps=deps, now=moment)
+            written += sum(r.facts_created for r in results)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的记忆抽取失败", user_id)
+            services.alerter.alert(
+                "记忆抽取异常", f"user={user_id}: {type(exc).__name__}: {exc}"
+            )
+
+    return written
+
+
 def build_scheduler(
     services: Services,
     *,
     runner: Callable[[Services], int] | None = None,
+    memory_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
+    run_memory = memory_runner or run_memory_extract_for_all_users
     hour, minute = services.settings.digest_hour_minute
+    memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
     scheduler.add_job(
@@ -95,4 +149,21 @@ def build_scheduler(
         # 错过一小时以内的照跑。超过一小时说明机器停了,那属于补偿的事
         misfire_grace_time=3600,
     )
+    scheduler.add_job(
+        lambda: run_memory(services),
+        trigger=CronTrigger(
+            hour=memory_hour, minute=memory_minute, timezone=services.settings.tzinfo
+        ),
+        id=MEMORY_JOB_ID,
+        name="记忆抽取",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
     return scheduler
+
+
+def _shift(hour: int, minute: int, minutes: int) -> tuple[int, int]:
+    """把时刻往后挪几分钟,跨过午夜也对。"""
+    total = (hour * 60 + minute + minutes) % (24 * 60)
+    return divmod(total, 60)

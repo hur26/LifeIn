@@ -21,7 +21,12 @@ from lifein.alerts import CollectingAlerter
 from lifein.bootstrap import Services
 from lifein.config import Settings
 from lifein.repos import users
-from lifein.scheduler import DIGEST_JOB_ID, build_scheduler, run_digest_for_all_users
+from lifein.scheduler import (
+    DIGEST_JOB_ID,
+    MEMORY_JOB_ID,
+    build_scheduler,
+    run_digest_for_all_users,
+)
 from tests.test_config import BASE
 
 pytestmark = pytest.mark.integration
@@ -60,6 +65,26 @@ class TestSchedulerShape:
         job = scheduler.get_job(DIGEST_JOB_ID)
         assert job.coalesce is True
         assert job.max_instances == 1
+
+    def test_memory_extract_runs_after_the_digest(self):
+        """记忆抽取必须排在摘要后面。
+
+        当天的事件是摘要那一步采进来的,记忆只读 raw_events ——
+        排在前面它永远看的是昨天,记忆会稳定地慢一天,而且没有任何表现。
+        """
+        scheduler = build_scheduler(
+            services(daily_digest_at="07:30"), runner=lambda _s: 0, memory_runner=lambda _s: 0
+        )
+        fields = {f.name: str(f) for f in scheduler.get_job(MEMORY_JOB_ID).trigger.fields}
+        assert (fields["hour"], fields["minute"]) == ("8", "0")
+
+    def test_memory_extract_wraps_past_midnight(self):
+        # 摘要设在 23:45 时,记忆抽取是第二天 0:15,不是 23:75
+        scheduler = build_scheduler(
+            services(daily_digest_at="23:45"), runner=lambda _s: 0, memory_runner=lambda _s: 0
+        )
+        fields = {f.name: str(f) for f in scheduler.get_job(MEMORY_JOB_ID).trigger.fields}
+        assert (fields["hour"], fields["minute"]) == ("0", "15")
 
     def test_scheduler_is_not_started_by_the_builder(self):
         # 由调用方决定什么时候起 —— 测试里不该有后台线程
