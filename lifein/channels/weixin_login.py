@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import io
 import logging
 import time
 from collections.abc import Callable
@@ -29,6 +28,7 @@ from pathlib import Path
 
 import httpx
 
+from lifein import qr as qr_render
 from lifein.channels.weixin import APP_ID, BASE_URL, CLIENT_VERSION
 
 log = logging.getLogger(__name__)
@@ -174,50 +174,19 @@ def _to_result(data: dict, *, fallback_base_url: str) -> LoginResult:
 
 
 def write_qr_html(qr: QrCode, path: Path) -> None:
-    """把二维码写成一个 HTML 文件,双击就能用浏览器打开扫。
+    """把登录二维码写成 HTML 文件。渲染本身在 `lifein.qr`,这里只管扫什么。
 
-    **这是 Windows 上唯一可靠的显示方式。** 终端字符画依赖控制台编码
-    (中文 Windows 默认 GBK,画二维码用的方块字符直接编不出来),
-    而生成文件不依赖任何终端能力。
-
-    用 SVG 而不是 PNG:PNG 要 Pillow,SVG 不用 —— 少一个依赖。
+    **扫 `value` 是没用的**,要扫的是 `url` —— 这个区别是本函数存在的全部理由,
+    别的调用方没有这层。
     """
-    import qrcode as qrcode_lib
-    import qrcode.image.svg as qrcode_svg
-
-    image = qrcode_lib.make(qr.url or qr.value, image_factory=qrcode_svg.SvgPathImage, border=2)
-    buffer = io.BytesIO()
-    image.save(buffer)
-    svg = buffer.getvalue().decode()
-
-    path.write_text(
-        "<!doctype html><meta charset='utf-8'>"
-        "<title>LifeIn · 微信登录</title>"
-        "<style>body{font-family:system-ui;text-align:center;padding:40px}"
-        "svg{width:320px;height:320px}"
-        "a{word-break:break-all;font-size:13px;color:#555}</style>"
-        "<h2>用微信扫这个二维码</h2>"
-        f"{svg}"
-        f"<p><a href='{qr.url or qr.value}'>{qr.url or qr.value}</a></p>"
-        "<p style='color:#888;font-size:13px'>扫完在手机上点确认，"
-        "然后在微信里给这个 bot 发一句话</p>",
-        encoding="utf-8",
+    qr_render.write_qr_html(
+        qr.url or qr.value,
+        path,
+        title="用微信扫这个二维码",
+        hint="扫完在手机上点确认，然后在微信里给这个 bot 发一句话",
     )
 
 
 def render_qr_ascii(qr: QrCode) -> str | None:
-    """把二维码渲染成终端能看的字符画。装不了依赖就返回 None,由调用方退回打链接。
-
-    服务器上没有浏览器,链接是打不开的 —— 所以这个能力对自托管不是锦上添花。
-    """
-    try:
-        import qrcode as qrcode_lib
-    except ImportError:
-        return None
-
-    code = qrcode_lib.QRCode(border=1)
-    code.add_data(qr.url or qr.value)
-    code.make(fit=True)
-    buffer = io.StringIO()
-    code.print_ascii(out=buffer, invert=True)
-    return buffer.getvalue()
+    """终端字符画版。装不了依赖就返回 None,由调用方退回打链接。"""
+    return qr_render.render_qr_ascii(qr.url or qr.value)
