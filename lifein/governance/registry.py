@@ -56,6 +56,13 @@ class ToolContext:
 
     user_id: str
     session: Session | None = None
+    channel: Any = None
+    """推送出口。**只有 L3 的代发消息用得上**,别的工具留 None。
+
+    工具自己不去装配通道,和"工具自己不开事务"是同一条理由:一个能自己决定
+    走哪条通道的工具,审计里记下的通道名就可能是假的 —— 而"这条消息从哪儿发的"
+    正是出事之后唯一要查的东西。
+    """
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,23 @@ class ToolSpec:
     returns_rollback: bool
     """执行后是否返回回滚信息。L2 必须为 True,见 06 §2.9 的 CHECK 约束。"""
 
+    preview: Callable[[Any], str] | None = None
+    """把这次调用的参数写成一句人话。**L3 必须有。**
+
+    `summary` 是静态的("代发一条消息"),而审批卡片上要看到的是
+    **这一次**要做什么("给老王发:明天三点见")。
+    [03 的退出条件](../../docs/03-roadmap.md#退出条件-2)写着
+    "你自己不敢点'同意' → 预览做得不够清楚" —— 把 `tool_args` 的 JSON 打上去
+    是能跑的,但那时你点同意是在赌,而不是在判断。
+    """
+
+    def preview_for(self, args: Any) -> str:
+        """这一次调用的人话。没有 `preview` 就退回 `summary`(只有 L1/L2 会走到)。"""
+        if self.preview is None:
+            return self.summary
+        text = self.preview(args).strip()
+        return text or self.summary
+
 
 _REGISTRY: dict[str, ToolSpec] = {}
 
@@ -86,6 +110,7 @@ def tool(
     args: type[BaseModel],
     summary: str,
     returns_rollback: bool = False,
+    preview: Callable[[Any], str] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """把一个函数注册成工具。
 
@@ -101,6 +126,13 @@ def tool(
             raise ToolError(f"{name} 是 L2,必须能返回回滚信息(returns_rollback=True)")
         if not summary.strip():
             raise ToolError(f"{name} 缺 summary。L3 审批卡片要拿它给人看")
+        if level is ToolLevel.L3 and preview is None:
+            # 和上面 L2 那条同一个道理:在导入期就炸,而不是等第一张审批卡片
+            # 发出去时才发现上面是一坨 JSON。**那时你会点同意,因为看不懂**
+            raise ToolError(
+                f"{name} 是 L3,必须给 preview —— 审批卡片上要写清这一次要做什么,"
+                "而不是这个工具一般是做什么的"
+            )
         _REGISTRY[name] = ToolSpec(
             name=name,
             level=level,
@@ -108,6 +140,7 @@ def tool(
             func=func,
             summary=summary,
             returns_rollback=returns_rollback,
+            preview=preview,
         )
         return func
 

@@ -64,6 +64,7 @@ def register_tools() -> None:
     )
     from lifein.tools import ledger as ledger_tools  # noqa: F401
     from lifein.tools import memory as memory_tools  # noqa: F401
+    from lifein.tools import message as message_tools  # noqa: F401
     from lifein.tools import todo as todo_tools  # noqa: F401
     from lifein.tools import transaction as transaction_tools  # noqa: F401
 

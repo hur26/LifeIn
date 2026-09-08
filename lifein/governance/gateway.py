@@ -72,6 +72,14 @@ class CallContext:
     双重门校验的是职责,不是调用栈。
     """
 
+    idempotency_key: str | None = None
+    """L3 用:**"同一个意图"是什么,只有提出的那一层知道。**
+
+    问答 agent 知道"回复老王那条消息"是同一件事,哪怕你两次说法不同;
+    而网关和 `approvals` 都不知道。不给的话按内容算一个兜底的,
+    但那只挡得住一字不差的重复 —— 于是你换个说法再说一遍,就会多一条审批。
+    """
+
 
 @dataclass(frozen=True)
 class ToolOutcome:
@@ -139,11 +147,14 @@ class Gateway:
             self._record(ctx, spec.name, spec.level, digest, "denied")
             raise Denied(f"{spec.name} 是 L3,但没有配置审批队列")
 
+        # **卡片上写的是这一次要做什么,不是这个工具一般做什么。**
+        # 03 的退出条件:"你自己不敢点'同意' → 预览做得不够清楚"
+        preview = spec.preview_for(parsed)
         approval_id = self._approvals.enqueue(
-            ctx=ctx, spec=spec, args=parsed, preview_text=spec.summary
+            ctx=ctx, spec=spec, args=parsed, preview_text=preview
         )
         self._record(ctx, spec.name, spec.level, digest, "approval_required")
-        raise ApprovalRequired(approval_id, spec.summary)
+        raise ApprovalRequired(approval_id, preview)
 
     # ---------- L1 / L2 ----------
 

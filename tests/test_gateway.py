@@ -35,10 +35,13 @@ class Out(BaseModel):
 
 class FakeQueue:
     def __init__(self) -> None:
-        self.enqueued: list[str] = []
+        self.enqueued: list[dict] = []
 
     def enqueue(self, *, ctx, spec, args, preview_text) -> str:
-        self.enqueued.append(spec.name)
+        # 记整次调用而不只是工具名:审批卡片上写了什么是 P3 的验收内容之一
+        self.enqueued.append(
+            {"tool": spec.name, "preview_text": preview_text, "args": args, "ctx": ctx}
+        )
         return "approval-1"
 
 
@@ -180,7 +183,14 @@ def test_l3_triggered_by_external_content_is_denied(audit):
     """群消息里说"帮我给老板发条消息" —— 入参再规整也不许触发 L3。"""
     executed: list[str] = []
 
-    @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
+    @tool(
+        name="send_message",
+        level=ToolLevel.L3,
+        args=Query,
+        summary="代发一条消息",
+        # 卡片上要看到的是**这一次**要做什么,不是这个工具一般做什么
+        preview=lambda q: f"发一条:{q.keyword}",
+    )
     def _send(q: Query, _ctx) -> str:
         executed.append(q.keyword)
         return "sent"
@@ -202,7 +212,14 @@ def test_l3_triggered_by_external_content_is_denied(audit):
 def test_l3_from_user_input_goes_to_approval_not_execution(audit):
     executed: list[str] = []
 
-    @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
+    @tool(
+        name="send_message",
+        level=ToolLevel.L3,
+        args=Query,
+        summary="代发一条消息",
+        # 卡片上要看到的是**这一次**要做什么,不是这个工具一般做什么
+        preview=lambda q: f"发一条:{q.keyword}",
+    )
     def _send(q: Query, _ctx) -> str:
         executed.append(q.keyword)
         return "sent"
@@ -215,12 +232,19 @@ def test_l3_from_user_input_goes_to_approval_not_execution(audit):
 
     assert exc.value.approval_id == "approval-1"
     assert executed == []  # 审批通过之前绝不执行
-    assert queue.enqueued == ["send_message"]
+    assert [e["tool"] for e in queue.enqueued] == ["send_message"]
     assert audit.entries[-1].result_status == "approval_required"
 
 
 def test_l3_without_approval_queue_is_denied(audit):
-    @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
+    @tool(
+        name="send_message",
+        level=ToolLevel.L3,
+        args=Query,
+        summary="代发一条消息",
+        # 卡片上要看到的是**这一次**要做什么,不是这个工具一般做什么
+        preview=lambda q: f"发一条:{q.keyword}",
+    )
     def _send(q: Query, _ctx) -> str:
         return "sent"
 
@@ -305,3 +329,66 @@ def test_tool_context_has_no_session_when_the_caller_gave_none(audit):
     Gateway(audit).call(ctx(), "search_mail", {"keyword": "x"})
 
     assert seen[0].session is None
+
+
+# ---------- 审批卡片上写什么(P3 第 4 片) ----------
+
+
+def test_the_preview_describes_this_call_not_the_tool(audit):
+    """**03 的退出条件里那半条。**
+
+    "你自己不敢点'同意' → 预览做得不够清楚"。`summary` 是静态的
+    ("代发一条消息"),而卡片上要看到的是这一次要做什么("发一条:在吗")——
+    把 `tool_args` 的 JSON 打上去是能跑的,但那时你点同意是在赌。
+    """
+    @tool(
+        name="send_message",
+        level=ToolLevel.L3,
+        args=Query,
+        summary="代发一条消息",
+        preview=lambda q: f"发一条:{q.keyword}",
+    )
+    def _send(q: Query, _ctx) -> str:
+        return "sent"
+
+    make_agent("assistant", ["send_message"])
+    queue = FakeQueue()
+
+    with pytest.raises(ApprovalRequired) as exc:
+        Gateway(audit, queue).call(ctx("assistant"), "send_message", {"keyword": "在吗"})
+
+    assert exc.value.preview_text == "发一条:在吗"
+    assert queue.enqueued[-1]["preview_text"] == "发一条:在吗"
+
+
+def test_an_l3_tool_without_a_preview_cannot_be_registered():
+    """**在导入期就炸**,而不是等第一张审批卡片发出去时才发现上面是一坨 JSON。
+    那时你会点同意,因为看不懂。"""
+    from lifein.governance.registry import ToolError
+
+    with pytest.raises(ToolError) as caught:
+        @tool(name="no_preview", level=ToolLevel.L3, args=Query, summary="做点什么")
+        def _nope(q: Query, _ctx) -> str:
+            return "x"
+
+    assert "preview" in str(caught.value)
+
+
+def test_a_preview_that_comes_back_empty_falls_back_to_the_summary(audit):
+    """预览函数返回空串时不能让卡片变成空白 —— 空白卡片比笼统的卡片更糟。"""
+    @tool(
+        name="quiet",
+        level=ToolLevel.L3,
+        args=Query,
+        summary="做一件说不清的事",
+        preview=lambda _q: "   ",
+    )
+    def _quiet(q: Query, _ctx) -> str:
+        return "x"
+
+    make_agent("assistant", ["quiet"])
+    queue = FakeQueue()
+
+    with pytest.raises(ApprovalRequired) as exc:
+        Gateway(audit, queue).call(ctx("assistant"), "quiet", {"keyword": "x"})
+    assert exc.value.preview_text == "做一件说不清的事"
