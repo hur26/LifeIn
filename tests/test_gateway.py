@@ -91,7 +91,7 @@ def test_unregistered_tool_is_denied_as_l3(audit):
 
 def test_tool_outside_agent_whitelist_is_denied(audit):
     @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
-    def _search(q: Query) -> str:
+    def _search(q: Query, _ctx) -> str:
         return "hit"
 
     make_agent("digest", [])  # 没把工具放进白名单
@@ -110,7 +110,7 @@ def test_bad_args_are_rejected_before_execution(audit):
     calls: list[str] = []
 
     @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
-    def _search(q: Query) -> str:
+    def _search(q: Query, _ctx) -> str:
         calls.append(q.keyword)
         return "hit"
 
@@ -126,7 +126,7 @@ def test_bad_args_are_rejected_before_execution(audit):
 
 def test_l1_executes_and_is_audited(audit):
     @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
-    def _search(q: Query) -> str:
+    def _search(q: Query, _ctx) -> str:
         return f"hit:{q.keyword}"
 
     make_agent("digest", ["search_mail"])
@@ -145,7 +145,7 @@ def test_l2_records_rollback_info(audit):
         summary="建待办",
         returns_rollback=True,
     )
-    def _add(q: Query) -> ToolOutcome:
+    def _add(q: Query, _ctx) -> ToolOutcome:
         return ToolOutcome(value="todo-1", rollback={"delete_todo_id": "todo-1"})
 
     make_agent("digest", ["add_todo"])
@@ -163,7 +163,7 @@ def test_l2_returning_bare_value_is_an_error(audit):
         summary="建待办",
         returns_rollback=True,
     )
-    def _add(q: Query) -> str:
+    def _add(q: Query, _ctx) -> str:
         return "todo-1"
 
     make_agent("digest", ["add_todo"])
@@ -181,7 +181,7 @@ def test_l3_triggered_by_external_content_is_denied(audit):
     executed: list[str] = []
 
     @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
-    def _send(q: Query) -> str:
+    def _send(q: Query, _ctx) -> str:
         executed.append(q.keyword)
         return "sent"
 
@@ -203,7 +203,7 @@ def test_l3_from_user_input_goes_to_approval_not_execution(audit):
     executed: list[str] = []
 
     @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
-    def _send(q: Query) -> str:
+    def _send(q: Query, _ctx) -> str:
         executed.append(q.keyword)
         return "sent"
 
@@ -221,7 +221,7 @@ def test_l3_from_user_input_goes_to_approval_not_execution(audit):
 
 def test_l3_without_approval_queue_is_denied(audit):
     @tool(name="send_message", level=ToolLevel.L3, args=Query, summary="代发一条消息")
-    def _send(q: Query) -> str:
+    def _send(q: Query, _ctx) -> str:
         return "sent"
 
     make_agent("assistant", ["send_message"])
@@ -237,7 +237,7 @@ def test_audit_records_shape_not_content(audit):
     """AGENTS.md §3:记入参摘要,不记原文。日志本身是数据集中点。"""
 
     @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
-    def _search(q: Query) -> str:
+    def _search(q: Query, _ctx) -> str:
         return "hit"
 
     make_agent("digest", ["search_mail"])
@@ -251,7 +251,7 @@ def test_audit_records_shape_not_content(audit):
 
 def test_failing_tool_is_still_audited(audit):
     @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
-    def _search(q: Query) -> str:
+    def _search(q: Query, _ctx) -> str:
         raise TimeoutError("IMAP 超时")
 
     make_agent("digest", ["search_mail"])
@@ -259,3 +259,49 @@ def test_failing_tool_is_still_audited(audit):
     with pytest.raises(TimeoutError):
         Gateway(audit).call(ctx(), "search_mail", {"keyword": "x"})
     assert audit.entries[-1].result_status == "error"
+
+
+# ---------- 工具执行上下文 ----------
+
+
+def test_tool_gets_the_callers_session_not_its_own(audit):
+    """工具拿到的是**调用方的事务**,不是它自己开的。
+
+    06 §2.7 要求"写入 target_table 与更新 pending_confirmations.status 在同一个
+    事务里"。工具自己 session_scope() 一下就永远做不到 —— 那是两个事务,
+    中间断电就得到"确认了但没写进去"。L1 只读的时候看不出区别,
+    等 L2 上线才发现就得把已有工具全改一遍。
+    """
+    seen = []
+    sentinel = object()
+
+    @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
+    def _search(q: Query, tool_ctx) -> str:
+        seen.append(tool_ctx)
+        return "hit"
+
+    make_agent("digest", ["search_mail"])
+    Gateway(audit).call(
+        CallContext(user_id=USER, agent="digest", trust=Trust.USER_INPUT, session=sentinel),
+        "search_mail",
+        {"keyword": "x"},
+    )
+
+    assert seen[0].session is sentinel
+    assert seen[0].user_id == USER  # 铁律 1:工具也不许自己去猜是谁的数据
+
+
+def test_tool_context_has_no_session_when_the_caller_gave_none(audit):
+    # 不碰库的工具照样收得到上下文,只是 session 是 None。
+    # 不做"有就传没有就不传"的分支:一个函数有两种调法就一定会有人按错的写
+    seen = []
+
+    @tool(name="search_mail", level=ToolLevel.L1, args=Query, summary="搜邮件")
+    def _search(q: Query, tool_ctx) -> str:
+        seen.append(tool_ctx)
+        return "hit"
+
+    make_agent("digest", ["search_mail"])
+    Gateway(audit).call(ctx(), "search_mail", {"keyword": "x"})
+
+    assert seen[0].session is None

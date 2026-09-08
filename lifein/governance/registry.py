@@ -16,6 +16,7 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 
 class ToolLevel(StrEnum):
@@ -40,6 +41,24 @@ class UnknownTool(ToolError):
 
 
 @dataclass(frozen=True)
+class ToolContext:
+    """一次工具执行的上下文。**每个工具都收它,用不用随意。**
+
+    `session` 由调用方给,**工具自己不许开事务**。这条不是风格问题:
+    06 §2.7 要求"写入 target_table 与更新 `pending_confirmations.status`
+    必须在同一个事务里",工具自己 `session_scope()` 一下就永远做不到 ——
+    那是两个事务,中间断电就得到"确认了但没写进去"或者"写了两次"。
+
+    P1 第一批工具是只读的 L1,其实用不上这条约束。但接口现在就定死,
+    等 L2 上线时才加参数,已有的工具全要回头改一遍
+    (P0 在 agent 契约上正是这么做的,收益已经验证过)。
+    """
+
+    user_id: str
+    session: Session | None = None
+
+
+@dataclass(frozen=True)
 class ToolSpec:
     name: str
     level: ToolLevel
@@ -47,6 +66,9 @@ class ToolSpec:
     """入参 schema。用 Pydantic 而不是裸 dict —— 校验失败要在调用前发生。"""
 
     func: Callable[..., Any]
+    """签名固定是 `(args, ctx: ToolContext)`。两个参数都给,不做"可选第二参数"
+    那种分支 —— 一个函数有两种调法,就一定会有人按错的那种写。"""
+
     summary: str
     """一句人话。L3 的审批卡片要拿它给用户看,JSON 不是给人读的。"""
 

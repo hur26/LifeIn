@@ -25,10 +25,17 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from lifein.agents.contract import get_agent
 from lifein.governance.audit import AuditSink, ToolCallRecord, digest_args
-from lifein.governance.registry import ToolLevel, ToolSpec, UnknownTool, get_tool
+from lifein.governance.registry import (
+    ToolContext,
+    ToolLevel,
+    ToolSpec,
+    UnknownTool,
+    get_tool,
+)
 from lifein.models.normalized import Trust
 
 
@@ -57,6 +64,13 @@ class CallContext:
     agent: str
     trust: Trust
     source_event_id: int | None = None
+    session: Session | None = None
+    """要碰库的工具用它。**调用方的事务,不是工具自己开的**(见 `ToolContext`)。
+
+    `agent` 说的是"这次调用代表哪个 agent",不是"谁写的这行代码"。
+    调度层替 agent 发起调用时照样填那个 agent 的名字 ——
+    双重门校验的是职责,不是调用栈。
+    """
 
 
 @dataclass(frozen=True)
@@ -136,7 +150,7 @@ class Gateway:
     def _execute(self, ctx: CallContext, spec: ToolSpec, parsed: Any, digest: dict) -> Any:
         started = time.perf_counter()
         try:
-            result = spec.func(parsed)
+            result = spec.func(parsed, ToolContext(user_id=ctx.user_id, session=ctx.session))
         except Exception:
             self._record(ctx, spec.name, spec.level, digest, "error", self._elapsed_ms(started))
             raise
