@@ -4,9 +4,17 @@
     <!--
       权限按需要一样一样加,不预留。**永远不会出现的是推送相关的那些** ——
       没有厂商推送 SDK,不接收推送(铁律 10 / ADR-014)。
-      也不会有相机:配码走粘贴,不做应用内扫码(ADR-021)。
     -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      相机只为**配码扫一次**(ADR-021 的 2026-09 改判)。
+      点"扫码"那一刻才申请;不给也配得上 —— 粘贴那条路一直留着。
+      这一点很要紧:一个"读你全部通知"的 App 要相机权限,
+      唯一说得过去的形态就是"你要用的时候才要,不用就不要"。
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!--
       日历要读也要写:写之前先查这条是不是已经写过(06 §6.8 那条"幂等责任

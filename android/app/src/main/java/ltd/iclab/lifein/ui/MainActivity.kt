@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -31,6 +33,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import ltd.iclab.lifein.LifeInApp
 import ltd.iclab.lifein.calendar.CalendarWriter
 import ltd.iclab.lifein.collect.CollectorState
@@ -155,6 +159,27 @@ private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
     var text by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
+    fun accept(raw: String) {
+        runCatching { Enrollment.parse(raw) }
+            .onSuccess {
+                LifeInApp.instance.secrets.save(it)
+                onEnrolled(it)
+            }
+            .onFailure { error = it.message ?: "配码不对" }
+    }
+
+    // 扫码结果直接进解析:扫出来的和粘进来的是同一串东西,
+    // 所以走同一条校验路径 —— 两条入口一套判断,不会出现"扫码能过、粘贴不过"
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val raw = result.contents
+        if (raw == null) {
+            // 用户按了返回,或者没给相机权限。不当错误 —— 粘贴那条路还在
+            error = null
+        } else {
+            accept(raw)
+        }
+    }
+
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -162,30 +187,48 @@ private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
         Text("配置采集端", style = MaterialTheme.typography.headlineSmall)
         Text(
             "在服务器上跑 python -m lifein.admin issue-device --user <你的 uuid> " +
-                "--device-id <这台手机>,把它打出来的那一串粘到下面。\n\n" +
-                "那串东西里有两把密钥,只显示一次。",
+                "--device-id <这台手机>,它会打出一串配码并生成一个二维码文件。\n\n" +
+                "扫那个二维码,或者把那串东西粘到下面。只显示一次。",
             style = MaterialTheme.typography.bodyMedium,
         )
+
+        Button(
+            onClick = {
+                error = null
+                scanner.launch(
+                    ScanOptions()
+                        .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                        .setPrompt("对准 issue-device 生成的那个二维码")
+                        .setBeepEnabled(false)
+                        // 竖屏锁死:配码是站着扫的,转屏只会让人手忙脚乱
+                        .setOrientationLocked(true)
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("扫码配置")
+        }
+        Text(
+            "相机权限点了才会要;不给也能用 —— 粘贴那条路一直在。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+
+        HorizontalDivider()
+
         OutlinedTextField(
             value = text,
             onValueChange = {
                 text = it
                 error = null
             },
-            label = { Text("配码") },
+            label = { Text("或者把配码粘在这里") },
             minLines = 4,
             modifier = Modifier.fillMaxWidth(),
         )
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         Button(
-            onClick = {
-                runCatching { Enrollment.parse(text) }
-                    .onSuccess {
-                        LifeInApp.instance.secrets.save(it)
-                        onEnrolled(it)
-                    }
-                    .onFailure { error = it.message ?: "配码不对" }
-            },
+            onClick = { accept(text) },
+            enabled = text.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("保存")

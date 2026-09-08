@@ -80,5 +80,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    // 配码扫码(ADR-021 的 2026-09 改判)。选它不选 ML Kit:后者的免捆绑版
+    // 依赖 Google Play 服务,而目标机型是国内主力机,那上面不一定有 ——
+    // 表现会是"扫码页打开就报错",且只在真机上出现
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
     testImplementation("junit:junit:4.13.2")
 }
