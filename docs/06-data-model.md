@@ -398,11 +398,14 @@ CREATE TABLE users (
 
 ```sql
 -- 推送日志:频率闸门与影子模式靠它计数
+-- channel 的取值要跟着通道一起加(迁移 0004 就是补 weixin)。
+-- 漏了的表现很坑:消息发出去了、记录写不进去、事务回滚、任务标成失败,
+-- 而下次重跑同一个窗口会再发一遍。
 CREATE TABLE push_log (
     id         BIGSERIAL PRIMARY KEY,
     user_id    UUID NOT NULL,
     rule_id    TEXT,
-    channel    TEXT NOT NULL CHECK (channel IN ('wecom','email')),
+    channel    TEXT NOT NULL CHECK (channel IN ('weixin','wecom','email')),
     mode       TEXT NOT NULL CHECK (mode IN ('shadow','active')),
     payload_digest JSONB NOT NULL,
     delivered  BOOLEAN NOT NULL DEFAULT false,
