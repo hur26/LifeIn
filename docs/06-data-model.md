@@ -466,6 +466,22 @@ CREATE TABLE job_runs (
 );
 CREATE INDEX ON job_runs (user_id, job_name, window_end DESC);
 
+-- 通道状态:入站通道自己要记住的一点东西
+-- 两个已知用途,都不属于"凭据"也不属于"业务数据":
+--   get_updates_buf      iLink 长轮询的游标。不存,进程重启会重放旧消息 ——
+--                        重放意味着重复回答、重复花钱
+--   context_token:<对方>  iLink 要求回复时原样带回对方最近一次的 context_token
+-- 刻意做成通用 KV 而不是给 iLink 开专表:下一个入站通道也会有类似的东西,
+-- 而这类状态丢了不会出事(重新同步即可),不值得各自建表。
+CREATE TABLE channel_state (
+    user_id    UUID NOT NULL,
+    channel    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, channel, key)
+);
+
 -- 采集器心跳:静默掉线是这条链路最可能的失效方式
 CREATE TABLE collector_heartbeat (
     user_id          UUID NOT NULL,
