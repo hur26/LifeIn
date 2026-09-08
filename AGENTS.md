@@ -13,7 +13,7 @@
 
 1. [`docs/01-product-spec.md`](docs/01-product-spec.md) — 边界与**明确不做什么**
 2. [`docs/03-roadmap.md`](docs/03-roadmap.md) — 当前在哪一期、本期范围、**退出条件**
-3. [`docs/04-tech-decisions.md`](docs/04-tech-decisions.md) — 16 条 ADR,重点看**被否决的方案**
+3. [`docs/04-tech-decisions.md`](docs/04-tech-decisions.md) — 19 条 ADR,重点看**被否决的方案**
 4. [`docs/05-risks.md`](docs/05-risks.md) — 12 条风险,重点看 R2 / R3 / R10 / R11 / R12
 5. [`docs/02-architecture.md`](docs/02-architecture.md) — 分层、数据模型、扩展点
 
