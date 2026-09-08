@@ -32,6 +32,7 @@
     python -m lifein.admin invite --user <uuid>          # 配码二维码(码是一次性的)
     python -m lifein.admin export --user <uuid> --out my-data.json   # 导出全部数据
     python -m lifein.admin purge-user --user <uuid>      # 彻底注销(要二次确认)
+    python -m lifein.admin check-user --user <uuid>      # 接一个朋友之前逐条对
 """
 
 from __future__ import annotations
@@ -1171,6 +1172,101 @@ def cmd_purge_user(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_user(args: argparse.Namespace) -> int:
+    """接一个朋友之前,逐条对一遍(P4 第 10 片)。
+
+    **这条命令替代的是"我记得都配好了"。** 03 的 P4 验收标准是
+    "一位朋友连续使用两周,无数据事故、无越权、无成本失控",
+    而那两周里最糟的开局是**某一样没配上,而他以为是产品不好用**。
+
+    每一条不通过都会说清楚**那样东西不在时他会看到什么** ——
+    因为"缺 X"对配置的人没有信息量,"他打不开 App"才有。
+    """
+    from lifein.repos import collector, credentials, data_control
+
+    settings = get_settings()
+    with session_scope() as session:
+        user = users.get_user(args.user, session)
+        if user is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+
+        devices = [d for d in credentials.list_device_credentials(args.user, session)
+                   if d.revoked_at is None]
+        rules = collector.list_whitelist(args.user, session)
+        beats = collector.list_heartbeats(args.user, session)
+        state = data_control.state(args.user, session)
+
+    kinds = {d.kind for d in devices}
+    checks = [
+        (
+            bool(user.wecom_userid),
+            "推送地址",
+            "没有 wecom_userid —— 他收不到任何主动消息(摘要、提醒、审批卡片)",
+        ),
+        (
+            "app_device" in kinds,
+            "查询密钥",
+            "没签发 —— 他的 App 打不开任何一页,看到的是一直转圈",
+        ),
+        (
+            "collector" in kinds,
+            "采集密钥",
+            "没签发 —— 通知采不上来,记账和群摘要整个不存在",
+        ),
+        (
+            bool(rules),
+            "采集白名单",
+            "一条都没有 —— 默认拒绝,所以采集器上报的东西全被丢掉,而它不会报错",
+        ),
+        (
+            bool(beats),
+            "采集器心跳",
+            "从来没上报过 —— App 装了但通知使用权多半没开(要他自己去系统设置里点)",
+        ),
+        (
+            settings.monthly_cost_cap_cny > 0,
+            "成本上限",
+            "没设 —— 主动扫描的开销随用户数线性增长,而那份账单是你付的",
+        ),
+        (
+            settings.notification_retention_days <= 7,
+            "通知保留期",
+            f"是 {settings.notification_retention_days} 天 —— R10 改判要求"
+            "朋友的群消息留得更短,因为群友是第三方",
+        ),
+    ]
+
+    print(f"{user.display_name}({args.user})")
+    print()
+    failed = 0
+    for ok, name, consequence in checks:
+        print(f"  {'✓' if ok else '✗'} {name}")
+        if not ok:
+            print(f"      {consequence}")
+            failed += 1
+
+    print()
+    print(f"采集状态:{'在采' if state.enabled else '没在采'}"
+          f"({state.active_devices} 台设备,{state.enabled_rules} 条规则)")
+    print()
+
+    # 这几条不是代码能查的,但**每次都要被念一遍** —— 它们是 03 的硬门槛
+    print("代码查不了、但一样是前提的几条(03 的 P4 门槛 + R10 改判):")
+    print("  □ 他读过并同意了 docs/09-privacy.md —— 尤其第 4 节那句")
+    print("     「白杨在技术上读得到你交给它的一切」")
+    print("  □ 他知道自己的群消息会被采到,而群友没有同意过")
+    print("  □ 备份恢复演练做过至少一次(scripts/restore-drill.md 那张表不是空的)")
+    print("  □ 他知道 App 里哪里能关掉采集、哪里能删数据")
+
+    if failed:
+        print()
+        print(f"上面有 {failed} 条没过。**先补齐再让他开始用** —— ")
+        print("那两周里最糟的开局是某一样没配上,而他以为是产品不好用。")
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1386,6 +1482,10 @@ def build_parser() -> argparse.ArgumentParser:
     purge = sub.add_parser("purge-user", help="彻底删掉一个用户的全部数据(不可撤销)")
     purge.add_argument("--user", required=True)
     purge.set_defaults(func=cmd_purge_user)
+
+    check_user = sub.add_parser("check-user", help="接一个朋友之前逐条对一遍")
+    check_user.add_argument("--user", required=True)
+    check_user.set_defaults(func=cmd_check_user)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)
