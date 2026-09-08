@@ -50,7 +50,9 @@ class Expectation:
     value: Any = None
 
     def describe(self) -> str:
-        return f"{self.path} {self.op} {self.value!r}" if self.op != ABSENT else f"{self.path} 应为空"
+        if self.op == ABSENT:
+            return f"{self.path} 应为空"
+        return f"{self.path} {self.op} {self.value!r}"
 
 
 @dataclass(frozen=True)

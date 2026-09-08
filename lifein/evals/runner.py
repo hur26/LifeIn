@@ -86,7 +86,9 @@ def run_agent(name: str, *, llm: LLMClient, cases: list[Case] | None = None) -> 
             payload = spec.inputs.model_validate(case.input)
         except Exception as exc:  # noqa: BLE001
             # 输入形状不对是评测集的 bug,不是 agent 的
-            raise EvalError(f"{name}/{case.id} 的 input 不符合 {spec.inputs.__name__}:{exc}") from exc
+            raise EvalError(
+                f"{name}/{case.id} 的 input 不符合 {spec.inputs.__name__}:{exc}"
+            ) from exc
 
         try:
             outcome = spec.handler(payload, llm=llm)

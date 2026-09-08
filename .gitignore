@@ -39,3 +39,7 @@ Thumbs.db
 # 登录时生成的二维码，不进仓库
 weixin-qr.html
 logs/
+
+# 评测集里是真实的邮件与群消息,和 R12 同级敏感。只有示例进库
+evals/*.jsonl
+!evals/*.example.jsonl

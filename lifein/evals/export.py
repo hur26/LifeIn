@@ -8,7 +8,7 @@
 那两句话在这个文件之前只是一句话。有了它,"永不删除"才真的换来了东西。
 
 **导出来的不能直接用。** 用户拒绝的原因不总是"agent 错了",也可能是
-"这事我自己记得" —— 后一种不该进负样本。所以这里只产出候选,
+                    "确认它当初不该被提出来再合并进来 —— 也可能只是你自己记得这事"
 合并进 `evals/` 之前要人看一遍(命令会把这句话再说一遍)。
 """
 
@@ -21,7 +21,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from lifein.evals import ABSENT, Case, Expectation
-from lifein.repos import raw_events
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +61,6 @@ def export_planner_negatives(
 
     cases: list[Case] = []
     for row in rows:
-        stored = raw_events.fetch_stored_between  # 占位,下面用按 id 取
-        del stored
         events = _events_for(user_id, session, [row.source_event_id])
         if not events:
             # 来源事件被删了(不该发生,raw_events 只追加)。跳过而不是造一个空输入
@@ -78,7 +75,7 @@ def export_planner_negatives(
                 expect=[Expectation(path="items", op=ABSENT)],
                 note=(
                     f"用户拒绝过这条({row.status},当初理由 {row.reason}):{title}。"
-                    "确认它当初不该被提出来再合并进来 —— 也可能只是"这事我自己记得""
+                    "确认它当初不该被提出来再合并进来 —— 也可能只是你自己记得这事"
                 ),
             )
         )
