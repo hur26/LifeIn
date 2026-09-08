@@ -18,6 +18,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -46,7 +47,7 @@ from lifein.jobs.reconcile import ReconcileDeps
 from lifein.jobs.reconcile import run_once as run_reconcile_once
 from lifein.jobs.reminders import ReminderDeps
 from lifein.jobs.reminders import run_once as run_reminders_once
-from lifein.repos import users
+from lifein.repos import quota, users
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
@@ -159,6 +160,32 @@ MEMORY_DELAY_MINUTES = 30
 """
 
 
+
+def within_quota(
+    services: Services, session, user_id: str, *, now: datetime, job: str
+) -> bool:
+    """这个用户这个月还有额度吗。**没有就跳过这一轮,不算失败。**
+
+    停的是模型调用不是采集(P4 第 5 片):采集几乎不花钱,而停掉它丢的数据
+    补不回来 —— 手机上那条通知早被划掉了。所以超上限那天的表现是
+    "没有摘要、没有新记忆",而**原文都还在,加回额度后能重跑**。
+
+    **不告警给用户。** 他对"你这个月的模型账单到上限了"做不了任何事;
+    要处理的是你,而你看的是告警通道。
+    """
+    cap = services.settings.monthly_cost_cap_cny if services.settings else 0.0
+    if not cap:
+        return True
+
+    try:
+        quota.guard(user_id, session, now=now, cap=Decimal(str(cap)))
+    except quota.QuotaExceeded as exc:
+        log.warning("跳过 %s:%s", job, exc)
+        services.alerter.alert(f"{job} 因额度上限跳过", f"user={user_id}: {exc}")
+        return False
+    return True
+
+
 def run_digest_for_all_users(
     services: Services,
     *,
@@ -181,6 +208,10 @@ def run_digest_for_all_users(
     for user_id in user_ids:
         try:
             with open_session() as session:
+                if not within_quota(
+                    services, session, user_id, now=moment, job="daily_digest"
+                ):
+                    continue
                 deps = DigestDeps(
                     adapters=build_adapters(user_id, session, services),
                     llm=services.llm,
@@ -219,6 +250,10 @@ def run_memory_extract_for_all_users(
     for user_id in user_ids:
         try:
             with open_session() as session:
+                if not within_quota(
+                    services, session, user_id, now=moment, job="memory_extract"
+                ):
+                    continue
                 deps = MemoryDeps(
                     llm=services.llm,
                     alerter=services.alerter,
@@ -255,6 +290,10 @@ def run_plan_extract_for_all_users(
     for user_id in user_ids:
         try:
             with open_session() as session:
+                if not within_quota(
+                    services, session, user_id, now=moment, job="plan_extract"
+                ):
+                    continue
                 deps = PlanDeps(llm=services.llm, alerter=services.alerter)
                 results = run_plan_once(user_id, session, deps=deps, now=moment)
             created += sum(r.created for r in results)
@@ -288,6 +327,10 @@ def run_bookkeeping_for_all_users(
     for user_id in user_ids:
         try:
             with open_session() as session:
+                if not within_quota(
+                    services, session, user_id, now=moment, job="bookkeeping"
+                ):
+                    continue
                 deps = BookkeepingDeps(llm=services.llm, alerter=services.alerter)
                 results = run_bookkeeping_once(user_id, session, deps=deps, now=moment)
             recorded += sum(r.recorded for r in results)
@@ -351,6 +394,10 @@ def run_monthly_report_for_all_users(
     for user_id in user_ids:
         try:
             with open_session() as session:
+                if not within_quota(
+                    services, session, user_id, now=moment, job="monthly_report"
+                ):
+                    continue
                 deps = MonthlyDeps(
                     llm=services.llm,
                     channel=services.channel,
