@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -29,6 +30,31 @@ log = logging.getLogger(__name__)
 
 _QUERY_SCOPES = ("query", "both")
 _INGEST_SCOPES = ("ingest", "both")
+
+INGEST_KIND = "collector"
+"""采集设备密钥的 kind。只能写(06 §6.1)。"""
+
+QUERY_KIND = "app_device"
+"""App 查询设备密钥的 kind。它同时是短期 token 的签名密钥(06 §6.3)。"""
+
+
+@dataclass(frozen=True)
+class DeviceCredential:
+    """一条设备凭据的元信息 —— **不含密钥本身**。
+
+    列设备是运维动作,不该顺手把明文密钥打到终端上。要密钥就重新签发一把,
+    旧的同时作废,这比"再看一眼"安全得多。
+    """
+
+    device_id: str
+    kind: str
+    scope: str
+    created_at: datetime
+    revoked_at: datetime | None
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_at is None
 
 _INSERT = text("""
     INSERT INTO credentials (user_id, kind, scope, ciphertext, key_version, device_id)
@@ -61,6 +87,36 @@ _SELECT_STALE = text("""
      WHERE user_id = :user_id
        AND revoked_at IS NULL
        AND key_version <> :current
+""")
+
+_SELECT_DEVICE = text("""
+    SELECT id, ciphertext
+      FROM credentials
+     WHERE user_id = :user_id
+       AND kind = :kind
+       AND device_id = :device_id
+       AND scope = ANY(:scopes)
+       AND revoked_at IS NULL
+     ORDER BY created_at DESC
+     LIMIT 1
+""")
+
+_REVOKE_DEVICE = text("""
+    UPDATE credentials
+       SET revoked_at = now()
+     WHERE user_id = :user_id
+       AND device_id = :device_id
+       -- 写 CAST 而不是 :kind::text —— 后者会被 text() 的绑定参数解析吃掉一个冒号
+       AND (CAST(:kind AS TEXT) IS NULL OR kind = CAST(:kind AS TEXT))
+       AND revoked_at IS NULL
+""")
+
+_LIST_DEVICES = text("""
+    SELECT device_id, kind, scope, created_at, revoked_at
+      FROM credentials
+     WHERE user_id = :user_id
+       AND device_id IS NOT NULL
+     ORDER BY created_at
 """)
 
 
@@ -126,6 +182,78 @@ def get_credential(
         raise
 
     return json.loads(plain)
+
+
+def get_device_credential(
+    user_id: str,
+    session: Session,
+    *,
+    kind: str,
+    device_id: str,
+    settings: Settings,
+    for_ingest: bool = False,
+) -> dict[str, Any] | None:
+    """取某台设备的凭据并解密。**这是 App 那两组接口的认证依据**(06 §6.1)。
+
+    和 `get_credential` 的区别只有一个 `device_id`,但那个区别就是 R11 要的
+    "按设备单点吊销":一台手机丢了,吊销它那两行,别的设备照常用。
+
+    `for_ingest` 的两边**一样不通融**:采集密钥在这里也换不出查询凭据 ——
+    scope 过滤是最后一道,就算路由挂错了依赖它也拦得住。
+    """
+    scopes = list(_INGEST_SCOPES if for_ingest else _QUERY_SCOPES)
+    row = session.execute(
+        _SELECT_DEVICE,
+        {"user_id": user_id, "kind": kind, "device_id": device_id, "scopes": scopes},
+    ).first()
+    if row is None:
+        return None
+
+    try:
+        plain = decrypt(bytes(row.ciphertext), user_id=user_id, kind=kind, settings=settings)
+    except DecryptError:
+        log.exception("设备凭据 %s/%s 解密失败,id=%s", kind, device_id, row.id)
+        raise
+
+    return json.loads(plain)
+
+
+def revoke_device(
+    user_id: str, session: Session, *, device_id: str, kind: str | None = None
+) -> int:
+    """吊销一台设备的凭据。返回受影响条数。
+
+    **默认吊销这台设备的全部凭据**,因为触发它的场景是"手机丢了" ——
+    那时只吊销其中一种,等于把另一种留在别人手里。
+    要单独吊销一种(比如只停采集)才传 `kind`。
+
+    记录保留不删:哪台设备什么时候被吊销的,是排查"手机丢了之后还有没有人
+    在用"时唯一的线索。
+    """
+    return int(
+        session.execute(
+            _REVOKE_DEVICE, {"user_id": user_id, "device_id": device_id, "kind": kind}
+        ).rowcount
+    )
+
+
+def list_device_credentials(user_id: str, session: Session) -> list[DeviceCredential]:
+    """列出这个用户签发过的设备凭据,**含已吊销的**。
+
+    已吊销的照样列出来:签发过什么、什么时候断的,是运维要回答的问题,
+    而"列表里没有"回答不了它。
+    """
+    rows = session.execute(_LIST_DEVICES, {"user_id": user_id}).all()
+    return [
+        DeviceCredential(
+            device_id=row.device_id,
+            kind=row.kind,
+            scope=row.scope,
+            created_at=row.created_at,
+            revoked_at=row.revoked_at,
+        )
+        for row in rows
+    ]
 
 
 def revoke_credential(user_id: str, session: Session, *, kind: str) -> int:

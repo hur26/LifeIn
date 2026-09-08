@@ -105,6 +105,18 @@ def decrypt(ciphertext: bytes, *, user_id: str, kind: str, settings: Settings) -
         raise DecryptError("解密失败:密钥不匹配,或密文与 user_id/kind 不对应") from exc
 
 
+def new_shared_secret() -> str:
+    """生成一把设备密钥(32 字节随机数的 base64)。
+
+    它和主密钥不是一回事:主密钥加密数据库里的凭据,这把是**服务端与某一台
+    设备之间**的共享密钥,用来签请求(06 §6.2)。它自己也要被主密钥加密后
+    才进库 —— 走 `credentials.put_credential`,那一层不给绕。
+
+    32 字节是 HMAC-SHA256 的块长,再长不增加强度,再短白白削弱。
+    """
+    return base64.b64encode(os.urandom(32)).decode()
+
+
 def needs_rotation(ciphertext: bytes, settings: Settings) -> bool:
     """这条密文是否还停在旧密钥上。轮换收尾时用它确认"无残留旧版本"。"""
     return key_version_of(ciphertext) != settings.master_key_version

@@ -82,7 +82,8 @@ class Settings(BaseSettings):
     "列出我的全部日历"这个能力(07 §2.4)。没配就不采日历。"""
 
     # ---------- 采集入口(P1) ----------
-    ingest_secret: SecretStr | None = None
+    # 采集与查询的密钥**不在环境变量里**:它们按设备签发,加密存 credentials 表
+    # (06 §6.1)。一把全局密钥做不到按设备单点吊销,也做不到 P4 的用户隔离(R11)
     ingest_max_skew_s: int = 300
     app_token_ttl_h: int = 24
 

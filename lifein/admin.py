@@ -14,12 +14,16 @@
     python -m lifein.admin test-imap --user <uuid>       # 07 §6 那条"IMAP 实测能登录"
     python -m lifein.admin key-status --user <uuid>      # 轮换收尾用
     python -m lifein.admin rotate-keys --user <uuid>
+    python -m lifein.admin issue-device --user <uuid> --device-id pixel-7a
+    python -m lifein.admin revoke-device --user <uuid> --device-id pixel-7a  # 手机丢了
+    python -m lifein.admin list-devices --user <uuid>
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import sys
 import time
@@ -30,6 +34,7 @@ from lifein.agents.digest import MAX_EVENTS
 from lifein.channels.base import Card
 from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.config import get_settings
+from lifein.crypto import new_shared_secret
 from lifein.db import session_scope
 from lifein.repos import channel_state, credentials, users
 from lifein.sources.imap_client import ImapConfig, ImapError, ImapMailbox
@@ -429,6 +434,107 @@ def cmd_rotate_keys(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_issue_device(args: argparse.Namespace) -> int:
+    """给一台手机签发设备密钥(06 §6.1)。
+
+    **采集与查询是两条独立的行、两把独立的密钥**,这是铁律 12。
+    `--purpose all` 只是省一次来回,不是把它们合成一条 ——
+    绝不写 `scope=both`:那等于把"采集端只能写"这条作废。
+
+    密钥**只在这里显示一次**。丢了就重新签发,旧的同时作废 ——
+    库里存的是密文,服务端自己也读不出来给你看第二遍(那正是加密的意义)。
+    """
+    from lifein import qr as qr_render
+
+    purposes = (
+        [("collector", "ingest"), ("app_device", "query")]
+        if args.purpose == "all"
+        else [("collector", "ingest")]
+        if args.purpose == "collect"
+        else [("app_device", "query")]
+    )
+
+    settings = get_settings()
+    provisioning: dict[str, str | int] = {
+        "v": 1,
+        "base_url": args.base_url,
+        "user_id": args.user,
+        "device_id": args.device_id,
+    }
+
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+
+        for kind, scope in purposes:
+            # 先吊销这台设备同类的旧凭据:留着两把有效的,验签用哪把取决于
+            # 排序,而"换了密钥但旧的还能用"是最难发现的一类问题
+            credentials.revoke_device(args.user, session, device_id=args.device_id, kind=kind)
+            secret = new_shared_secret()
+            credentials.put_credential(
+                args.user,
+                session,
+                kind=kind,
+                scope=scope,
+                payload={"secret": secret},
+                settings=settings,
+                device_id=args.device_id,
+            )
+            provisioning["collector_secret" if scope == "ingest" else "query_secret"] = secret
+
+    blob = json.dumps(provisioning, ensure_ascii=False, separators=(",", ":"))
+    print(f"\n已签发 {len(purposes)} 条设备凭据,device_id={args.device_id}")
+    print("下面这串只显示这一次,配进 App 之后就把窗口关了:\n")
+    print(blob)
+
+    qr_path = Path(f"device-{args.device_id}.html").resolve()
+    try:
+        qr_render.write_qr_html(
+            blob,
+            qr_path,
+            title=f"配置 LifeIn 采集端 · {args.device_id}",
+            hint="在 App 的扫码配置页里扫它。密钥只显示这一次",
+        )
+        print(f"\n二维码:{qr_path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n(生成二维码文件失败,手抄上面那串也一样:{exc})")
+
+    ascii_art = qr_render.render_qr_ascii(blob)
+    if ascii_art:
+        try:
+            print()
+            print(ascii_art)
+        except UnicodeEncodeError:
+            # 控制台是 GBK,画不出方块字符。上面的文件照样能扫
+            print("(终端编码画不出字符版二维码,用上面的文件)")
+    return 0
+
+
+def cmd_revoke_device(args: argparse.Namespace) -> int:
+    """手机丢了。**默认把这台设备的全部凭据一起吊销** —— 只停一种等于没停。"""
+    with session_scope() as session:
+        count = credentials.revoke_device(
+            args.user, session, device_id=args.device_id, kind=args.kind
+        )
+    print(f"已吊销 {count} 条凭据。那台设备手上的 token 下一次请求就失效")
+    return 0
+
+
+def cmd_list_devices(args: argparse.Namespace) -> int:
+    with session_scope() as session:
+        rows = credentials.list_device_credentials(args.user, session)
+
+    if not rows:
+        print("还没给任何设备签发过凭据。跑 issue-device")
+        return 0
+
+    for row in rows:
+        state = "有效" if row.active else f"已吊销 {row.revoked_at:%Y-%m-%d %H:%M}"
+        print(f"{row.device_id:<20} {row.kind:<12} scope={row.scope:<7} {state}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -500,6 +606,37 @@ def build_parser() -> argparse.ArgumentParser:
     rotate = sub.add_parser("rotate-keys", help="用当前主密钥重新加密全部凭据")
     rotate.add_argument("--user", required=True)
     rotate.set_defaults(func=cmd_rotate_keys)
+
+    issue = sub.add_parser("issue-device", help="给一台手机签发采集/查询密钥(分开签发)")
+    issue.add_argument("--user", required=True)
+    issue.add_argument("--device-id", required=True, help="自己起,比如 pixel-7a。吊销按它")
+    issue.add_argument(
+        "--purpose",
+        choices=("all", "collect", "query"),
+        default="all",
+        help="签哪几把。all 是两条独立的行、两把独立的密钥,不是 scope=both",
+    )
+    issue.add_argument(
+        "--base-url",
+        default="https://example.com",
+        help="App 要连的地址(反代之后的),写进配码里省得手输",
+    )
+    issue.set_defaults(func=cmd_issue_device)
+
+    revoke_dev = sub.add_parser("revoke-device", help="手机丢了:吊销这台设备的凭据")
+    revoke_dev.add_argument("--user", required=True)
+    revoke_dev.add_argument("--device-id", required=True)
+    revoke_dev.add_argument(
+        "--kind",
+        choices=("collector", "app_device"),
+        default=None,
+        help="只吊销其中一种。不给就两种都吊销 —— 手机丢了该走这条",
+    )
+    revoke_dev.set_defaults(func=cmd_revoke_device)
+
+    devices = sub.add_parser("list-devices", help="列出签发过的设备凭据(含已吊销)")
+    devices.add_argument("--user", required=True)
+    devices.set_defaults(func=cmd_list_devices)
 
     return parser
 

@@ -41,9 +41,11 @@ def test_minimal_config_is_enough_for_p0():
     assert s.app_host == "127.0.0.1"  # 默认只监听本地
     assert s.digest_hour_minute == (8, 0)
     assert s.shadow_mode_default is True
-    # P1 才用到的两项在 P0 可以为空,不该阻止启动
+    # P1 才用到的项在 P0 可以为空,不该阻止启动
     assert s.embedding_model is None
-    assert s.ingest_secret is None
+    # 采集与查询的密钥不在配置里 —— 按设备签发,进 credentials 表(06 §6.1)
+    assert not hasattr(s, "ingest_secret")
+    assert s.ingest_max_skew_s == 300
     # 企微整组可选:配可信 IP 要先有公网域名,而 iLink 让它不再是必需
     assert s.wecom_enabled is False
 
@@ -75,11 +77,11 @@ def test_alert_channel_cannot_be_wecom():
 def test_require_reports_missing_p1_config():
     s = build()
     with pytest.raises(ConfigError) as exc:
-        s.require("ingest_secret")
-    assert "INGEST_SECRET" in str(exc.value)
+        s.require("embedding_model")
+    assert "EMBEDDING_MODEL" in str(exc.value)
 
-    s2 = build(ingest_secret="x")
-    s2.require("ingest_secret")  # 填了就不该抛
+    s2 = build(embedding_model="text-embedding-3")
+    s2.require("embedding_model")  # 填了就不该抛
 
 
 def test_secrets_do_not_leak_in_repr():
