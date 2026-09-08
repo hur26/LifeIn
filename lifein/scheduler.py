@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
 from lifein.db import session_scope
+from lifein.jobs import notification_retention
 from lifein.jobs.collector_watch import WatchDeps
 from lifein.jobs.collector_watch import run_once as run_watch_once
 from lifein.jobs.daily_digest import DigestDeps, run_once
@@ -46,6 +47,13 @@ MEMORY_JOB_ID = "memory_extract"
 PLAN_JOB_ID = "plan_extract"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
+RETENTION_JOB_ID = "notification_retention"
+
+RETENTION_DELAY_MINUTES = 60
+"""通知保留期清理排在摘要之后一小时。
+
+**必须排在提取之后**(+45):清掉的是提取要读的那份正文。同一天里
+先清后提,提取看到的就是空的 —— 而它不会报错,只会少提几条。"""
 
 COLLECTOR_WATCH_INTERVAL_MINUTES = 5
 """采集器掉线扫描的间隔。
@@ -256,6 +264,40 @@ def run_collector_watch_for_all_users(
     return alerted
 
 
+def run_notification_retention_for_all_users(
+    services: Services,
+    *,
+    now: datetime | None = None,
+    session_factory: SessionFactory | None = None,
+) -> int:
+    """给每个用户清一遍过期的通知正文。返回处理条数。
+
+    失败只告警不打扰用户:没清成当天没有任何外部表现,但它是 R10 的措施,
+    悄悄停一个月就等于那条措施不存在了。
+    """
+    open_session = session_factory or session_scope
+    moment = now or datetime.now(UTC)
+    cleaned = 0
+
+    with open_session() as session:
+        user_ids = users.list_active_users(session)
+
+    for user_id in user_ids:
+        try:
+            with open_session() as session:
+                cleaned += notification_retention.run_once(
+                    user_id,
+                    session,
+                    now=moment,
+                    retention_days=services.settings.notification_retention_days,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("用户 %s 的通知清理失败", user_id)
+            services.alerter.alert("通知保留期清理异常", f"user={user_id}: {exc}")
+
+    return cleaned
+
+
 def build_scheduler(
     services: Services,
     *,
@@ -264,6 +306,7 @@ def build_scheduler(
     plan_runner: Callable[[Services], int] | None = None,
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
+    retention_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
@@ -271,9 +314,11 @@ def build_scheduler(
     run_plan = plan_runner or run_plan_extract_for_all_users
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
+    run_retention = retention_runner or run_notification_retention_for_all_users
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
+    retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
     scheduler.add_job(
@@ -317,6 +362,17 @@ def build_scheduler(
         max_instances=1,
         # 错过五分钟以上就不补了:一条晚了半小时的"快到点了"只会让人困惑
         misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        lambda: run_retention(services),
+        trigger=CronTrigger(
+            hour=retention_hour, minute=retention_minute, timezone=services.settings.tzinfo
+        ),
+        id=RETENTION_JOB_ID,
+        name="通知原文保留期清理",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
     )
     scheduler.add_job(
         lambda: run_collector_watch(services),

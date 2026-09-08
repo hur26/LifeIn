@@ -138,6 +138,7 @@ P0 不该逼着人先生成一把用不到的密钥 —— 提前存在的凭据
 | `PENDING_EXPIRE_DAYS` | `30` | 待确认队列过期 |
 | `APPROVAL_EXPIRE_H` | `24` | L3 审批过期 |
 | `COLLECTOR_HEARTBEAT_TIMEOUT_M` | `60` | 超时即告警,P1 验收要求 1 小时内 |
+| `NOTIFICATION_RETENTION_DAYS` | `7` | 通知原文留多久,到期只清正文([R10](05-risks.md#r10--手机端采集器的越权读取)) |
 | `ALERT_CHANNEL` | `email` | 告警走兜底通道,不走可能已经挂掉的推送通道 |
 
 ### 2.7 邮件兜底通道(P1,可选)

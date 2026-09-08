@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     pending_expire_days: int = 30
     approval_expire_h: int = 24
     collector_heartbeat_timeout_m: int = 60
+    notification_retention_days: int = 7
+    """通知原文留多久(R10)。到期只清正文,行和元信息留着。
+
+    7 天是给补跑留的余量:窗口补偿最多三天(job_runs),再加一次手动重跑。
+    调小更安全,但小于 3 会让补跑读到空正文。"""
     alert_channel: str = "email"
 
     # ---------- 邮件兜底通道(P1,可选)----------
