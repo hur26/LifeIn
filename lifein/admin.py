@@ -17,6 +17,8 @@
     python -m lifein.admin issue-device --user <uuid> --device-id pixel-7a
     python -m lifein.admin revoke-device --user <uuid> --device-id pixel-7a  # 手机丢了
     python -m lifein.admin list-devices --user <uuid>
+    python -m lifein.admin allow-source --user <uuid> --package com.tencent.mm
+    python -m lifein.admin list-sources --user <uuid>   # 白名单 + 采集器心跳
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.config import get_settings
 from lifein.crypto import new_shared_secret
 from lifein.db import session_scope
-from lifein.repos import channel_state, credentials, users
+from lifein.repos import channel_state, collector, credentials, users
 from lifein.sources.imap_client import ImapConfig, ImapError, ImapMailbox
 
 log = logging.getLogger("lifein.admin")
@@ -535,6 +537,53 @@ def cmd_list_devices(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_allow_source(args: argparse.Namespace) -> int:
+    """给采集白名单加一条来源(07 §4)。
+
+    **默认拒绝**,所以新装的采集器在这条跑之前一个字都送不进来。
+    P1 只该放行微信;银行与支付类是 P2 的事,提前加了也会被 purpose 闸门挡住。
+    """
+    match_type = collector.MATCH_PACKAGE if args.package else collector.MATCH_SMS_SENDER
+    pattern = args.package or args.sms_sender
+
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        rule = collector.add_whitelist(
+            args.user,
+            session,
+            match_type=match_type,
+            pattern=pattern,
+            purpose=args.purpose,
+            phase=args.phase,
+        )
+    print(f"已放行 {rule.match_type}={rule.pattern}(purpose={rule.purpose}, {rule.phase})")
+    if rule.purpose == collector.PURPOSE_TRANSACTION:
+        print("注意:P1 不放行 transaction,这条要等记账链路打开才生效")
+    return 0
+
+
+def cmd_list_sources(args: argparse.Namespace) -> int:
+    with session_scope() as session:
+        rules = collector.list_whitelist(args.user, session)
+        beats = collector.list_heartbeats(args.user, session)
+
+    if not rules:
+        print("白名单是空的 —— 采集器送上来的东西一条都不会入库")
+    for rule in rules:
+        state = "启用" if rule.enabled else "停用"
+        print(f"#{rule.id:<4} {rule.match_type:<13} {rule.pattern:<28} {rule.purpose:<12} {state}")
+
+    print()
+    if not beats:
+        print("还没有任何设备上报过心跳")
+    for beat in beats:
+        listener = "监听正常" if beat.listener_enabled else "监听权限被关"
+        print(f"{beat.device_id:<20} 最后心跳 {beat.last_seen_at:%Y-%m-%d %H:%M}  {listener}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -637,6 +686,24 @@ def build_parser() -> argparse.ArgumentParser:
     devices = sub.add_parser("list-devices", help="列出签发过的设备凭据(含已吊销)")
     devices.add_argument("--user", required=True)
     devices.set_defaults(func=cmd_list_devices)
+
+    allow = sub.add_parser("allow-source", help="给采集白名单加一条来源(默认拒绝)")
+    allow.add_argument("--user", required=True)
+    source = allow.add_mutually_exclusive_group(required=True)
+    source.add_argument("--package", help="安卓包名,全等匹配,如 com.tencent.mm")
+    source.add_argument("--sms-sender", help="短信发件号,前缀匹配(号段)")
+    allow.add_argument(
+        "--purpose",
+        choices=(collector.PURPOSE_MESSAGE, collector.PURPOSE_TRANSACTION),
+        default=collector.PURPOSE_MESSAGE,
+        help="P1 只有 message 会被放行",
+    )
+    allow.add_argument("--phase", default="P1")
+    allow.set_defaults(func=cmd_allow_source)
+
+    sources = sub.add_parser("list-sources", help="看白名单与采集器心跳")
+    sources.add_argument("--user", required=True)
+    sources.set_defaults(func=cmd_list_sources)
 
     return parser
 
