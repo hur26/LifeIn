@@ -35,3 +35,6 @@ Thumbs.db
 # 测试与工具缓存
 .pytest_cache/
 .ruff_cache/
+
+# 登录时生成的二维码，不进仓库
+weixin-qr.html

@@ -24,6 +24,7 @@ import logging
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from lifein.channels.base import Card
 from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
@@ -104,20 +105,29 @@ def cmd_login_weixin(args: argparse.Namespace) -> int:
             print(f"用户不存在:{args.user}", file=sys.stderr)
             return 1
 
+    qr_path = Path("weixin-qr.html").resolve()
+
     def show(qr: weixin_login.QrCode) -> None:
-        print("\n请用微信扫这个二维码:")
-        print(qr.url or qr.value)
+        # 先落地成文件。终端字符画依赖控制台编码,而文件不依赖任何终端能力 ——
+        # 中文 Windows 上这是唯一稳的路
+        try:
+            weixin_login.write_qr_html(qr, qr_path)
+            print("\n二维码已生成,用浏览器打开它扫:")
+            print(f"  {qr_path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n(生成二维码文件失败:{exc})")
+        print("\n或者直接扫这个链接:")
+        print(f"  {qr.url or qr.value}")
+
         ascii_art = weixin_login.render_qr_ascii(qr)
         if not ascii_art:
-            print("(装了 qrcode 包才能在终端画出来,现在只能打开上面的链接扫)")
             return
         try:
+            print()
             print(ascii_art)
         except UnicodeEncodeError:
-            # 中文 Windows 的控制台默认 GBK,编不出二维码用的方块字符。
-            # 这不该让登录失败 —— 链接照样能扫
-            print("(当前终端编码画不出二维码,请扫上面的链接;")
-            print(" 想在终端里看的话:先执行 chcp 65001 切到 UTF-8)")
+            # 控制台是 GBK,编不出方块字符。不影响 —— 上面的文件照样能扫
+            print("(终端编码画不出字符版二维码,用上面的文件)")
 
     client = httpx.Client(timeout=40.0)
     try:
