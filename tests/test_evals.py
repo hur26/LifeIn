@@ -181,7 +181,7 @@ class TestLoad:
 class TestShippedExamples:
     """仓库里带的示例评测集自己要是合法的 —— 它们是别人照抄的模板。"""
 
-    @pytest.mark.parametrize("name", ["planner", "memory"])
+    @pytest.mark.parametrize("name", ["planner", "memory", "bookkeeper"])
     def test_examples_load(self, name):
         cases = load_cases(f"evals/{name}.example.jsonl")
         assert len(cases) >= 2
