@@ -53,19 +53,42 @@ def data_access_functions():
                 yield f"{module_info.name}.{name}", obj
 
 
+ALLOWED_EXEMPTIONS = {
+    # 身份解析那一步手上还没有 user_id —— 它正是要算出这个值
+    "users": {"find_by_wecom_userid", "create_user", "list_active_users"},
+    # 配码同理(P4 第 1 片):App 扫码那一刻只有一张码,而"这张码是谁的"
+    # 就存在那一行里。要求它先给 user_id,等于要求它先知道自己配的是谁的号。
+    # peek 是 claim 的只读版,purge_expired 按时间扫全表 ——
+    # **两者都不返回任何属于某个用户的数据**
+    "enrollment": {"claim", "peek", "purge_expired"},
+}
+"""哪些模块允许破例,以及破哪几个。
+
+**这份清单是这组测试真正的内容。** 上面那些签名检查任何时候都能通过 ——
+只要有人给模块加一行 `NO_USER_ID_REQUIRED`。而加进这份清单要改这个文件,
+那是一个看得见、要在 review 里解释的动作。
+"""
+
+
 def test_exemptions_are_narrow():
-    """例外只允许出现在 users 模块,且只有身份解析与建用户两类。
+    """例外只允许出现在上面那份清单里,一个不多。
 
     这条测试存在的意义是让"再破一次例"变得需要解释:哪天有人想给别的模块
-    加 NO_USER_ID_REQUIRED,得先改这里。
+    加 NO_USER_ID_REQUIRED,得先改 ALLOWED_EXEMPTIONS。
     """
     for module_info in pkgutil.iter_modules(lifein.repos.__path__):
         module = importlib.import_module(f"lifein.repos.{module_info.name}")
         exempt = getattr(module, "NO_USER_ID_REQUIRED", frozenset())
         if not exempt:
             continue
-        assert module_info.name == "users", f"{module_info.name} 不该有例外"
-        assert exempt == {"find_by_wecom_userid", "create_user", "list_active_users"}
+        allowed = ALLOWED_EXEMPTIONS.get(module_info.name)
+        assert allowed is not None, f"{module_info.name} 不在允许破例的清单里"
+        assert set(exempt) == allowed, f"{module_info.name} 的例外和清单对不上"
+
+
+def test_the_exemption_list_itself_stays_short():
+    """**破例的模块只有两个。** 第三个出现时,要先回答"为什么这次也算特殊"。"""
+    assert set(ALLOWED_EXEMPTIONS) == {"users", "enrollment"}
 
 
 def test_there_are_data_access_functions_to_check():

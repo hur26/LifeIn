@@ -29,6 +29,7 @@
     python -m lifein.admin budget --user <uuid> --category 餐饮 --amount 1500
     python -m lifein.admin budgets --user <uuid>                         # 看进度
     python -m lifein.admin approvals --user <uuid>       # L3 审批队列与最近的执行
+    python -m lifein.admin invite --user <uuid>          # 配码二维码(码是一次性的)
 """
 
 from __future__ import annotations
@@ -459,6 +460,10 @@ def cmd_issue_device(args: argparse.Namespace) -> int:
 
     密钥**只在这里显示一次**。丢了就重新签发,旧的同时作废 ——
     库里存的是密文,服务端自己也读不出来给你看第二遍(那正是加密的意义)。
+
+    **给别人配码不要用这条,用 `invite`。** 这条打出来的二维码里是明文密钥,
+    自己扫没问题;发给别人的话那张图会走微信,**等于把密钥发在聊天里**
+    (P4 第 1 片)。
     """
     from lifein import qr as qr_render
 
@@ -1013,6 +1018,80 @@ def cmd_approvals(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_invite(args: argparse.Namespace) -> int:
+    """出一张配码二维码(P4 第 1 片)。**图里是一次性换取码,不是密钥。**
+
+    这条命令替代了 `issue-device` 在"给别人配码"这个场景下的位置。
+    两者的区别是一句话:
+
+    - `issue-device`:图里是**明文的两把密钥**。自己扫没问题
+    - `invite`:图里是一张**十分钟内、只能用一次**的换取码
+
+    03 的 P4 说朋友要用它配码,而那张图会走微信发过去 ——
+    **等于把密钥发在聊天里**,而微信的聊天记录会漫游、会备份、会被截图。
+    换取码即使被截图拿到,也只有两种结局:要么你已经换过了(他换不了),
+    要么你还没换(你会发现自己换不了)。**两种都比"两个人各有一套"好。**
+    """
+    from lifein import qr as qr_render
+    from lifein.repos import enrollment
+
+    settings = get_settings()
+    now = datetime.now(settings.tzinfo)
+
+    with session_scope() as session:
+        if users.get_user(args.user, session) is None:
+            print(f"用户不存在:{args.user}", file=sys.stderr)
+            return 1
+        code, issued = enrollment.issue(
+            args.user,
+            session,
+            base_url=args.base_url,
+            now=now,
+            purpose=args.purpose,
+            ttl=timedelta(minutes=args.minutes),
+        )
+
+    payload = json.dumps(
+        {"v": 2, "claim": code, "base_url": args.base_url}, ensure_ascii=False
+    )
+
+    print(f"这张码 {args.minutes} 分钟内有效,只能用一次。")
+    print(f"过期时间:{issued.expires_at:%Y-%m-%d %H:%M}")
+    print()
+    print("图里没有密钥 —— App 扫完之后自己去换,换过一次这张码立刻作废。")
+    print("所以它可以直接发给对方;而 issue-device 打出来的那张不行。")
+
+    qr_path = Path(f"invite-{issued.id}.html").resolve()
+    try:
+        qr_render.write_qr_html(
+            payload,
+            qr_path,
+            title="配置 LifeIn",
+            hint=f"在 App 里扫它。{args.minutes} 分钟内有效,只能用一次",
+        )
+        print()
+        print(f"二维码:{qr_path}")
+    except Exception as exc:  # noqa: BLE001
+        print()
+        print(f"(生成二维码文件失败:{exc})")
+
+    ascii_art = qr_render.render_qr_ascii(payload)
+    if ascii_art:
+        try:
+            print()
+            print(ascii_art)
+        except UnicodeEncodeError:
+            print("(终端编码画不出字符版二维码,用上面的文件)")
+
+    if args.show_text:
+        # 扫不了码时的退路(相机权限没给、屏幕太小)。**默认不打** ——
+        # 打出来就会进终端历史,而那是一个不必要的落地点
+        print()
+        print("扫不了就手动粘这一串:")
+        print(payload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lifein.admin")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1200,6 +1279,25 @@ def build_parser() -> argparse.ArgumentParser:
     approvals_cmd.add_argument("--user", required=True)
     approvals_cmd.add_argument("--limit", type=int, default=20, help="最近几条,默认 20")
     approvals_cmd.set_defaults(func=cmd_approvals)
+
+    invite = sub.add_parser("invite", help="出一张配码二维码(图里是一次性换取码,可以发给别人)")
+    invite.add_argument("--user", required=True)
+    invite.add_argument(
+        "--base-url",
+        default="https://example.com",
+        help="App 要连的地址(反代之后的),写进码里省得对方手输",
+    )
+    invite.add_argument(
+        "--purpose",
+        choices=("all", "collect", "query"),
+        default="all",
+        help="换出来签哪几把。all 是两条独立的行、两把独立的密钥,不是 scope=both",
+    )
+    invite.add_argument("--minutes", type=int, default=10, help="码活多久,默认十分钟")
+    invite.add_argument(
+        "--show-text", action="store_true", help="同时打印文本(扫不了码时的退路)"
+    )
+    invite.set_defaults(func=cmd_invite)
 
     mode = sub.add_parser("rule-mode", help="开关一条规则(off 是你主动关的那一档)")
     mode.add_argument("--user", required=True)
