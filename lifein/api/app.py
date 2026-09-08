@@ -1,13 +1,19 @@
 """HTTP 入口。
 
-P0 只有两个端点:健康检查,和企微回调。采集上报(`/ingest`)是 P1 的事,
-接口契约还没定(06 §4)。
+三组端点,**各自的认证面完全分开**(06 §6.1):
 
-**回调的错误响应一律不带原因。** `CallbackRejected` 里写了是签名不对还是
-时间戳过期,那是给日志看的;返给对方只有一个 400 —— 告诉探测者他哪一步
-错了,等于帮他调试。
+| 组 | 谁在调 | 认证 |
+| --- | --- | --- |
+| `/wecom/*` | 企微平台 | 平台签名 |
+| `/ingest/*` | 手机上的采集器 | 设备密钥签名,**只能写** |
+| `/app/*` | 手机上的界面 | 长期设备凭据换来的短期 token |
+
+**错误响应一律不带原因。** 企微回调回 400、App 那两组回 401,
+里面写的是空的 —— 具体是签名不对还是时间戳过期只进日志。
+告诉探测者他哪一步错了,等于帮他调试。
 
 默认只监听 `127.0.0.1`(07 §2.1),公网访问走反向代理 + TLS。
+反代**不能改写路径** —— 路径进签名(06 §6.2)。
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
 
+from lifein.api import ingest
+from lifein.api.deps import AuthRejected
 from lifein.bootstrap import Services, build_services
 from lifein.channels.wecom_callback import CallbackRejected
 from lifein.db import session_scope
@@ -71,6 +79,13 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
         title="LifeIn", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
     )
     app.state.services = resolved
+    app.include_router(ingest.router)
+
+    @app.exception_handler(AuthRejected)
+    def _auth_rejected(_request: Request, exc: AuthRejected) -> Response:
+        # 原因只进日志。响应体是空的 —— 401 之外不给对方任何信息
+        log.warning("拒绝一次 App 请求:%s", exc.reason)
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
