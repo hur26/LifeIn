@@ -30,6 +30,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -38,7 +39,14 @@ import com.journeyapps.barcodescanner.ScanOptions
 import ltd.iclab.lifein.LifeInApp
 import ltd.iclab.lifein.calendar.CalendarWriter
 import ltd.iclab.lifein.collect.CollectorState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import ltd.iclab.lifein.BuildConfig
+import ltd.iclab.lifein.data.DeviceId
 import ltd.iclab.lifein.data.Enrollment
+import ltd.iclab.lifein.data.EnrollmentPayload
+import ltd.iclab.lifein.net.EnrollClient
 import ltd.iclab.lifein.data.LifeInDatabase
 
 /**
@@ -161,14 +169,60 @@ private fun Home(
 private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
     var text by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
+    /**
+     * 收下一串配码。两种都认(见 `EnrollmentPayload`):
+     *
+     * - `issue-device` 那种:密钥已经在手上,直接存
+     * - `invite` 那种:手上只有一张换取码,要联网去 `POST /enroll/claim` 换
+     *
+     * **第二种是这个 App 原来接不上的那一半。** 服务端的 invite 早就在打
+     * `{"v":2,"claim":…}` 了,而这里只会解旧的那种 —— 于是朋友接入的第一道门
+     * 上,代码在服务端、客户端还走旧洞。
+     */
     fun accept(raw: String) {
-        runCatching { Enrollment.parse(raw) }
-            .onSuccess {
-                LifeInApp.instance.secrets.save(it)
-                onEnrolled(it)
+        error = null
+        val payload = try {
+            EnrollmentPayload.parse(raw)
+        } catch (e: Exception) {
+            error = e.message ?: "配码不对"
+            return
+        }
+
+        when (payload) {
+            is EnrollmentPayload.Ready -> {
+                LifeInApp.instance.secrets.save(payload.enrollment)
+                onEnrolled(payload.enrollment)
             }
-            .onFailure { error = it.message ?: "配码不对" }
+
+            is EnrollmentPayload.Invite -> {
+                busy = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            EnrollClient.claim(
+                                baseUrl = payload.baseUrl,
+                                code = payload.claim,
+                                // 自己生成、存下来复用。人编的名字会重复,
+                                // 而重复的 device_id 意味着吊销一台会连带
+                                // 吊销另一台(06 §6.15)
+                                deviceId = DeviceId.get(LifeInApp.instance),
+                                appVersion = BuildConfig.VERSION_NAME,
+                            )
+                        }
+                    }
+                    busy = false
+                    result
+                        .onSuccess {
+                            LifeInApp.instance.secrets.save(it)
+                            onEnrolled(it)
+                        }
+                        .onFailure { error = it.message ?: "换取密钥失败" }
+                }
+            }
+        }
     }
 
     // 扫码结果直接进解析:扫出来的和粘进来的是同一串东西,
@@ -189,10 +243,17 @@ private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
     ) {
         Text("配置采集端", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "在服务器上跑 python -m lifein.admin issue-device --user <你的 uuid> " +
-                "--device-id <这台手机>,它会打出一串配码并生成一个二维码文件。\n\n" +
-                "扫那个二维码,或者把那串东西粘到下面。只显示一次。",
+            "让对方在服务器上跑 python -m lifein.admin invite --user <你的 uuid>," +
+                "它会生成一个二维码文件。\n\n" +
+                "那张图里没有密钥,只有一张十分钟内、只能用一次的换取码 —— " +
+                "所以它可以直接发给你。扫它,或者把那串东西粘到下面," +
+                "App 会自己去把密钥换回来。",
             style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            "自己给自己配码时也可以用 issue-device 打出来的那种,同样扫或粘。" +
+                "但那张图里是明文密钥,不要发在聊天里。",
+            style = MaterialTheme.typography.bodySmall,
         )
 
         Button(
@@ -201,12 +262,13 @@ private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
                 scanner.launch(
                     ScanOptions()
                         .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                        .setPrompt("对准 issue-device 生成的那个二维码")
+                        .setPrompt("对准那张配码二维码")
                         .setBeepEnabled(false)
                         // 竖屏锁死:配码是站着扫的,转屏只会让人手忙脚乱
                         .setOrientationLocked(true)
                 )
             },
+            enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("扫码配置")
@@ -226,15 +288,18 @@ private fun EnrollScreen(onEnrolled: (Enrollment) -> Unit) {
             },
             label = { Text("或者把配码粘在这里") },
             minLines = 4,
+            enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         )
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         Button(
             onClick = { accept(text) },
-            enabled = text.isNotBlank(),
+            // **换取中一律不许再点。** 一张码只能用一次,第二次点下去
+            // 拿到的是 401,而那句"配码无效"会让人以为第一次也失败了
+            enabled = text.isNotBlank() && !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("保存")
+            Text(if (busy) "正在换取密钥…" else "保存")
         }
     }
 }
