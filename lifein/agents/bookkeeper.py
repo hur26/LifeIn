@@ -44,6 +44,15 @@ from lifein.repos.transactions import CATEGORIES, TxnKind
 log = logging.getLogger(__name__)
 
 MAX_EVENTS = 40
+"""**一批**最多送几条给模型 —— 不是"一天最多处理几条"。
+
+`build_blocks` 里的 `[:max_events]` 是最后一道兜底。真正保证不丢事件的是
+调用方([`jobs/bookkeeping.py`](../jobs/bookkeeping.py))按这个数分批:
+它以前不分批,于是一天超过 40 条时较旧的那些被静默丢掉,而窗口照样成功。
+
+**改这个数不会丢事件,只会改调用几次模型。**
+"""
+
 MAX_CHARS_PER_EVENT = 600
 """交易通知都很短。给得比日程少,是因为长文本里多半是营销话术,
 而它们只会把模型往"这是一笔消费"上带。"""

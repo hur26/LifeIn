@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -325,6 +326,158 @@ class TestTheWindow:
         assert row.status == "succeeded"
         assert row.stats["recorded"] == 1
         assert row.stats["llm_share"] == 1.0  # 第一笔当然全靠模型
+
+
+class EchoLLM:
+    """按**这一批实际收到的素材**回答,不是每次都回同一份。
+
+    分批那件事必须这样测:一个"每次都返回同样 items"的假模型,在只送了
+    前 40 条的旧代码下也照样能让 45 笔全部入账 —— 那样测出来的绿是假的。
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.batch_sizes: list[int] = []
+
+    def chat(self, messages):
+        self.calls += 1
+        refs = re.findall(r'id="([^"]+)"', messages[-1]["content"])
+        self.batch_sizes.append(len(refs))
+        return _Response(
+            json.dumps({"items": [judged(ref) for ref in refs]}, ensure_ascii=False)
+        )
+
+
+class BrokenGateway:
+    """入账这一步炸掉。用来验"整窗算失败",而不是"悄悄跳过这一笔"。"""
+
+    def call(self, ctx, tool, args):
+        raise RuntimeError("数据库连接断了")
+
+
+class TestABusyDay:
+    """一天超过 40 条交易。**这是原来会静默丢账的那条路。**
+
+    `judge` 内部 `[:MAX_EVENTS]` 只取最新的 40 条,而 job 把整窗事件一次性
+    交给它 —— 较旧的那些既没入账也没进待确认,窗口却照样 succeeded,
+    于是它们再也不会被读第二次。表现是"这天少了几笔",而那要到月底才看得出来。
+    """
+
+    def events(self, session, user_id, count: int) -> list[str]:
+        """建 count 条交易事件,返回它们的 external_id(按时间从新到旧)。
+
+        时间和金额都各不相同:排序稳定,才说得清"最旧的那条"是哪条,
+        而金额不同才不会被跨渠道合并顺手并掉。
+        """
+        refs = []
+        for i in range(count):
+            ref = f"t-{i:03d}"
+            an_event(
+                session,
+                user_id,
+                external_id=ref,
+                amount=f"{10 + i}.00",
+                occurred_at=WINDOW_TIME - timedelta(minutes=i),
+            )
+            refs.append(ref)
+        return refs
+
+    def test_forty_five_events_take_two_model_calls(self, pg_session, user_id):
+        self.events(pg_session, user_id, 45)
+        llm = EchoLLM()
+        bookkeeping.run_once(
+            user_id, pg_session,
+            deps=BookkeepingDeps(llm=llm, alerter=RecordingAlerter()), now=NOW,
+        )
+        assert llm.calls == 2
+        assert sorted(llm.batch_sizes) == [5, 40]
+
+    def test_the_oldest_events_still_get_booked(self, pg_session, user_id):
+        """**这一条就是那个 bug 的回归测试。**
+
+        断言的不是"总数对得上"(那个数在旧代码下也可能凑巧对),
+        而是**最旧的那一条在不在账本里** —— 它正是被截断掉的那一头。
+        """
+        refs = self.events(pg_session, user_id, 45)
+        bookkeeping.run_once(
+            user_id, pg_session,
+            deps=BookkeepingDeps(llm=EchoLLM(), alerter=RecordingAlerter()), now=NOW,
+        )
+        assert _ledger_size(pg_session, user_id) == 45
+        oldest = refs[-1]  # occurred_at 最早的那条
+        got = pg_session.execute(
+            text(
+                "SELECT count(*) FROM transactions t JOIN raw_events e"
+                " ON e.id = t.source_event_id"
+                " WHERE t.user_id = :u AND e.external_id = :x"
+            ),
+            {"u": user_id, "x": oldest},
+        ).scalar_one()
+        assert got == 1, "最旧的那笔被截断掉了 —— 这正是原来的行为"
+
+    def test_reading_more_than_the_window_limit_alerts(self, pg_session, user_id, monkeypatch):
+        """真读不完的时候要喊一声。**静默截断才是问题**,截断本身不是。"""
+        monkeypatch.setattr(bookkeeping, "MAX_EVENTS_PER_WINDOW", 3)
+        self.events(pg_session, user_id, 5)
+        alerter = RecordingAlerter()
+        bookkeeping.run_once(
+            user_id, pg_session,
+            deps=BookkeepingDeps(llm=EchoLLM(), alerter=alerter), now=NOW,
+        )
+        assert any("上限" in body for _, body in alerter.sent)
+
+
+class TestARecordThatBlowsUp:
+    """`txn.record` 抛异常。原来的注释说"这一笔明天还会被判一次" ——
+    而窗口标成 succeeded 之后不会有明天。"""
+
+    def test_the_whole_window_is_marked_failed(self, pg_session, user_id):
+        an_event(pg_session, user_id)
+        alerter = RecordingAlerter()
+        bookkeeping.run_once(
+            user_id, pg_session,
+            deps=BookkeepingDeps(
+                llm=FakeLLM([judged("t-1")]), alerter=alerter,
+                gateway_factory=lambda u, s: BrokenGateway(),
+            ),
+            now=NOW,
+        )
+        status = pg_session.execute(
+            text(
+                "SELECT status FROM job_runs WHERE user_id = :u"
+                " AND job_name = 'bookkeeping'"
+            ),
+            {"u": user_id},
+        ).scalar_one()
+        assert status == "failed"
+        assert alerter.sent
+
+    def test_the_retry_books_it_and_does_not_double_book(self, pg_session, user_id):
+        """**两个改动接起来的那一条。**
+
+        第一遍入账炸了 → 整窗 failed;第二遍窗口被重新认领 → 这次记上了。
+        跑第三遍不会记第二笔:靠的是 `UNIQUE (user_id, source_event_id)`,
+        不是靠这个 job 记得自己干过什么。
+        """
+        an_event(pg_session, user_id)
+        broken = BookkeepingDeps(
+            llm=FakeLLM([judged("t-1")]), alerter=RecordingAlerter(),
+            gateway_factory=lambda u, s: BrokenGateway(),
+        )
+        bookkeeping.run_once(user_id, pg_session, deps=broken, now=NOW)
+        assert _ledger_size(pg_session, user_id) == 0
+
+        ok = BookkeepingDeps(llm=FakeLLM([judged("t-1")]), alerter=RecordingAlerter())
+        [second] = [
+            r for r in bookkeeping.run_once(user_id, pg_session, deps=ok, now=NOW)
+            if not r.skipped
+        ]
+        assert second.recorded == 1
+        assert _ledger_size(pg_session, user_id) == 1
+
+        third = bookkeeping.run_once(user_id, pg_session, deps=ok, now=NOW)
+        assert all(r.skipped for r in third)
+        assert _ledger_size(pg_session, user_id) == 1
 
 
 def _ledger_size(session, user_id) -> int:

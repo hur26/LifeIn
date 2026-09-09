@@ -14,6 +14,16 @@
 每天都有,把它们塞进待确认队列会把队列淹掉,而淹掉的队列等于没有队列 ——
 用户会在某一天不再打开它,然后真正需要确认的那笔也一起看不见了。
 
+**一个窗口里的事件按 40 条一批送模型**,不是只送最前面 40 条。
+后者是这个文件原来的行为:一天超过 40 条交易时,较旧的那些既没入账
+也没进待确认,而窗口照样标成 succeeded —— 于是它们再也不会被读第二次。
+分批安全的前提是跨渠道合并与去重都在 `txn.record` 里按库上的唯一键做,
+不依赖"同一批里能不能看见对方"。
+
+**入账失败会让整窗失败。** 也是原来写错的一处:那里的注释说"明天还会被
+判一次",而窗口标成功之后不会有明天。整窗重跑靠
+`UNIQUE (user_id, source_event_id)` 兜底,已记成的会被判成 duplicate。
+
 **这个 job 是 `merchant_rules.remember()` 唯一的调用方。** 沉淀发生在
 入账成功之后,而且只沉淀真实商户名 —— 代收机构名被 `remember()` 自己挡掉
 (ADR-008)。实时这一遍多数会被挡住,那是常态:真正的沉淀要等第 6 片
@@ -24,13 +34,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from lifein.agents.bookkeeper import (
+    MAX_EVENTS,
     BookkeeperFailed,
     BookkeeperInput,
     JudgedTransaction,
@@ -53,6 +64,17 @@ JOB_NAME = "bookkeeping"
 AGENT = "bookkeeper"
 TARGET_TABLE = "transactions"
 TOOL = "txn.record"
+
+MAX_EVENTS_PER_WINDOW = 400
+"""一个窗口最多读几条交易事件。
+
+**它和 `MAX_EVENTS`(模型一批 40 条)是两个不同的上限**,别合并:
+超过 40 条会分批送模型,一条都不会漏;超过 400 条才是真的读不完 ——
+而那时会告警,不会静默截断(原来那一版就是静默的)。
+
+个人账本一天 400 笔已经远超正常,真出现多半是采集器在重放,
+而那种情况下"读完"没有意义,"喊一声"才有。
+"""
 
 BACKLOG_ALERT_AT = 20
 """待确认积压到多少条就告警。和日程那边同一个数,理由也一样:
@@ -95,6 +117,10 @@ class BookkeepingResult:
 
     dropped_ungrounded: int = 0
     failed_review: int = 0
+    failed_record: int = 0
+    """`txn.record` 抛了异常的笔数。**大于 0 就让整窗算失败** ——
+    见 `_record` 里那段注释:窗口标成功等于这些事件被永久跳过。"""
+
     categorized_by_rule: int = 0
     categorized_by_llm: int = 0
     rules_learned: int = 0
@@ -119,6 +145,7 @@ class BookkeepingResult:
             "discarded": self.discarded,
             "dropped_ungrounded": self.dropped_ungrounded,
             "failed_review": self.failed_review,
+            "failed_record": self.failed_record,
             "categorized_by_rule": self.categorized_by_rule,
             "categorized_by_llm": self.categorized_by_llm,
             "rules_learned": self.rules_learned,
@@ -192,18 +219,76 @@ def _book_window(
     now: datetime,
     result: BookkeepingResult,
 ) -> None:
-    stored = raw_events.fetch_transactions_between(user_id, session, start=start, end=end)
+    stored = raw_events.fetch_transactions_between(
+        user_id, session, start=start, end=end, limit=MAX_EVENTS_PER_WINDOW
+    )
     if not stored:
         log.info("窗口 %s 内没有交易事件", start.isoformat())
         result.no_events = True
         result.pending_backlog = pending.count_pending(user_id, session, now=now)
         return
 
-    judged = judge(BookkeeperInput(events=stored), llm=deps.llm)
+    if len(stored) >= MAX_EVENTS_PER_WINDOW:
+        # 取到上限就说明可能还有没取到的。**这一条必须喊出来** ——
+        # 静默截断的症状是"账本上这天少了几笔",而那要到月底对账才看得出来
+        message = f"一个窗口里取到 {len(stored)} 条交易事件,已到上限,更早的没读"
+        log.warning(message)
+        result.warnings.append(message)
+        deps.alerter.alert("记账窗口事件过多", message)
+
+    gateway = deps.gateway_factory(user_id, session)
+
+    # **分批送模型,不是只送最前面 40 条。**
+    # 原来这里一次性把整窗事件交给 `judge`,而它内部 `[:MAX_EVENTS]` 截断:
+    # 一天超过 40 条时,较旧的那些既没入账也没进待确认,窗口却照样标成功 ——
+    # 于是它们再也不会被读一次。分批之后每一条都会被判到,代价是多几次模型调用
+    for batch in _batches(stored, size=MAX_EVENTS):
+        _judge_and_apply(
+            user_id, session, gateway, batch, deps=deps, now=now, result=result
+        )
+
+    if result.failed_record:
+        # 落在这里而不是 `_record` 里直接抛:剩下的那些笔仍然值得处理一遍,
+        # 处理完了再把整窗标成失败,下次重跑时它们会被判成 duplicate
+        result.error = f"{result.failed_record} 笔入账失败,这一窗要重跑"
+        deps.alerter.alert("入账失败", result.error)
+
+    result.pending_backlog = pending.count_pending(user_id, session, now=now)
+    if result.pending_backlog >= BACKLOG_ALERT_AT:
+        message = f"待确认积压 {result.pending_backlog} 条,判据可能太保守了"
+        result.warnings.append(message)
+        deps.alerter.alert("待确认队列积压", message)
+
+
+def _batches(
+    stored: list[raw_events.StoredEvent], *, size: int
+) -> Iterator[list[raw_events.StoredEvent]]:
+    """按模型一次能吃下的条数切开。
+
+    **切的是"送给模型的批",不是"业务上的组"** —— 跨渠道合并、去重全都在
+    `txn.record` 里按库上的唯一键做,不依赖同一批里能不能看见对方。
+    所以怎么切都不影响结果,只影响调用几次。
+    """
+    for i in range(0, len(stored), size):
+        yield stored[i : i + size]
+
+
+def _judge_and_apply(
+    user_id: str,
+    session: Session,
+    gateway: Gateway,
+    batch: list[raw_events.StoredEvent],
+    *,
+    deps: BookkeepingDeps,
+    now: datetime,
+    result: BookkeepingResult,
+) -> None:
+    """一批:判定 + 落账。计数累加进同一个 `result`。"""
+    judged = judge(BookkeeperInput(events=batch), llm=deps.llm)
     output = judged.output
-    result.events_considered = output.considered_events
-    result.dropped_ungrounded = output.dropped_ungrounded
-    result.failed_review = output.failed_review
+    result.events_considered += output.considered_events
+    result.dropped_ungrounded += output.dropped_ungrounded
+    result.failed_review += output.failed_review
 
     record_tool_call(
         user_id,
@@ -213,7 +298,7 @@ def _book_window(
             agent=AGENT,
             tool_name="llm.chat",
             level=ToolLevel.L1,
-            args_digest={"events": {"type": "list", "len": len(stored)}},
+            args_digest={"events": {"type": "list", "len": len(batch)}},
             llm_fields_sent=judged.llm_fields_sent,
             result_status="allowed",
             prompt_tokens=judged.prompt_tokens,
@@ -221,13 +306,11 @@ def _book_window(
         ),
     )
 
-    by_event = {item.event_id: item for item in stored}
-    gateway = deps.gateway_factory(user_id, session)
-
+    by_event = {item.event_id: item for item in batch}
     for item in output.items:
         source = by_event.get(item.event_id)
         if source is None:
-            # 判定指回了一个这一窗里没有的事件。理论上进不来(index 就是从
+            # 判定指回了一个这一批里没有的事件。理论上进不来(index 就是从
             # 这批事件建的),真出现说明有 bug,而记一笔来源不明的钱最糟
             result.dropped_ungrounded += 1
             continue
@@ -238,12 +321,6 @@ def _book_window(
             _queue(user_id, session, item, source, now=now, result=result)
         else:
             _record(user_id, session, gateway, item, source, result=result)
-
-    result.pending_backlog = pending.count_pending(user_id, session, now=now)
-    if result.pending_backlog >= BACKLOG_ALERT_AT:
-        message = f"待确认积压 {result.pending_backlog} 条,判据可能太保守了"
-        result.warnings.append(message)
-        deps.alerter.alert("待确认队列积压", message)
 
 
 def _record(
@@ -276,10 +353,16 @@ def _record(
     try:
         value = gateway.call(ctx, TOOL, _args_for(item, source, category=decided.category))
     except Exception as exc:  # noqa: BLE001
-        # 一笔记失败不该让整个窗口失败:剩下的还有价值,而这一笔明天还会
-        # 被判一次(事件还在,交易没记成)
-        log.warning("入账失败,跳过这一笔:%s", exc)
+        # **这里原来写的是"这一笔明天还会被判一次",那句是假的。**
+        # 事件确实还在,但窗口会被标成 succeeded,而"该跑哪些窗口"只从
+        # 最后一个成功窗口往后切 —— 这一窗再也不会被读第二次,那笔钱就没了。
+        #
+        # 所以记一个 `failed_record`,由 `_book_window` 把整窗标成 failed。
+        # 整窗重跑是安全的:`transactions` 上有 UNIQUE (user_id, source_event_id),
+        # 已经记成的那些会被判成 duplicate,不会记两遍。
+        log.warning("入账失败,这一窗会重跑:%s", exc)
         result.warnings.append(f"入账失败:{exc}")
+        result.failed_record += 1
         return
 
     if value["duplicate"]:
