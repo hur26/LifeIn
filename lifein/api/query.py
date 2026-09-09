@@ -935,19 +935,28 @@ def delete_collected(
     `since` 不给就是全部。给了就只删那之后的 —— "把上周那几天删掉"是一个
     真实的诉求,而**只能全删的删除按钮很多人不敢点**。
 
-    派生的东西一起走:交易、待确认、以及出处全部落在被删事件里的记忆条目。
-    只删原文会留下一堆看起来仍然有出处的记忆,而点开才发现出处没了 ——
-    那让"有出处"这件事变得不可信。
+    派生的东西一起走:交易、待确认、出处全部落在被删事件里的记忆条目与日程、
+    这些东西的向量、以及别名上指向被删事件的证据(清单和理由在
+    `repos/data_control` 的模块开头)。
+
+    只删原文会留下一堆看起来仍然有出处的记忆和日程,而点开才发现出处没了 ——
+    那让"有出处"这件事变得不可信;留下向量则更隐蔽:那条被删的内容
+    **还能被语义检索命中**。
     """
     if since is not None and since.tzinfo is None:
         raise HTTPException(status_code=422, detail="since 必须带时区")
 
     removed = data_control.delete_collected(caller.user_id, session, since=since)
+    # **每一类各报一个数,不只报总数。** 用户点完删除唯一能验证的就是这些数字,
+    # 而"删了 12 条"回答不了"我那条日程还在不在"
     return {
         "raw_events": removed.raw_events,
         "transactions": removed.transactions,
         "pending": removed.pending,
         "facts": removed.facts,
+        "todos": removed.todos,
+        "embeddings": removed.embeddings,
+        "aliases": removed.aliases,
         "total": removed.total(),
     }
 

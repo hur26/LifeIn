@@ -282,3 +282,168 @@ def _events(session, user_id) -> int:
     return session.execute(
         text("SELECT count(*) FROM raw_events WHERE user_id = :u"), {"u": user_id}
     ).scalar_one()
+
+
+class TestWhatElseHasToGo:
+    """**"删除按钮点了,东西还在"是这一节存在的理由。**
+
+    最初的派生清单只有交易、待确认、记忆三样,而从那些通知派生出来的
+    还有三样:日程、向量、别名证据。漏掉它们的表现都一样 ——
+    用户以为删掉了,而那些东西还在库里,有的还能被检索命中。
+    """
+
+    def a_todo_from(self, session, user_id, *event_ids):
+        return session.execute(
+            text(
+                "INSERT INTO todos (user_id, kind, title, status, source, provenance,"
+                " created_by_agent, starts_at)"
+                " VALUES (:u, 'schedule', '周三三点开会', 'open', 'agent',"
+                " CAST(:p AS BIGINT[]), 'planner', :t) RETURNING id"
+            ),
+            {"u": user_id, "p": list(event_ids), "t": WHEN},
+        ).scalar_one()
+
+    def a_vector(self, session, user_id, *, ref_type: str, ref_id: str):
+        session.execute(
+            text(
+                "INSERT INTO embeddings (user_id, ref_type, ref_id, embedding, model)"
+                " VALUES (:u, :rt, :ri, CAST(:v AS VECTOR), 'test-model')"
+            ),
+            {
+                "u": user_id,
+                "rt": ref_type,
+                "ri": ref_id,
+                "v": "[" + ",".join(["0.1"] * 1024) + "]",
+            },
+        )
+
+    def an_alias(self, session, user_id, *event_ids):
+        entity = session.execute(
+            text(
+                "INSERT INTO entities (user_id, kind, canonical_name,"
+                " first_seen_at, last_seen_at)"
+                " VALUES (:u, 'person', '老王', :t, :t) RETURNING id"
+            ),
+            {"u": user_id, "t": WHEN},
+        ).scalar_one()
+        return session.execute(
+            text(
+                "INSERT INTO entity_aliases (user_id, entity_id, alias, alias_type,"
+                " evidence_event_ids) VALUES (:u, :e, '老王', 'nickname',"
+                " CAST(:v AS BIGINT[])) RETURNING id"
+            ),
+            {"u": user_id, "e": entity, "v": list(event_ids)},
+        ).scalar_one()
+
+    def count(self, session, table, user_id) -> int:
+        return session.execute(
+            text(f"SELECT count(*) FROM {table} WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+
+    def test_a_schedule_from_a_deleted_notification_goes_too(self, pg_session, user_id):
+        """**日程还在日历里,说"来自某条通知",而那条通知没了。**
+        和记忆条目是同一个问题:它看起来仍然有出处。"""
+        event = a_collected_event(pg_session, user_id)
+        self.a_todo_from(pg_session, user_id, event)
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert deleted.todos == 1
+        assert self.count(pg_session, "todos", user_id) == 0
+
+    def test_a_schedule_with_another_source_stays(self, pg_session, user_id):
+        """出处不止这些事件的留着 —— 删了反而是删掉了邮件那一半。"""
+        collected = a_collected_event(pg_session, user_id)
+        from_email = a_collected_event(
+            pg_session, user_id, external_id="m-1", source="email"
+        )
+        self.a_todo_from(pg_session, user_id, collected, from_email)
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert deleted.todos == 0
+        assert self.count(pg_session, "todos", user_id) == 1
+
+    def test_the_vector_of_a_deleted_event_goes_too(self, pg_session, user_id):
+        """**"删了但向量还在"不算删掉。**
+
+        向量是原文的有损编码,而且留着的那条还能被语义检索命中 ——
+        于是问一句相关的话,那条本该消失的东西又浮上来了。
+        """
+        event = a_collected_event(pg_session, user_id)
+        self.a_vector(pg_session, user_id, ref_type="raw_event", ref_id=str(event))
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert deleted.embeddings == 1
+        assert self.count(pg_session, "embeddings", user_id) == 0
+
+    def test_the_vector_of_a_deleted_fact_goes_too(self, pg_session, user_id):
+        """事实的向量在事实之前删 —— 反过来的话那条子查询已经查不到东西了,
+        而向量会安静地留下来。"""
+        event = a_collected_event(pg_session, user_id)
+        added = _a_fact(pg_session, user_id, statement="他不吃香菜", provenance=[event])
+        self.a_vector(pg_session, user_id, ref_type="fact", ref_id=str(added.fact.id))
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert (deleted.facts, deleted.embeddings) == (1, 1)
+        assert self.count(pg_session, "embeddings", user_id) == 0
+
+    def test_an_unrelated_vector_stays(self, pg_session, user_id):
+        a_collected_event(pg_session, user_id)
+        self.a_vector(pg_session, user_id, ref_type="raw_event", ref_id="999999")
+
+        data_control.delete_collected(user_id, pg_session)
+
+        assert self.count(pg_session, "embeddings", user_id) == 1
+
+    def test_deleted_events_are_stripped_from_alias_evidence(self, pg_session, user_id):
+        """**改不是删。** 一个别名可能有好几条证据,删掉整条等于把别的
+        证据也一起丢了。"""
+        collected = a_collected_event(pg_session, user_id)
+        from_email = a_collected_event(
+            pg_session, user_id, external_id="m-1", source="email"
+        )
+        alias = self.an_alias(pg_session, user_id, collected, from_email)
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert deleted.aliases == 0
+        evidence = pg_session.execute(
+            text("SELECT evidence_event_ids FROM entity_aliases WHERE id = :i"),
+            {"i": alias},
+        ).scalar_one()
+        assert evidence == [from_email]
+
+    def test_an_alias_with_no_evidence_left_is_removed(self, pg_session, user_id):
+        """**一条没有任何证据的别名比没有这条别名更糟**:它会继续把"老王"
+        解析到某个实体上,而没有任何东西能解释凭什么。"""
+        event = a_collected_event(pg_session, user_id)
+        self.an_alias(pg_session, user_id, event)
+
+        deleted = data_control.delete_collected(user_id, pg_session)
+
+        assert deleted.aliases == 1
+        assert self.count(pg_session, "entity_aliases", user_id) == 0
+
+    def test_the_audit_trail_stays(self, pg_session, user_id):
+        """**审计是保护用户的记录,不是关于用户的记录。**
+
+        里面只有字段名和长度,没有内容 —— 而删掉它等于让"它到底把什么发给了
+        外部模型"这个问题永远没法回答(R12)。这一条写进了隐私说明,
+        所以它必须是真的。
+        """
+        a_collected_event(pg_session, user_id)
+        pg_session.execute(
+            text(
+                "INSERT INTO tool_calls (user_id, agent, tool_name, level,"
+                " args_digest, result_status) VALUES (:u, 'digest', 'llm.chat', 'L1',"
+                " CAST('{}' AS JSONB), 'allowed')"
+            ),
+            {"u": user_id},
+        )
+
+        data_control.delete_collected(user_id, pg_session)
+
+        assert self.count(pg_session, "tool_calls", user_id) == 1

@@ -30,6 +30,40 @@
 **但派生的东西要一起走。** 只删 `raw_events` 会留下一堆
 `provenance` 指向不存在事件的记忆条目,而那些条目**看起来仍然是有出处的** ——
 点开才发现出处没了。那比留着原文更糟:它让"有出处"这件事变得不可信。
+
+## 派生的东西到底有哪些
+
+**这份清单最初漏了三样**,而漏掉的表现是"删除按钮点了,东西还在":
+
+| 表 | 怎么关联 | 漏掉的后果 |
+| --- | --- | --- |
+| `transactions` | `source_event_id` | —— |
+| `pending_confirmations` | `source_event_id` | —— |
+| `facts` | `provenance` 全落在被删事件里 | —— |
+| **`todos`** | `provenance` 全落在被删事件里 | 日程还在日历里,说"来自某条通知",而那条通知没了 |
+| **`embeddings`** | `ref_id` 指向被删的事件或事实 | **向量是原文的有损编码。**
+"删了但向量还在"不算删掉,而且它还能被语义检索命中 |
+| **`entity_aliases`** | `evidence_event_ids` 里有被删事件 |
+别名上写着"证据是第 42 条事件",而第 42 条不存在了 |
+
+**顺序不是随手排的,两处有讲究:**
+
+- `raw_events` 最后。外键指着它,先删它数据库直接拒绝
+- **事实的向量要在事实之前删。** 它们之间没有外键(`ref_id` 是 TEXT),
+  所以数据库不会拦 —— 但"哪些事实的出处全没了"这个子查询在事实删完之后
+  查不到任何东西,于是那些向量留了下来,而且还能被语义检索命中
+
+## 有两样东西刻意留着
+
+- **`tool_calls`**:审计。里面只有字段名和长度,没有内容 ——
+  而删掉它等于让"它到底把什么发给了外部模型"这个问题永远没法回答(R12)。
+  **这是保护用户的记录,不是关于用户的记录。**
+- **`push_log`**:同样只有标题和正文长度。它是误报率唯一的来源,
+  而那个数字决定要不要继续推东西。
+
+两样都不含通知原文。要连它们一起清掉只有一条路:整个注销账户
+(`export.purge_user`,那份清单是全的)。**这一点写进了隐私说明**,
+不能只在代码里知道。
 """
 
 from __future__ import annotations
@@ -68,8 +102,27 @@ class Deleted:
     """出处只剩被删事件的记忆条目。**跟着一起删** ——
     留着的话它们看起来仍然有出处,点开才发现没了。"""
 
+    todos: int = 0
+    """出处只剩被删事件的待办与日程。理由和 `facts` 一样。"""
+
+    embeddings: int = 0
+    """被删事件与事实的向量。**"删了但向量还在"不算删掉** ——
+    向量是原文的有损编码,而且它还能被语义检索命中。"""
+
+    aliases: int = 0
+    """证据被清空之后整条删掉的别名。证据里只是**少了几条**的不删,
+    那个别名还有别的依据。"""
+
     def total(self) -> int:
-        return self.raw_events + self.transactions + self.pending + self.facts
+        return (
+            self.raw_events
+            + self.transactions
+            + self.pending
+            + self.facts
+            + self.todos
+            + self.embeddings
+            + self.aliases
+        )
 
 
 _COUNT_ACTIVE_COLLECTORS = text("""
@@ -111,6 +164,60 @@ _DELETE_ORPHAN_FACTS = text("""
        AND provenance <@ CAST(:event_ids AS BIGINT[])
        AND array_length(provenance, 1) > 0
 """)
+
+
+_DELETE_ORPHAN_TODOS = text("""
+    DELETE FROM todos
+     WHERE user_id = :user_id
+       -- 和 facts 同一条判据:出处**全部**落在被删事件里才删。
+       -- 还有别的出处的留着 —— 那条日程不只来自被删掉的这些
+       AND provenance <@ CAST(:event_ids AS BIGINT[])
+       AND array_length(provenance, 1) > 0
+""")
+
+_DELETE_EVENT_VECTORS = text("""
+    DELETE FROM embeddings
+     WHERE user_id = :user_id
+       AND ref_type = 'raw_event'
+       -- ref_id 是 TEXT(它要同时指得了 bigint 的事件和 uuid 的事实),
+       -- 所以这里把事件 id 转成文本来比,不是把它转成 bigint
+       AND ref_id = ANY(CAST(:event_ids AS TEXT[]))
+""")
+
+_DELETE_ORPHAN_FACT_VECTORS = text("""
+    DELETE FROM embeddings
+     WHERE user_id = :user_id
+       AND ref_type = 'fact'
+       -- **必须在删 facts 之前跑。** 删完之后就找不到"哪些事实没了",
+       -- 而留下来的向量还能被语义检索命中 —— 那是"删了但没删干净"
+       AND ref_id IN (
+            SELECT CAST(id AS TEXT) FROM facts
+             WHERE user_id = :user_id
+               AND provenance <@ CAST(:event_ids AS BIGINT[])
+               AND array_length(provenance, 1) > 0
+       )
+""")
+
+_STRIP_ALIAS_EVIDENCE = text("""
+    UPDATE entity_aliases
+       SET evidence_event_ids = ARRAY(
+            SELECT e FROM unnest(evidence_event_ids) AS e
+             WHERE e <> ALL(CAST(:event_ids AS BIGINT[]))
+       )
+     WHERE user_id = :user_id
+       AND evidence_event_ids && CAST(:event_ids AS BIGINT[])
+""")
+"""把被删事件从证据数组里摘出去。**改不是删** —— 一个别名可能有好几条证据,
+删掉整条等于把别的证据也一起丢了。"""
+
+_DELETE_EMPTY_ALIASES = text("""
+    DELETE FROM entity_aliases
+     WHERE user_id = :user_id AND cardinality(evidence_event_ids) = 0
+""")
+"""证据被清空的别名整条删掉。
+
+**一条没有任何证据的别名比没有这条别名更糟**:它会继续把"老王"解析到某个
+实体上,而没有任何东西能解释凭什么。"""
 
 
 def state(user_id: str, session: Session) -> CollectionState:
@@ -161,25 +268,40 @@ def delete_collected(
     if not event_ids:
         return Deleted(raw_events=0, transactions=0, pending=0, facts=0)
 
+
     # **顺序不能反。** `transactions.source_event_id` 和
     # `pending_confirmations.source_event_id` 都有指向 `raw_events` 的外键 ——
     # 先删事件的话数据库直接拒绝,而那个报错("violates foreign key constraint")
     # 完全不解释"你应该先删派生的那些"
-    txns = session.execute(
-        _DELETE_TXNS, {"user_id": user_id, "event_ids": event_ids}
-    ).rowcount
-    pending = session.execute(
-        _DELETE_PENDING, {"user_id": user_id, "event_ids": event_ids}
-    ).rowcount
-    facts = session.execute(
-        _DELETE_ORPHAN_FACTS, {"user_id": user_id, "event_ids": event_ids}
-    ).rowcount
-    session.execute(_DELETE_EVENTS, {"user_id": user_id, "event_ids": event_ids})
+    args = {"user_id": user_id, "event_ids": event_ids}
+    txt_args = {"user_id": user_id, "event_ids": [str(i) for i in event_ids]}
+
+    txns = session.execute(_DELETE_TXNS, args).rowcount
+    pending = session.execute(_DELETE_PENDING, args).rowcount
+    todos = session.execute(_DELETE_ORPHAN_TODOS, args).rowcount
+
+    # **向量在事实之前删。** 反过来的话那条子查询("哪些事实的出处全没了")
+    # 已经查不到任何东西,而留下来的向量还能被语义检索命中
+    vectors = session.execute(_DELETE_ORPHAN_FACT_VECTORS, args).rowcount
+    vectors += session.execute(_DELETE_EVENT_VECTORS, txt_args).rowcount
+
+    facts = session.execute(_DELETE_ORPHAN_FACTS, args).rowcount
+
+    session.execute(_STRIP_ALIAS_EVIDENCE, args)
+    aliases = session.execute(_DELETE_EMPTY_ALIASES, {"user_id": user_id}).rowcount
+
+    session.execute(_DELETE_EVENTS, args)
 
     log.info(
-        "已删除采集数据:user=%s 事件 %s 交易 %s 待确认 %s 记忆 %s",
-        user_id, len(event_ids), txns, pending, facts,
+        "已删除采集数据:user=%s 事件 %s 交易 %s 待确认 %s 待办 %s 记忆 %s 向量 %s 别名 %s",
+        user_id, len(event_ids), txns, pending, todos, facts, vectors, aliases,
     )
     return Deleted(
-        raw_events=len(event_ids), transactions=txns, pending=pending, facts=facts
+        raw_events=len(event_ids),
+        transactions=txns,
+        pending=pending,
+        facts=facts,
+        todos=todos,
+        embeddings=vectors,
+        aliases=aliases,
     )
