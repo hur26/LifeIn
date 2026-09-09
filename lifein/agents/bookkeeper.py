@@ -40,6 +40,7 @@ from lifein.llm.prompt import ExternalBlock, build_messages, fields_sent, normal
 from lifein.models.normalized import PartyRole
 from lifein.repos.raw_events import StoredEvent
 from lifein.repos.transactions import CATEGORIES, TxnKind
+from lifein.sources.transaction_text import redact_for_model
 
 log = logging.getLogger(__name__)
 
@@ -173,8 +174,15 @@ def build_blocks(
 ) -> list[ExternalBlock]:
     """把交易事件包成隔离块。
 
-    **金额、卡号、方向作为结构化字段单独给**,不混在正文里(铁律 9 与 06 §5)——
+    **金额、方向作为结构化字段单独给**,不混在正文里(铁律 9 与 06 §5)——
     模型看得到它们才能判断类型,但它改不了它们:落账用的是规则抠出来的值。
+
+    **卡号一个字都不给。** 它作为 `account_hint` 存在库里,而判断"这是哪一类
+    资金变动"用不上它 —— 所以既不放进字段,正文里那一份也遮掉。
+
+    正文过 `redact_for_model`:那条规则原来只做了一半,结构化字段抽出来了,
+    正文照样原样送出去,于是**卡号和余额一起去了外部供应商那里**。
+    余额尤其糟 —— 它甚至不在我们要存的清单里(R10)。
     """
     blocks: list[ExternalBlock] = []
     for item in sorted(stored, key=lambda s: s.event.occurred_at, reverse=True)[:max_events]:
@@ -191,7 +199,7 @@ def build_blocks(
             ExternalBlock(
                 source=event.external_ref.source,
                 external_id=event.external_ref.external_id,
-                text=event.body or "",
+                text=redact_for_model(event.body),
                 fields=fields,
             )
         )
