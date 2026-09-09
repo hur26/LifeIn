@@ -131,7 +131,7 @@ def _run_window(
     result = PlanResult(window_start=start, window_end=end)
 
     if not job_runs.claim_window(
-        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end
+        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end, now=now
     ):
         result.skipped = True
         return result

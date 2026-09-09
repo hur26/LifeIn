@@ -500,8 +500,8 @@ CREATE TABLE credentials (
 
 -- 定时任务执行窗口:补偿的依据
 -- ADR-016 说补偿"靠数据库记录上次执行窗口实现,不依赖调度器自身的持久化"。
--- 这张表就是那个记录。唯一键让同一个窗口不会被跑第二次 ——
--- 进程半夜重启后按"最后一个成功窗口"往前补,补几次都是同一个结果。
+-- 这张表就是那个记录。唯一键让同一个窗口不会被**并发**跑两遍,
+-- 而 attempts 让它在**失败之后**还能再跑一遍 —— 这是两件事,见下方。
 CREATE TABLE job_runs (
     id           BIGSERIAL PRIMARY KEY,
     user_id      UUID NOT NULL,
@@ -509,6 +509,7 @@ CREATE TABLE job_runs (
     window_start TIMESTAMPTZ NOT NULL,
     window_end   TIMESTAMPTZ NOT NULL,
     status       TEXT NOT NULL CHECK (status IN ('running','succeeded','failed')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
     started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at  TIMESTAMPTZ,
     error        TEXT,
@@ -545,8 +546,47 @@ CREATE TABLE collector_heartbeat (
 );
 ```
 
+#### 窗口失败之后会发生什么
+
+**这一段是补出来的,因为原来的写法会静默丢事件。**
+
+原来的语义是:窗口认领走 `ON CONFLICT DO NOTHING`,而"该跑哪些窗口"只从
+**最后一个成功窗口**往后切。两条规则单看都对,合起来是一个洞:
+
+1. 周一的窗口失败了 —— `status='failed'`,那一天的事件一条都没处理
+2. 周二再跑,`windows_to_run` 从周日的成功点往后切,确实切出了周一
+3. 但 `claim_window` 撞上周一那行,`DO NOTHING`,返回"已经跑过",跳过
+4. 周二的窗口成功,成功点推进到周二 —— **周一从此再也不会被切出来**
+
+结果是"失败"和"成功"对下一次运行**没有任何区别**,而那一天的钱、日程、
+记忆全部消失,日志里只有一行早已被滚掉的 WARNING。
+
+所以 `attempts`:
+
+- 认领改成 `ON CONFLICT DO UPDATE ... WHERE status = 'failed' AND attempts < 3`。
+  判断和写入在同一条语句里 —— 先查后写会在并发下两个进程同时认领
+- **重跑必须是幂等的。** 这一点由下游保证而不是由这张表保证:
+  `transactions` 有 `UNIQUE (user_id, source_event_id)`,`todos`、`facts`
+  同理。重跑整个窗口只会把已经处理过的那些判成 duplicate
+- 三次之后不再重跑,行留在库里(`status='failed'`,`attempts=3`)。
+  **无限重试比放弃更糟**:一个永远失败的窗口会把后面每一天的额度都吃掉,
+  而那时丢的就不是一天了
+
+#### `running` 留着,但六小时之后不算数
+
 `job_runs.status='running'` 的记录**不清理**:进程被 kill 时它会留在那里,
 而"上一次跑了一半"和"从来没跑过"是两种不同的状态,分不清就没法安全补偿。
+
+但"不清理"不等于"永远当它在跑"。上面那个洞有一扇一模一样的侧门:
+进程在窗口跑到一半时被 kill,行卡在 `running`,而 `running` 既不算成功
+(不推进成功点)也不能被重新认领 —— **这一天同样丢掉了**。
+
+所以认领时把 `started_at` 早于六小时的 `running` 也当成可重认领的。
+六小时不是拍的:这几个 job 里最慢的是月度报告,一次模型调用加一次推送,
+分钟量级;跑了六小时的窗口一定是死的,不是慢的。
+
+> 这和"不清理"不矛盾:行还在,`attempts` 记着它被认领过几次,
+> "上一次跑了一半"这个事实一点没丢 —— 只是不再拿它当借口不干活。
 
 采集白名单表 `collector_whitelist` 定义在
 [07 §4](07-config.md#4-采集白名单存表用户可改) —— 它是用户可改的配置,

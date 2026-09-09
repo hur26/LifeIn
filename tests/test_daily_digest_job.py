@@ -215,10 +215,14 @@ def test_running_twice_does_not_push_twice(pg_session, user_id):
 
 
 def test_a_crashed_run_is_not_pushed_twice_either(pg_session, user_id):
-    """真正会走 skipped 的是这条路:上次认领了窗口但没跑完(进程被 kill)。
+    """真正会走 skipped 的是这条路:上次认领了窗口但**刚刚**没跑完。
 
-    窗口还在,会被重新算出来;但它已经被认领过,所以不会再推一遍。
-    这是"窗口是幂等键"那句话唯一真实生效的场景。
+    窗口还在,会被重新算出来;但它是 `running` 且才认领不久,
+    所以不会再推一遍 —— 幂等键挡的是并发,不是重试。
+
+    **注意"刚刚"这个限定。** 六小时之后同一个窗口会被重新认领:
+    卡在 `running` 的行原来永远拿不回来,那一天的摘要就此消失
+    (见 `job_runs` 里那段"running 留着,但六小时之后不算数")。
     """
     d, handles = deps()
     job_runs.claim_window(
@@ -227,6 +231,7 @@ def test_a_crashed_run_is_not_pushed_twice_either(pg_session, user_id):
         job_name=JOB_NAME,
         window_start=NOW - DAY,
         window_end=NOW,
+        now=NOW,
     )
     [result] = run_once(user_id, pg_session, deps=d, now=NOW)
 

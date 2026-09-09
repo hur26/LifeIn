@@ -89,8 +89,25 @@ def run_once(
     """跑该跑的窗口(通常一个,补跑时多个)。"""
     windows = job_runs.windows_to_run(user_id, session, job_name=JOB_NAME, now=now, length=window)
     return [
-        _run_window(user_id, session, deps=deps, start=start, end=end) for start, end in windows
+        _run_window(user_id, session, deps=deps, start=start, end=end, now=now)
+        for start, end in windows
     ]
+
+
+def _fail_unless_already_pushed(result: WindowResult, message: str) -> None:
+    """出错了,但**摘要已经推出去的话不能把窗口标成 failed**。
+
+    失败的窗口现在会被重跑(`job_runs` 那边的三次重试),而这个 job 里
+    唯一不幂等的动作就是推送 —— 库上的每一个写入都有唯一键挡着,
+    推送没有。标成 failed 的代价是同一份摘要明天再推一次,
+    而**用户看到的是系统在乱发消息**,比看不到那条报错严重得多。
+
+    错不会被吞:它进 `failed_sources`,并且已经 alert 过了。
+    """
+    if result.pushed:
+        result.failed_sources.append(f"推送之后出错(窗口仍算成功):{message}")
+    else:
+        result.error = message
 
 
 def _run_window(
@@ -100,11 +117,12 @@ def _run_window(
     deps: DigestDeps,
     start: datetime,
     end: datetime,
+    now: datetime,
 ) -> WindowResult:
     result = WindowResult(window_start=start, window_end=end)
 
     if not job_runs.claim_window(
-        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end
+        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end, now=now
     ):
         result.skipped = True
         return result
@@ -113,13 +131,14 @@ def _run_window(
         _ingest(user_id, session, deps=deps, since=start, result=result)
         _summarize_and_push(user_id, session, deps=deps, start=start, end=end, result=result)
     except DigestFailed as exc:
-        result.error = str(exc)
         deps.alerter.alert("每日摘要没生成出来", str(exc))
+        _fail_unless_already_pushed(result, str(exc))
     except Exception as exc:  # noqa: BLE001
         # 没预料到的异常也要落成 failed,否则这个窗口会被当成"成功过"再也不补
         log.exception("摘要 job 异常")
-        result.error = f"{type(exc).__name__}: {exc}"
-        deps.alerter.alert("每日摘要异常终止", result.error)
+        message = f"{type(exc).__name__}: {exc}"
+        deps.alerter.alert("每日摘要异常终止", message)
+        _fail_unless_already_pushed(result, message)
 
     job_runs.finish_window(
         user_id,

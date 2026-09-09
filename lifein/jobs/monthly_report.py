@@ -100,7 +100,7 @@ def run_once(
     result = MonthlyJobResult(period=start.strftime("%Y-%m"))
 
     if not job_runs.claim_window(
-        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end
+        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end, now=now
     ):
         # 已经发过了。**这是常态而不是异常** —— 进程一天重启五次也只发一份
         result.skipped = True
@@ -109,12 +109,13 @@ def run_once(
     try:
         _send(user_id, session, deps=deps, now=last_month, result=result)
     except MonthlyReportFailed as exc:
-        result.error = str(exc)
         deps.alerter.alert("月度报告生成失败", str(exc))
+        _fail_unless_already_delivered(result, str(exc))
     except Exception as exc:  # noqa: BLE001
         log.exception("月度报告 job 异常")
-        result.error = f"{type(exc).__name__}: {exc}"
-        deps.alerter.alert("月度报告异常终止", result.error)
+        message = f"{type(exc).__name__}: {exc}"
+        deps.alerter.alert("月度报告异常终止", message)
+        _fail_unless_already_delivered(result, message)
 
     job_runs.finish_window(
         user_id,
@@ -126,6 +127,22 @@ def run_once(
         error=result.error,
     )
     return result
+
+
+def _fail_unless_already_delivered(result: MonthlyJobResult, message: str) -> None:
+    """出错了,但**卡片已经送到的话不能把这个月标成 failed**。
+
+    失败的窗口现在会被重跑(`job_runs` 那边的三次重试),而这个 job 里
+    唯一不幂等的动作是推送。标成 failed 的代价是同一份月报再推一次 ——
+    而月报是一年只有十二次的东西,重复一次格外显眼。
+
+    这和 `_send_long_version` 那句"失败不算这次 job 失败"是同一条规矩,
+    只是那里是显式写的,这里补上了兜底路径。
+    """
+    if result.delivered:
+        result.warnings.append(f"推送之后出错(本月仍算发过):{message}")
+    else:
+        result.error = message
 
 
 def _send(

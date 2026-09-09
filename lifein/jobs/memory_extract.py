@@ -110,7 +110,8 @@ def run_once(
 ) -> list[ExtractResult]:
     windows = job_runs.windows_to_run(user_id, session, job_name=JOB_NAME, now=now, length=window)
     return [
-        _run_window(user_id, session, deps=deps, start=start, end=end) for start, end in windows
+        _run_window(user_id, session, deps=deps, start=start, end=end, now=now)
+        for start, end in windows
     ]
 
 
@@ -121,11 +122,12 @@ def _run_window(
     deps: MemoryDeps,
     start: datetime,
     end: datetime,
+    now: datetime,
 ) -> ExtractResult:
     result = ExtractResult(window_start=start, window_end=end)
 
     if not job_runs.claim_window(
-        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end
+        user_id, session, job_name=JOB_NAME, window_start=start, window_end=end, now=now
     ):
         result.skipped = True
         return result
