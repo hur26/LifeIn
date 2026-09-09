@@ -21,7 +21,16 @@ class MigrationSettings(BaseSettings):
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # **`disable_existing_loggers=False` 不能省。**
+    #
+    # 它默认是 True,意思是"把此刻已经存在的 logger 全部禁用" —— 而在
+    # 进程内跑迁移时(测试夹具、`python -m lifein --check`),`lifein.*` 那些
+    # logger 早就建好了,于是迁移跑完之后**这个进程里所有告警和日志静默消失**。
+    #
+    # 症状完全不像日志问题:告警"没发出去"、排查时日志里一片空白,
+    # 而重现它需要"先跑过迁移"这个前提。这一条是 2026-09 真踩的:
+    # 一条只在有数据库时才出现的红,而在此之前没人跑过带库的整套测试。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # 只在没人设过的时候才从 DATABASE_URL 取。
 # 无条件覆盖会把程序化传入的 url 吃掉 —— 测试夹具要指向另一个库,
