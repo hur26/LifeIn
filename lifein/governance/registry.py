@@ -10,9 +10,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import wraps
 from typing import Any
 
 from pydantic import BaseModel
@@ -103,6 +106,65 @@ class ToolSpec:
 _REGISTRY: dict[str, ToolSpec] = {}
 
 
+class DirectCall(RuntimeError):
+    """有人绕过网关直接调了工具函数([铁律 4](../../AGENTS.md#1-铁律))。
+
+    **这不是"用法错了",是一条防线被跳过了。** 跳过网关意味着这一次调用
+    没查等级、没查白名单、没记审计、L3 也没进审批队列 —— 而这四样正是
+    治理层存在的全部理由。
+    """
+
+
+_INSIDE_GATEWAY: ContextVar[str | None] = ContextVar("lifein_tool_call", default=None)
+"""当前正在被治理层执行的工具名。**没有它的话"过网关"和"不过网关"
+在代码里长得一模一样** —— 两者都是 `func(args, ctx)`。
+
+用 `ContextVar` 不用全局变量:它跟着调用栈走,而且在 asyncio 任务之间隔离。
+"""
+
+
+@contextmanager
+def executing(tool_name: str) -> Iterator[None]:
+    """**我知道我在绕过网关,而这一次是有理由的。**
+
+    名字取得这么直白是有意的:铁律 4 在 Python 里做不到"不可能绕过",
+    只能做到"绕过需要显式写出来,而且写出来会被看见"。谁 import 了它,
+    `tests/test_layering.py` 会看见。
+
+    **只有两个地方该用它:**
+
+    - `governance/gateway.py` —— 正门
+    - `jobs/approval_execute.py` —— L3 的执行。那次调用在**进审批队列那一刻**
+      已经过了网关(等级、白名单、入参、trust 全查过了),人点同意之后
+      再过一次网关只会把它重新变成一条审批
+    """
+    token = _INSIDE_GATEWAY.set(tool_name)
+    try:
+        yield
+    finally:
+        _INSIDE_GATEWAY.reset(token)
+
+
+def _guarded(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
+    """把工具函数包一层,进门先看是不是从治理层来的。
+
+    比对的是**工具名**不是一个布尔值:否则在 `a` 的网关调用里顺手调一下 `b`
+    也能过 —— 而那正是"绕过网关"最像正常代码的一种写法。
+    """
+
+    @wraps(func)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        if _INSIDE_GATEWAY.get() != name:
+            raise DirectCall(
+                f"{name} 被直接调用了,没过治理层网关(铁律 4)。"
+                "要调它请走 Gateway.call();"
+                "确实需要绕过的地方只有审批执行,那里用 registry.executing()"
+            )
+        return func(*args, **kwargs)
+
+    return guarded
+
+
 def tool(
     *,
     name: str,
@@ -137,12 +199,18 @@ def tool(
             name=name,
             level=level,
             args_model=args,
-            func=func,
+            # **注册表里存的是包过的那一份。** 存原函数的话,拿 `spec.func`
+            # 调一样绕得过去 —— 而那是最容易发生的绕法,因为它看起来
+            # 完全像在用注册表
+            func=_guarded(name, func),
             summary=summary,
             returns_rollback=returns_rollback,
             preview=preview,
         )
-        return func
+        # **返回包过的那一份,不是原函数。** 返回原函数的话,
+        # `from lifein.tools.todo import create` 拿到的就是没有守卫的版本 ——
+        # 而那正是铁律 4 要挡的那一句
+        return _REGISTRY[name].func
 
     return decorator
 

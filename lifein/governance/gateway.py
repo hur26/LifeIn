@@ -34,6 +34,7 @@ from lifein.governance.registry import (
     ToolLevel,
     ToolSpec,
     UnknownTool,
+    executing,
     get_tool,
 )
 from lifein.models.normalized import Trust
@@ -171,7 +172,12 @@ class Gateway:
     def _execute(self, ctx: CallContext, spec: ToolSpec, parsed: Any, digest: dict) -> Any:
         started = time.perf_counter()
         try:
-            result = spec.func(parsed, ToolContext(user_id=ctx.user_id, session=ctx.session))
+            # **这一行是"过网关"和"不过网关"唯一的区别**(铁律 4)。
+            # 工具函数被包了一层守卫,不在这个上下文里调它会抛 DirectCall
+            with executing(spec.name):
+                result = spec.func(
+                    parsed, ToolContext(user_id=ctx.user_id, session=ctx.session)
+                )
         except Exception:
             self._record(ctx, spec.name, spec.level, digest, "error", self._elapsed_ms(started))
             raise

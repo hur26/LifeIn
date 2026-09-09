@@ -56,7 +56,7 @@ from sqlalchemy.orm import Session
 from lifein.alerts import Alerter
 from lifein.channels.base import Channel
 from lifein.governance.audit import ToolCallRecord
-from lifein.governance.registry import ToolContext, ToolLevel, get_tool
+from lifein.governance.registry import ToolContext, ToolLevel, executing, get_tool
 from lifein.repos import approvals
 from lifein.repos.approvals import Approval
 from lifein.repos.tool_calls import record_tool_call
@@ -209,7 +209,11 @@ def _execute_one(
     try:
         # 这一步会动外部世界。**到这里为止这条已经是 `executing` 了** ——
         # 别的执行者认领不到,所以不会有第二条消息发出去
-        value = spec.func(args, ctx)
+        # **这是铁律 4 唯一的合法例外**,所以要显式写出来(见 `registry.executing`)。
+        # 这次调用在**进审批队列那一刻**已经过了网关:等级、白名单、入参、
+        # trust 全查过了。人点同意之后再过一次网关,只会把它重新变成一条审批
+        with executing(spec.name):
+            value = spec.func(args, ctx)
     except Exception as exc:  # noqa: BLE001
         _fail(
             user_id, session, item, deps=deps, result=result,
