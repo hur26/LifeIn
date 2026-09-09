@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -266,14 +267,19 @@ class TestPending:
         assert after.status is pending.PendingStatus.REJECTED
 
     def test_unknown_target_table_is_refused(self, client, pg_session, user_id, token):
-        """P2 的账目进来时,这个版本的服务端不该硬着头皮写。"""
+        """认不出来的目标表不该硬着头皮写。
+
+        `facts` 是下一个会进这个队列的表(06 §2.7 的 kind 里已经有它),
+        而在写它的那一片落地之前,确认按钮必须拿到 422 ——
+        而不是一个半写进去的事实。
+        """
         queued = pending.enqueue(
             user_id,
             pg_session,
-            agent="bookkeeper",
-            kind=pending.PendingKind.TRANSACTION,
-            target_table="transactions",
-            payload={"amount": "12.00"},
+            agent="memory",
+            kind=pending.PendingKind.FACT,
+            target_table="facts",
+            payload={"statement": "他不吃香菜"},
             reason=pending.PendingReason.LOW_CONFIDENCE,
             now=NOW,
         )
@@ -281,10 +287,191 @@ class TestPending:
             f"/app/pending/{queued.id}/resolve", headers=bearer(token), json={"action": "confirm"}
         )
         assert response.status_code == 422
-        # 没被认领:状态还是 pending,将来版本更新了还能处理
+        # **没被认领**:状态还是 pending,将来版本更新了还能处理。
+        # 认领了再失败等于把它变成永远处理不了的那种
         assert pending.get(user_id, pg_session, pending_id=queued.id).status is (
             pending.PendingStatus.PENDING
         )
+
+
+class TestConfirmingATransaction:
+    """**低置信度的账确认之后要真的入账。**
+
+    这条路原来是断的:P2 的记账 job 早就在往队列里塞
+    `target_table='transactions'`,而 `resolve` 只会写 `todos`,别的一律 422。
+    表现是那些钱堆在队列里,App 列得出来、点不动,三十天后过期 ——
+    而账本上从头到尾看不出少了什么。
+    """
+
+    def event_id(self, pg_session, user_id) -> int:
+        return pg_session.execute(
+            text(
+                "INSERT INTO raw_events (user_id, source, external_id, occurred_at, trust, raw)"
+                " VALUES (:u, 'notification', :e, :t, 'external', CAST('{}' AS JSONB))"
+                " RETURNING id"
+            ),
+            {"u": user_id, "e": f"n-{os.urandom(4).hex()}", "t": NOW},
+        ).scalar_one()
+
+    def queue_one(self, pg_session, user_id, **overrides):
+        event_id = self.event_id(pg_session, user_id)
+        payload = {
+            "occurred_at": NOW.isoformat(),
+            "amount": "38.50",
+            "currency": "CNY",
+            "direction": "debit",
+            "kind": "expense",
+            "channel": "bank_sms",
+            "source_event_id": event_id,
+            "confidence": 0.55,
+            "merchant_raw": "财付通",
+            "category": "餐饮",
+            "account_hint": "1234",
+            **overrides,
+        }
+        return pending.enqueue(
+            user_id,
+            pg_session,
+            agent="bookkeeper",
+            kind=pending.PendingKind.TRANSACTION,
+            target_table="transactions",
+            payload=payload,
+            reason=pending.PendingReason.LOW_CONFIDENCE,
+            confidence=0.55,
+            source_event_id=event_id,
+            now=NOW,
+        )
+
+    def test_confirming_lands_it_in_the_ledger(self, client, pg_session, user_id, token):
+        queued = self.queue_one(pg_session, user_id)
+
+        response = client.post(
+            f"/app/pending/{queued.id}/resolve", headers=bearer(token), json={"action": "confirm"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "confirmed"
+
+        (row,) = pg_session.execute(
+            text("SELECT amount, kind, category FROM transactions WHERE user_id = :u"),
+            {"u": user_id},
+        ).all()
+        assert (row.amount, row.kind, row.category) == (Decimal("38.50"), "expense", "餐饮")
+        assert pending.get(user_id, pg_session, pending_id=queued.id).status is (
+            pending.PendingStatus.CONFIRMED
+        )
+
+    def test_it_goes_through_the_gateway(self, client, pg_session, user_id, token):
+        """内容是 agent 提的,用户只是点头 —— 审计里得留下带 rollback 的那条,
+        否则"这笔钱哪来的、怎么撤"没人答得上来(06 §6.6 的唯一例外)。
+        """
+        queued = self.queue_one(pg_session, user_id)
+        client.post(
+            f"/app/pending/{queued.id}/resolve", headers=bearer(token), json={"action": "confirm"}
+        )
+
+        row = pg_session.execute(
+            text(
+                "SELECT tool_name, level, rollback_info, result_status FROM tool_calls"
+                " WHERE user_id = :u AND tool_name = 'txn.record'"
+            ),
+            {"u": user_id},
+        ).one()
+        assert row.level == "L2"
+        # L2 的 allowed 记录必须带 rollback_info,库上的 CHECK 也这么要求
+        assert (row.result_status, row.rollback_info is not None) == ("allowed", True)
+
+    def test_the_category_and_kind_can_be_corrected(self, client, pg_session, user_id, token):
+        """模型判的那一半可以改 —— 这正是这些账进队列的原因。"""
+        queued = self.queue_one(pg_session, user_id)
+
+        response = client.post(
+            f"/app/pending/{queued.id}/resolve",
+            headers=bearer(token),
+            json={
+                "action": "confirm",
+                "payload": {"kind": "repayment", "merchant_raw": "招行信用卡"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "edited"
+
+        row = pg_session.execute(
+            text("SELECT kind, merchant_raw FROM transactions WHERE user_id = :u"),
+            {"u": user_id},
+        ).one()
+        # repayment 不进支出统计 —— 消费那一刻已经记过一次了
+        assert (row.kind, row.merchant_raw) == ("repayment", "招行信用卡")
+
+    def test_the_amount_cannot_be_edited(self, client, pg_session, user_id, token):
+        """**放开金额等于给客户端一条往账本里写任意数字的路**,
+        而那一行的出处还写着"来自那条短信"。金额真抠错了该拒绝再手动补。
+        """
+        queued = self.queue_one(pg_session, user_id)
+
+        client.post(
+            f"/app/pending/{queued.id}/resolve",
+            headers=bearer(token),
+            json={"action": "confirm", "payload": {"amount": "9999.00", "direction": "credit"}},
+        )
+        row = pg_session.execute(
+            text("SELECT amount, direction FROM transactions WHERE user_id = :u"),
+            {"u": user_id},
+        ).one()
+        assert (row.amount, row.direction) == (Decimal("38.50"), "debit")
+
+    def test_the_source_event_comes_from_the_queue_not_the_client(
+        self, client, pg_session, user_id, token
+    ):
+        """铁律 5:出处不由客户端说了算。"""
+        queued = self.queue_one(pg_session, user_id)
+        someone_elses = self.event_id(pg_session, user_id)
+
+        client.post(
+            f"/app/pending/{queued.id}/resolve",
+            headers=bearer(token),
+            json={"action": "confirm", "payload": {"source_event_id": someone_elses}},
+        )
+        got = pg_session.execute(
+            text("SELECT source_event_id FROM transactions WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+        assert got == queued.source_event_id
+        assert got != someone_elses
+
+    def test_a_bogus_category_does_not_half_confirm_it(self, client, pg_session, user_id, token):
+        """工具的枚举校验拦下来时,**那条必须还是 pending**。
+
+        06 §2.7 那条硬要求:写入和状态更新在同一个事务里。
+        写失败却留下 confirmed,就是"确认了但没写进去"。
+        """
+        queued = self.queue_one(pg_session, user_id)
+
+        response = client.post(
+            f"/app/pending/{queued.id}/resolve",
+            headers=bearer(token),
+            json={"action": "confirm", "payload": {"category": "外卖"}},
+        )
+        assert response.status_code >= 400
+        assert pending.get(user_id, pg_session, pending_id=queued.id).status is (
+            pending.PendingStatus.PENDING
+        )
+        assert _ledger_count(pg_session, user_id) == 0
+
+    def test_confirming_twice_does_not_book_it_twice(self, client, pg_session, user_id, token):
+        queued = self.queue_one(pg_session, user_id)
+        first = client.post(
+            f"/app/pending/{queued.id}/resolve", headers=bearer(token), json={"action": "confirm"}
+        )
+        second = client.post(
+            f"/app/pending/{queued.id}/resolve", headers=bearer(token), json={"action": "confirm"}
+        )
+        assert (first.status_code, second.status_code) == (200, 409)
+        assert _ledger_count(pg_session, user_id) == 1
+
+
+def _ledger_count(session, user_id) -> int:
+    return session.execute(
+        text("SELECT count(*) FROM transactions WHERE user_id = :u"), {"u": user_id}
+    ).scalar_one()
 
 
 class TestCalendarSync:

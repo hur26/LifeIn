@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from lifein.api import auth
 from lifein.api.deps import AppCaller, NowDep, QueryDevice, SessionDep, SettingsDep
-from lifein.governance.gateway import CallContext, Gateway
+from lifein.governance.gateway import CallContext, Denied, Gateway
 from lifein.models.normalized import Trust
 from lifein.repos import (
     budgets,
@@ -62,14 +62,39 @@ FromParam = Annotated[datetime | None, Query(alias="from")]
 都要重复一遍那个 Query(...),而重复的东西迟早会有一处漏掉别名。"""
 
 TODOS_TABLE = "todos"
-"""P1 唯一会写的目标表。
+TRANSACTIONS_TABLE = "transactions"
 
-App 遇到不认识的 `target_table` 只展示不给确认按钮(06 §6.7),
-但服务端也得挡一道 —— 客户端的克制不能当成服务端的保证。
+TXN_ARGS = frozenset(
+    {
+        "occurred_at", "amount", "currency", "direction", "kind", "channel",
+        "source_event_id", "confidence", "merchant_raw", "category",
+        "account_hint", "order_no", "stage",
+    }
+)
+"""`txn.record` 认的入参名。
+
+**白名单而不是原样透传 payload**:队列里那份是记账 job 攒的,将来多塞一个
+调试字段进去,原样透传会让工具的 pydantic 校验直接 422 —— 而那时报的错
+指向的是"用户点了确认",不是"我们多存了一个字段"。
 """
 
-EDITABLE_FIELDS = ("title", "notes", "starts_at", "ends_at")
-"""修改后确认时,客户端能改的就这几项。出处不由客户端说了算。"""
+EDITABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    TODOS_TABLE: ("title", "notes", "starts_at", "ends_at"),
+    TRANSACTIONS_TABLE: ("category", "kind", "merchant_raw"),
+}
+"""修改后确认时,客户端能改的就这几项(06 §6.7)。出处不由客户端说了算。
+
+**账目那一行里没有 `amount`、`direction`、`occurred_at`,这不是漏了:**
+
+- 那三项是规则从原文里抠出来的,不是模型说的(铁律 9)。进待确认的原因是
+  "这是不是一笔支出说不准",不是"钱数说不准"
+- 放开金额等于给了客户端一条**往账本里写任意数字**的路,而那一行的出处
+  还写着"来自那条短信" —— 比记错一笔更糟的是记错了还查不出来
+- 金额真抠错了,正确的动作是拒绝它然后手动补一笔:那一笔的出处是
+  "用户自己填的",账本上分得清
+
+能改的三项都是模型判的那一半:分类、是支出还是还款/转账、商户名。
+"""
 
 
 
@@ -300,20 +325,37 @@ def resolve_pending(
             raise HTTPException(status_code=409, detail="已经处理过或已过期")
         return {"status": "rejected"}
 
-    if item.target_table != TODOS_TABLE:
-        # 这个版本的服务端只会写 todos。P2 的账目进来时,老 App 会把它列出来
-        # 但不该点得动(06 §6.7)—— 真点了也要在这里挡住
+    if item.target_table not in WRITERS:
+        # 不认识的目标表**在认领之前**挡住:那一条仍然是 pending,
+        # 将来版本更新了还能处理。认领了再失败等于把它变成永远处理不了的那种
         raise HTTPException(status_code=422, detail=f"还不会写 {item.target_table}")
 
-    edited = _merge_payload(item.payload, body.payload)
-    written = pending.confirm(
-        caller.user_id,
-        session,
-        pending_id=pending_id,
-        resolved_via="app",
-        edited_payload=edited,
-        writer=lambda payload: _create_via_gateway(caller, session, item=item, payload=payload),
-    )
+    edited = _merge_payload(item.target_table, item.payload, body.payload)
+    write = WRITERS[item.target_table]
+    try:
+        # **SAVEPOINT,不是整个事务回滚。**
+        #
+        # 网关的入参校验是客户端能触发的:一个旧版本 App 里的分类枚举比
+        # 服务端多一项,点确认就走到这里 —— 那该是 422,不是一个带栈的 500。
+        # 而把异常吃掉之后 `session_scope` 就不会回滚了,这时
+        # `pending.confirm` 里那条认领的 UPDATE 已经写下去,提交出去就是
+        # "确认了但没写进去" —— 06 §2.7 唯一不能出现的状态。
+        #
+        # 用 `session.rollback()` 也能挡住那个状态,但它会把**这个请求里
+        # 之前做过的一切**一起撤掉。SAVEPOINT 只撤这一次确认,
+        # 而且仍然在同一个事务里 —— §2.7 那条硬要求要的正是这个
+        with session.begin_nested():
+            written = pending.confirm(
+                caller.user_id,
+                session,
+                pending_id=pending_id,
+                resolved_via="app",
+                edited_payload=edited,
+                writer=lambda payload: write(caller, session, item=item, payload=payload),
+            )
+    except Denied as exc:
+        log.info("确认 %s 被网关挡住:%s", pending_id, exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if written is None:
         # 两个入口同时点确认是正常的用户行为,不是错误
         raise HTTPException(status_code=409, detail="已经处理过或已过期")
@@ -541,7 +583,7 @@ def toggle_whitelist(
 # ---------- 内部 ----------
 
 
-def _create_via_gateway(caller, session, *, item: pending.Pending, payload: dict) -> dict:
+def _create_todo_via_gateway(caller, session, *, item: pending.Pending, payload: dict) -> dict:
     """确认之后照 payload 写进 `todos`,**过网关**。
 
     这是"用户的写不过网关"那条规则的唯一例外:内容是 agent 提出来的,
@@ -574,16 +616,63 @@ def _create_via_gateway(caller, session, *, item: pending.Pending, payload: dict
     return dict(result)
 
 
-def _merge_payload(original: dict, edited: dict | None) -> dict | None:
+def _record_txn_via_gateway(caller, session, *, item: pending.Pending, payload: dict) -> dict:
+    """确认之后照 payload 记一笔账,**过网关**。和待办那条同一个形状。
+
+    金额、方向、时间、`source_event_id` 全部取队列里那份 —— 它们是记账 job
+    从原文里抠出来存进去的,客户端连改的路都没有(见 `EDITABLE_FIELDS`)。
+
+    **`stage` 跟着 payload 走,不写死。** 今天进队列的都是实时通知,
+    所以那里多半没有这个字段、落到默认的 `realtime`;但 `stage` 决定要不要走
+    五分钟跨渠道合并(`repos/transactions.record` 里 `reconciled` 那一路直接
+    跳过合并),写死成 `realtime` 会在将来某类账目进队列时**悄悄改掉它的去重
+    规则** —— 而那种错的表现是"账本上少了一笔",最难查的那一种。
+
+    返回值里 `created` 为假不代表失败,多半是跨渠道合并生效了 ——
+    这一点和记账 job 那边一致,调用方要按它计数。
+    """
+    gateway = Gateway(PostgresAuditSink(caller.user_id, session))
+    ctx = CallContext(
+        user_id=caller.user_id,
+        agent=item.agent,
+        # 触发这次调用的是用户的点击,不是那条短信。L2 不看 trust,
+        # 但如实记下来才对得上"谁让记的"
+        trust=Trust.USER_INPUT,
+        source_event_id=item.source_event_id,
+        session=session,
+    )
+    args = {k: v for k, v in payload.items() if k in TXN_ARGS}
+    # `source_event_id` 是铁律 5 的落地点:没有它这笔钱就没有出处。
+    # 队列行上那个字段是权威,payload 里那份只是副本
+    if item.source_event_id is not None:
+        args["source_event_id"] = item.source_event_id
+    result = gateway.call(ctx, "txn.record", args)
+    return dict(result)
+
+
+WRITERS = {
+    TODOS_TABLE: _create_todo_via_gateway,
+    TRANSACTIONS_TABLE: _record_txn_via_gateway,
+}
+"""确认之后往哪写。**加一张目标表就在这里加一行** ——
+`resolve_pending` 按它派发,而不认识的表在认领之前就被挡住(06 §6.7)。"""
+
+
+def _merge_payload(target_table: str, original: dict, edited: dict | None) -> dict | None:
     """把客户端改的那几项并回原 payload。没改就返回 None(原样确认)。
 
-    **出处不由客户端说了算**(铁律 5):`provenance` 与 `created_by_agent`
-    一律沿用队列里那份。放开的话,一条"帮张三带个东西"就能被改成
-    凭空出现在待办列表里的样子,而那比不出现更让人不敢用。
+    **白名单按目标表取**,不是一份公用的:`todos` 那几项放到账目上会让
+    客户端能改 `title`(账目根本没有这个字段,但下一次加字段时就不一定了),
+    而账目那几项放到待办上同理。两张表共用一个白名单等于赌它们永远不会长出
+    同名而不同义的字段。
+
+    **出处不由客户端说了算**(铁律 5):`provenance`、`created_by_agent`、
+    `source_event_id` 一律沿用队列里那份。放开的话,一条"帮张三带个东西"
+    就能被改成凭空出现在待办列表里的样子,而那比不出现更让人不敢用。
     """
     if not edited:
         return None
-    changes = {k: edited[k] for k in EDITABLE_FIELDS if k in edited}
+    changes = {k: edited[k] for k in EDITABLE_FIELDS[target_table] if k in edited}
     if not changes:
         return None
     return {**original, **changes}
