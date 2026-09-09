@@ -219,8 +219,203 @@ class TestThePages:
 def test_the_console_does_not_reimplement_the_app(client):
     """**03 那句"只剩"是这一片的边界。** 账本、待办、记忆都不进来 ——
     App 已经有了,而一份两处实现的界面会有两套 bug 和两次要改。
+
+    **红了不要顺手把新路径加进去。** 先对着 03 的 P4 范围看一眼:
+    它只列了"数据导出、账号与授权管理、隐私说明页"三样。
+    加一条进来要能指到那三样里的某一样 —— `/console/devices/invite`
+    指的是"账号与授权管理",而且 P4 范围里点了名。
     """
     from lifein.api import console
 
     paths = {r.path for r in console.router.routes}
-    assert paths == {"/app/console/link", "/console", "/console/export", "/console/privacy"}
+    assert paths == {
+        "/app/console/link",
+        "/console",
+        "/console/devices/invite",  # 账号与授权管理:添加设备
+        "/console/export",  # 数据导出
+        "/console/privacy",  # 隐私说明页
+    }
+
+
+class TestAddingADevice:
+    """**这一组是 03 的 P4 那句话的验收。**
+
+    那一条写的是"Web 控制台里点添加设备 → 页面显示二维码",而**理由是**
+    "现在的配码要人在服务器上跑 `issue-device`,非技术背景的人做不到"。
+
+    二维码的内容在 P4 第 1 片就修对了(里面是一次性换取码,不是密钥),
+    而出码这个动作在这之前还留在终端里 —— 于是那一条只做完了一半:
+    payload 安全了,流程还是要开 SSH。
+    """
+
+    def with_url(self, browser, value="https://life.example.com"):
+        """给这个客户端配一个 `PUBLIC_BASE_URL`。
+
+        走 `dependency_overrides` 而不是改环境变量:`Settings` 是进程级缓存的,
+        改环境变量会漏到别的用例里去,而那种污染只在整套一起跑时才出现。
+        """
+        from lifein.api.deps import get_app_settings
+        from tests.conftest import api_settings
+
+        def patched():
+            settings = api_settings()
+            object.__setattr__(settings, "public_base_url", value)
+            return settings
+
+        browser.app.dependency_overrides[get_app_settings] = patched
+
+    def test_the_button_is_on_the_home_page(self, browser, pg_session, user_id):
+        """点得到才算做完 —— 藏在某个 URL 后面的功能等于没有。"""
+        raw = a_link(pg_session, user_id)
+
+        page = open_console(browser, raw).text
+
+        assert "添加设备" in page
+        assert 'action="/console/devices/invite"' in page
+
+    def test_it_issues_a_code_and_shows_a_qr(self, browser, pg_session, user_id):
+        from lifein.repos import enrollment
+
+        self.with_url(browser)
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/invite")
+
+        assert page.status_code == 200
+        assert "<svg" in page.text, "页面上要有二维码本身,不是一个下载链接"
+        assert "life.example.com" in page.text
+        # 库里真多了一张码
+        codes = pg_session.execute(
+            text("SELECT count(*) FROM enrollment_codes WHERE user_id = :u"),
+            {"u": user_id},
+        ).scalar_one()
+        assert codes == 1
+        assert enrollment  # 用到它才说明这条路真走了仓储
+
+    def test_the_qr_is_inline_not_a_link(self, browser, pg_session, user_id):
+        """**控制台里没有任何外部引用。** 多一个外链就多一处 Referer
+        会带着东西出去的地方 —— 而这一页上带着的是一张能换走密钥的码。"""
+        self.with_url(browser)
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/invite").text
+
+        # 断言的是"没有外部资源引用",不是"页面里没有 http" ——
+        # SVG 自己的 xmlns 就是一个 http URL,而那个不发出任何请求
+        assert "<img" not in page
+        assert "src=" not in page
+        assert 'href="http' not in page
+        assert "<svg" in page
+
+    def test_the_payload_is_v2_with_no_secrets(self, browser, pg_session, user_id):
+        """**图里没有密钥。** 那正是它可以直接发给对方的原因 ——
+        `issue-device` 打出来的那张不行。"""
+        self.with_url(browser)
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/invite").text
+
+        assert "&quot;v&quot;: 2" in page, "配码 payload 要原样显示出来,扫不动时还能手抄"
+        assert "collector_secret" not in page
+        assert "query_secret" not in page
+
+    def test_it_needs_a_session(self, browser, pg_session, user_id):
+        """没有会话 cookie 就出不了码 —— 它签发的是一张能换走两把密钥的东西。"""
+        page = browser.post("/console/devices/invite").text
+        assert "重新点一次" in page
+
+    def test_it_is_not_a_link(self, browser, pg_session, user_id):
+        """**GET 会被浏览器预取、被"重新打开上次的标签页"重放** ——
+        而每重放一次就多一张有效的码,每一张都能配上一台设备。"""
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        assert browser.get("/console/devices/invite").status_code == 405
+
+    def test_without_a_public_url_it_says_so(self, browser, pg_session, user_id):
+        """**不猜一个地址。**
+
+        那个值会变成手机里"我的服务端在哪",而猜错的后果是他把自己的通知
+        报到了别处。请求头是发请求的人说了算的,照着它生成的码可能把手机
+        指到别人的服务器上。
+        """
+        from lifein.repos import enrollment  # noqa: F401
+
+        self.with_url(browser, value=None)
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/invite")
+
+        assert "PUBLIC_BASE_URL" in page.text
+        # **一张码都不该被签出来** —— 出一张指向 example.com 的码比不出更糟
+        codes = pg_session.execute(
+            text("SELECT count(*) FROM enrollment_codes WHERE user_id = :u"),
+            {"u": user_id},
+        ).scalar_one()
+        assert codes == 0
+
+    def test_the_code_belongs_to_whoever_clicked(
+        self, browser, pg_session, user_id, monkeypatch
+    ):
+        """铁律 1。`user_id` 从会话里取,页面上没有任何地方能指定别人 ——
+        **给朋友开账号是另一件事**,那要跑 `admin add-user`。"""
+        self.with_url(browser)
+        other = "99999999-9999-9999-9999-999999999999"
+        pg_session.execute(
+            text(
+                "INSERT INTO users (id, display_name, wecom_userid)"
+                " VALUES (:i, '别人', 'other')"
+            ),
+            {"i": other},
+        )
+        raw = a_link(pg_session, other)
+        open_console(browser, raw)
+
+        browser.post("/console/devices/invite")
+
+        owner = pg_session.execute(
+            text("SELECT user_id FROM enrollment_codes")
+        ).scalar_one()
+        assert str(owner) == other
+
+    def test_the_ttl_on_the_page_matches_the_real_one(
+        self, browser, pg_session, user_id, monkeypatch
+    ):
+        """页面上那句"十分钟内有效"必须和真正的过期时间是同一个数。
+
+        **各写各的话,先过期的是用户不知道的那一个** —— 他照着页面上的话
+        慢悠悠去扫,而码已经废了。
+        """
+        from lifein.api.console import INVITE_TTL
+
+        self.with_url(browser)
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/invite").text
+        expires = pg_session.execute(
+            text("SELECT expires_at FROM enrollment_codes")
+        ).scalar_one()
+
+        assert f"{int(INVITE_TTL.total_seconds() // 60)} 分钟内有效" in page
+        assert expires == NOW + INVITE_TTL
+
+    def test_the_version_matches_what_the_app_expects(self):
+        """服务端出的 `v` 和 App 认的那个必须是同一个数。
+
+        对不上的话新出的码会被 App 当成缺字段的旧式配码,
+        报一句完全指错方向的话 —— 而用户手上只有那句话。
+        """
+        from pathlib import Path
+
+        from lifein.repos.enrollment import INVITE_VERSION
+
+        kotlin = (
+            Path(__file__).resolve().parents[1]
+            / "android/app/src/main/java/ltd/iclab/lifein/data/Enrollment.kt"
+        ).read_text(encoding="utf-8")
+        assert f'INVITE_VERSION = "{INVITE_VERSION}"' in kotlin

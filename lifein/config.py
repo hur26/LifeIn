@@ -46,6 +46,17 @@ class Settings(BaseSettings):
     tz: str = "Asia/Shanghai"
     log_level: str = "INFO"
 
+    public_base_url: str | None = None
+    """反代之后、手机够得着的地址。**配码要把它写进二维码。**
+
+    **不能从请求里推。** `Host` 头是客户端说了算的:能设 `Host` 的人就能让
+    一张配码二维码指向他自己的服务器,而扫码的那个人不会发现 ——
+    他只会觉得"配上了",然后开始往那台机器上报自己的通知。
+
+    所以没配的时候宁可少一个功能:控制台的"添加设备"直接说去配这个值,
+    而不是猜一个地址、生成一张会把人送错地方的码。
+    """
+
     # ---------- 加密主密钥 ----------
     master_key: SecretStr
     master_key_version: int

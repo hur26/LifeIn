@@ -71,12 +71,22 @@ from fastapi import APIRouter, Cookie, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
-from lifein.api.deps import AppCaller, NowDep, SessionDep
-from lifein.repos import console_links, credentials, export, users
+from lifein import qr
+from lifein.api.deps import AppCaller, NowDep, SessionDep, SettingsDep
+from lifein.repos import console_links, credentials, enrollment, export, users
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["console"])
+
+INVITE_TTL = timedelta(minutes=10)
+"""配码活多久。**和 `enrollment.DEFAULT_TTL` 一样,而且是有意重复写一遍的** ——
+控制台上那句"十分钟内有效"是给人看的,它必须和真正的过期时间是同一个数,
+而不是各写各的。
+
+比控制台链接那十五分钟短:配码是当场扫的动作,而在聊天记录里躺三天的码
+等于没有一次性。
+"""
 
 COOKIE = "lifein_console"
 """会话 cookie 的名字。**值就是那张 token** —— 库里存的仍然是它的 sha256,
@@ -137,6 +147,9 @@ def console_home(
 
     user = users.get_user(user_id, session)
     devices = credentials.list_device_credentials(user_id, session)
+    # 首页那句"几分钟内有效"和出码页上那句必须是同一个数 ——
+    # 各写各的话,先过期的是用户不知道的那一个
+    invite_minutes = int(INVITE_TTL.total_seconds() // 60)
     rows = "".join(
         "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
             html.escape(d.device_id or "(没有名字)"),
@@ -154,6 +167,13 @@ def console_home(
             '<tr><td colspan="3">还没有配过设备</td></tr>'}</table>
         <p class="hint">两条一台:采集一把密钥、查询一把,分开签发。
         手机丢了告诉白杨,吊销这台的两条即可,别的设备不受影响。</p>
+
+        <form method="post" action="/console/devices/invite">
+          <button type="submit">添加设备</button>
+        </form>
+        <p class="hint">出一张二维码,在新手机的 LifeIn 里扫它。
+        <strong>图里没有密钥</strong> —— 只有一张 {invite_minutes} 分钟内、
+        只能用一次的换取码,所以它可以直接发过去。</p>
 
         <h2>你的数据</h2>
         <form method="post" action="/console/export">
@@ -206,6 +226,74 @@ def download_export(
         headers={
             "Content-Disposition": f'attachment; filename="lifein-{data.user_id[:8]}.json"'
         },
+    )
+
+
+@router.post("/console/devices/invite")
+def add_device(
+    session: SessionDep,
+    settings: SettingsDep,
+    now: NowDep,
+    lifein_console: Annotated[str | None, Cookie()] = None,
+) -> Response:
+    """出一张配码二维码(03 的 P4:"Web 控制台里点添加设备 → 页面显示二维码")。
+
+    **这一条是那句"现在的配码要人在服务器上跑 `issue-device`,非技术背景的人
+    做不到"的答案。** 二维码的内容在 P4 第 1 片已经修对了(里面是一次性换取码,
+    不是密钥),而出码这个动作在这之前还留在终端里。
+
+    **POST 不是 GET。** 它签发的是一张能换走两把密钥的码,而 GET 会被浏览器
+    预取、被"重新打开上次的标签页"重放 —— **每重放一次就多一张有效的码**,
+    每一张都能配上一台设备。
+
+    **`user_id` 从会话里取,页面上没有任何地方能指定别人。** 这张码只能配到
+    点它的那个人自己的账号上;给朋友开账号是另一件事,那要跑 `admin add-user`。
+    """
+    link = (
+        console_links.resolve(session, token=lifein_console, now=now)
+        if lifein_console
+        else None
+    )
+    if link is None:
+        return _page("LifeIn", "<p>这个链接过期了。在 App 里重新点一次。</p>")
+
+    base_url = settings.public_base_url if settings else None
+    if not base_url:
+        # **不猜一个地址。** 那个值会变成手机里"我的服务端在哪",
+        # 而猜错的后果是他把自己的通知报到了别处(07 §2.1 那段)
+        log.warning("没配 PUBLIC_BASE_URL,配不了码")
+        return _page(
+            "添加设备",
+            "<p>服务端还没配 <code>PUBLIC_BASE_URL</code>,出不了配码。</p>"
+            "<p class='hint'>那个值是手机要连的地址,它会被写进二维码。"
+            "**不能从这次请求里推出来** —— 请求头是发请求的人说了算的,"
+            "照着它生成的码可能把手机指到别人的服务器上。</p>",
+        )
+
+    code, issued = enrollment.issue(
+        link.user_id, session, base_url=base_url, now=now, ttl=INVITE_TTL
+    )
+    payload = json.dumps(
+        {"v": enrollment.INVITE_VERSION, "claim": code, "base_url": base_url}, ensure_ascii=False
+    )
+    minutes = int(INVITE_TTL.total_seconds() // 60)
+    log.info("控制台出了一张配码:user=%s code_id=%s", link.user_id, issued.id)
+
+    return _page(
+        "添加设备",
+        f"""
+        <p>在新手机的 LifeIn 里扫它。<strong>{minutes} 分钟内有效,只能用一次。</strong></p>
+        <div class="qr">{qr.render_qr_svg(payload)}</div>
+        <p class="hint">扫不动的话,把下面这串粘进 App 的配码框:</p>
+        <code>{html.escape(payload)}</code>
+        <p class="hint"><strong>这一串只显示这一次。</strong>
+        库里存的是它的哈希,服务端自己也说不出它是什么 ——
+        关掉这一页就只能再出一张。</p>
+        <p class="hint">图里没有密钥,所以它可以直接发给对方。
+        真被别人截图拿到也只有两种结局:要么你已经换过了(他换不了),
+        要么你还没换(你会发现自己换不了)。</p>
+        <p><a href="/console">回到首页</a></p>
+        """,
     )
 
 
@@ -262,6 +350,10 @@ def _page(title: str, body: str) -> Response:
  td, th {{ border-bottom: 1px solid #ddd; padding: .4rem .2rem; text-align: left; }}
  .hint {{ color: #666; font-size: .9rem; }}
  pre {{ white-space: pre-wrap; word-break: break-word; }}
+ code {{ display: block; word-break: break-all; background: #f6f6f6;
+         padding: .6rem; border-radius: 4px; font-size: .85rem; }}
+ .qr svg {{ width: 280px; height: 280px; }}
+ button {{ font: inherit; padding: .5rem 1rem; }}
 </style></head>
 <body><h1>{html.escape(title)}</h1>{body}</body></html>""",
         media_type="text/html; charset=utf-8",

@@ -19,10 +19,12 @@ import io
 from pathlib import Path
 
 
-def write_qr_html(data: str, path: Path, *, title: str, hint: str = "") -> None:
-    """把 `data` 编成二维码写进一个 HTML 文件,双击就能用浏览器打开扫。
+def render_qr_svg(data: str) -> str:
+    """把 `data` 编成一段 SVG,**原样嵌进页面**。
 
-    `data` 原样进二维码,也原样显示在页面上 —— 扫不动的时候还能手抄。
+    单独一个函数是给 Web 控制台用的:那边要把二维码**内联**进 HTML,
+    而不是写成文件再 `<img src>` 引一次 —— 控制台里没有任何外部引用,
+    多一个外链就多一处 Referer 会带着东西出去的地方(06 §6.13)。
     """
     import qrcode as qrcode_lib
     import qrcode.image.svg as qrcode_svg
@@ -31,6 +33,20 @@ def write_qr_html(data: str, path: Path, *, title: str, hint: str = "") -> None:
     buffer = io.BytesIO()
     image.save(buffer)
     svg = buffer.getvalue().decode()
+
+    # **去掉 XML 声明。** `<?xml …?>` 只在文件开头合法,嵌进 HTML 里之后
+    # 它会被当成一段文本原样显示在二维码上面 —— 而那看起来像页面坏了
+    if svg.startswith("<?xml"):
+        svg = svg[svg.index("?>") + 2 :].lstrip()
+    return svg
+
+
+def write_qr_html(data: str, path: Path, *, title: str, hint: str = "") -> None:
+    """把 `data` 编成二维码写进一个 HTML 文件,双击就能用浏览器打开扫。
+
+    `data` 原样进二维码,也原样显示在页面上 —— 扫不动的时候还能手抄。
+    """
+    svg = render_qr_svg(data)
 
     path.write_text(
         "<!doctype html><meta charset='utf-8'>"

@@ -1050,6 +1050,17 @@ def cmd_invite(args: argparse.Namespace) -> int:
     settings = get_settings()
     now = datetime.now(settings.tzinfo)
 
+    # **和控制台读同一个值。** 两处各写各的地址时,先出错的是没人核对的那一处 ——
+    # 而这个值会变成手机里"我的服务端在哪"(07 §2.1)
+    base_url = args.base_url or settings.public_base_url
+    if not base_url:
+        print(
+            "没给 --base-url,也没配 PUBLIC_BASE_URL。"
+            "那个值会被写进二维码,变成手机要连的地址 —— 不能猜一个",
+            file=sys.stderr,
+        )
+        return 1
+
     with session_scope() as session:
         if users.get_user(args.user, session) is None:
             print(f"用户不存在:{args.user}", file=sys.stderr)
@@ -1057,14 +1068,14 @@ def cmd_invite(args: argparse.Namespace) -> int:
         code, issued = enrollment.issue(
             args.user,
             session,
-            base_url=args.base_url,
+            base_url=base_url,
             now=now,
             purpose=args.purpose,
             ttl=timedelta(minutes=args.minutes),
         )
 
     payload = json.dumps(
-        {"v": 2, "claim": code, "base_url": args.base_url}, ensure_ascii=False
+        {"v": enrollment.INVITE_VERSION, "claim": code, "base_url": base_url}, ensure_ascii=False
     )
 
     print(f"这张码 {args.minutes} 分钟内有效,只能用一次。")
@@ -1468,8 +1479,8 @@ def build_parser() -> argparse.ArgumentParser:
     invite.add_argument("--user", required=True)
     invite.add_argument(
         "--base-url",
-        default="https://example.com",
-        help="App 要连的地址(反代之后的),写进码里省得对方手输",
+        default=None,
+        help="App 要连的地址(反代之后的)。不给就读 PUBLIC_BASE_URL",
     )
     invite.add_argument(
         "--purpose",
