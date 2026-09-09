@@ -9,18 +9,23 @@
 
 ## 怎么编
 
-已经在 Windows 上真编过:JDK 17 + Android SDK 35 + Gradle 8.9
-(装在 `D:\environment`),`assembleDebug` 与 `testDebugUnitTest` 都过。
+需要 JDK 17、Android SDK(compileSdk 见 `app/build.gradle.kts`)、Gradle 8.9。
+已经在 Windows 上真编过,`assembleDebug` 与 `testDebugUnitTest` 都过。
 
 ```bash
-export JAVA_HOME=/d/environment/jdk/jdk-17.0.20.1+1
-export ANDROID_HOME=/d/environment/android-sdk
+export JAVA_HOME=<你的 JDK 17>
+export ANDROID_HOME=<你的 Android SDK>
 cd android
-/d/environment/gradle/gradle-8.9/bin/gradle.bat assembleDebug testDebugUnitTest
+"$GRADLE_HOME/bin/gradle" assembleDebug testDebugUnitTest
 ```
 
-`local.properties` 里要有 `sdk.dir=D:/environment/android-sdk`(不进版本库)。
-用 Android Studio 打开 `android/` 目录也一样,它会自己补 Gradle wrapper。
+**这份文档里不写具体路径。** 这个项目在不止一台机器上开发,而写死的路径
+在别的机器上不是"改一下就好" —— 它会让人以为那是要求,然后去建一个同名目录。
+装在哪由 `JAVA_HOME` / `ANDROID_HOME` 回答,那两个变量本来就是干这个的。
+
+`local.properties` 里要有 `sdk.dir=<你的 Android SDK>`,**它不进版本库**
+(`.gitignore` 里有)—— 正是因为每台机器不一样。
+用 Android Studio 打开 `android/` 目录会自己补上它。
 
 产物在 `app/build/outputs/apk/debug/app-debug.apk`。
 

@@ -233,11 +233,17 @@ pytest -m integration        # 夹具每次从 base 重建到 head,顺带测迁�
 
 **但 P1 还不能算做完**,因为剩下的验收标准全在手机上和时间里:
 
-- **App 编得出来,但没在真机上跑过。** 工具链在 `D:\environment`
-  (JDK 17 + SDK 35 + Gradle 8.9),`assembleDebug` 与 `testDebugUnitTest`
-  都过,11 个纯逻辑单元测试零失败 —— 但"编得过"和"在一台被频繁清后台的
-  主力机上活得下来"是两件事。下一步是装机、配码、开通知使用权
+- **App 编得出来,但没在真机上跑过。** JDK 17 + Android SDK + Gradle 8.9,
+  `assembleDebug` 与 `testDebugUnitTest` 都过,纯逻辑单元测试零失败 ——
+  但"编得过"和"在一台被频繁清后台的主力机上活得下来"是两件事。
+  下一步是装机、配码、开通知使用权
   (`android/README.md` 里有"怎么确认它真的在跑")
+
+  > **这份文档以及 `android/README.md` 里都不写工具链装在哪。**
+  > 这个项目在不止一台机器上开发,而写死的路径在别的机器上不是
+  > "改一下就好" —— 它会让人以为那是要求,然后去建一个同名目录。
+  > 装在哪由 `JAVA_HOME` / `ANDROID_HOME` / `local.properties` 回答,
+  > 那几个本来就是干这个的,而且 `local.properties` 本来就不进版本库。
 - 影子期数据、误报率、日程漏报率还一条都没开始攒 ——
   见 [03 的 P1 验收标准](docs/03-roadmap.md#验收标准-1)
 - **服务端要搬到云服务器**([ADR-022](docs/04-tech-decisions.md#adr-022--服务端搬到云服务器用已备案域名的子域名))。
