@@ -1017,7 +1017,16 @@ def cmd_approvals(args: argparse.Namespace) -> int:
         print(f"⚠ 有 {leaked} 条不是由 user_input 触发的 —— 那条 CHECK 被绕过了,停下来查")
     else:
         print("越权:0 条(approvals 里没有非 user_input 触发的行)")
-    print("重复执行:看告警里有没有出现过“可能的重复执行”——它不会自己冒出来")
+    stuck = counts.get("executing", 0)
+    if stuck:
+        # **卡在 executing 就是那条判据。** 它的含义是"开始发了,但不知道
+        # 发出去没有" —— 不能替用户猜:重试可能发第二条,标失败会让人
+        # 以为一条都没发。所以这里只把它摆出来,由人去确认
+        print(f"⚠ 重复执行风险:{stuck} 条卡在 executing")
+        print("  含义是「开始发了,但不知道发出去没有」。去对面确认收到没有,")
+        print("  然后手动把状态改成 executed 或 failed。**不要直接重跑。**")
+    else:
+        print("重复执行:0 条卡在 executing(执行前先认领,认领不到就不发)")
     return 0
 
 

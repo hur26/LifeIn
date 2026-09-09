@@ -6,9 +6,10 @@
 所以顺序是:先测不该发生的(没批准的不执行、做过的不再做、schema 对不上不猜),
 再测该发生的(批准过的真的发出去了,而且审计里查得到谁批准的)。
 
-**"先执行,再改状态"那个取舍在这里有一条专门的用例。** 反过来的话,
-改完状态到执行完成之间挂了,那条审批会永远停在 `executed` 而事情根本没做 ——
-而两个零里"漏做"不在其中,"重复做"在。
+**"两个执行者同时拿到同一条"在这里有一条专门的用例。**
+它是原来那个设计真正会出事的地方,而顺序跑两遍的用例看不出来:
+第二遍时那条已经是 `executed` 了。要复现得让两个执行者**都在还是 `approved`
+的时候**读到它 —— 而那正是生产里会发生的事。
 """
 
 from __future__ import annotations
@@ -102,6 +103,58 @@ class TestWhatMustNotHappen:
 
         assert (first.executed, second.executed) == (1, 0)
         assert len(channel.cards) == 1
+
+    def test_two_executors_racing_only_send_once(self, pg_session, user_id):
+        """**这一条是那个 bug 的回归测试。**
+
+        上面那条顺序跑两遍的用例在旧代码上也是绿的:第二遍时行已经是
+        `executed` 了。真正会出事的是两个执行者**都在还是 `approved` 的时候**
+        读到同一条 —— 生产里那就是两个进程、或者一次调度重叠。
+
+        旧代码的两步是"先执行、再写结果",于是两个都发了出去,只是其中一个
+        在写结果时才发现自己是第二个。而那时消息已经出去了,告警只能事后说。
+        """
+        item = an_approved(pg_session, user_id)
+        channel = Sent()
+        d = deps(channel)
+
+        # 两个执行者各自读到了同一条 approved 的记录
+        (a,) = approvals.list_ready(user_id, pg_session)
+        (b,) = approvals.list_ready(user_id, pg_session)
+        assert a.id == b.id == item.id
+
+        first = approval_execute.ExecuteResult()
+        second = approval_execute.ExecuteResult()
+        approval_execute._execute_one(user_id, pg_session, a, deps=d, result=first)
+        approval_execute._execute_one(user_id, pg_session, b, deps=d, result=second)
+
+        assert len(channel.cards) == 1, "第二个执行者不该把消息也发出去"
+        assert (first.executed, second.executed) == (1, 0)
+        assert second.skipped == 1
+
+    def test_the_loser_of_the_race_does_not_alert(self, pg_session, user_id):
+        """**认领不到不是错误,是"只做一次"在起作用。**
+
+        旧代码在这里会发一条"可能的重复执行"告警 —— 那时它是对的,因为
+        确实可能重复发了。现在什么都没发出去,再告警就是在制造噪音,
+        而 03 那张验收表上"有没有重复执行"要看的是别的东西。
+        """
+        item = an_approved(pg_session, user_id)
+        alerter = Loud()
+        d = deps(Sent(), alerter)
+
+        (a,) = approvals.list_ready(user_id, pg_session)
+        (b,) = approvals.list_ready(user_id, pg_session)
+        for item_read in (a, b):
+            approval_execute._execute_one(
+                user_id, pg_session, item_read, deps=d,
+                result=approval_execute.ExecuteResult(),
+            )
+
+        assert alerter.sent == []
+        assert approvals.get(user_id, pg_session, approval_id=item.id).status is (
+            ApprovalStatus.EXECUTED
+        )
 
     def test_a_rejected_one_is_never_executed(self, pg_session, user_id):
         item = a_pending(pg_session, user_id)
@@ -240,3 +293,51 @@ def test_the_batch_size_is_small(pg_session, user_id):
 
     assert result.executed == 2
     assert len(channel.cards) == 2
+
+
+class TestStuckInExecuting:
+    """认领之后、拿到结果之前进程挂了。**这是新顺序的代价,而它是可见的。**
+
+    含义是"我们开始发了,但不知道发出去没有" —— 唯一不能替用户猜的情况:
+    重试可能发第二条,标成失败会让人以为一条都没发。
+    """
+
+    def stuck_one(self, pg_session, user_id, *, claimed_at):
+        item = an_approved(pg_session, user_id)
+        approvals.claim_for_execution(
+            user_id, pg_session, approval_id=item.id, now=claimed_at
+        )
+        return item
+
+    def test_a_fresh_claim_is_not_reported(self, pg_session, user_id):
+        """刚认领的不算卡住。**一条会天天误报的告警等于没有告警。**"""
+        self.stuck_one(pg_session, user_id, claimed_at=NOW)
+        alerter = Loud()
+
+        result = approval_execute.run_once(
+            user_id, pg_session, deps=deps(Sent(), alerter, now=NOW)
+        )
+        assert result.stuck == 0
+        assert alerter.sent == []
+
+    def test_an_old_claim_is_alerted(self, pg_session, user_id):
+        item = self.stuck_one(pg_session, user_id, claimed_at=NOW - timedelta(hours=1))
+        alerter = Loud()
+
+        result = approval_execute.run_once(
+            user_id, pg_session, deps=deps(Sent(), alerter, now=NOW)
+        )
+        assert result.stuck == 1
+        assert alerter.sent, "卡住的审批必须告警 —— 它是 03 验收表里那一行的判据"
+        assert f"#{item.id}" in alerter.sent[0][1]
+
+    def test_it_is_not_retried(self, pg_session, user_id):
+        """**只报,不动。** 重试就是发第二条,而我们不知道第一条发出去没有。"""
+        item = self.stuck_one(pg_session, user_id, claimed_at=NOW - timedelta(hours=1))
+        channel = Sent()
+
+        approval_execute.run_once(user_id, pg_session, deps=deps(channel, now=NOW))
+
+        assert channel.cards == []
+        after = approvals.get(user_id, pg_session, approval_id=item.id)
+        assert after.status is ApprovalStatus.EXECUTING, "不该被自动改成 failed"

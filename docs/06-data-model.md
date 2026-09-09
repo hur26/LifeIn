@@ -423,10 +423,11 @@ CREATE TABLE approvals (
     trigger_trust    TEXT NOT NULL,
     source_event_id  BIGINT REFERENCES raw_events(id),
     status           TEXT NOT NULL DEFAULT 'pending'
-                       CHECK (status IN ('pending','approved','rejected',
-                                         'executed','expired','failed')),
+                       CHECK (status IN ('pending','approved','executing',
+                                         'rejected','executed','expired','failed')),
     expires_at       TIMESTAMPTZ NOT NULL,
     approved_at      TIMESTAMPTZ,
+    started_at       TIMESTAMPTZ,            -- 认领去执行的那一刻
     executed_at      TIMESTAMPTZ,
     result           JSONB,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -438,6 +439,39 @@ CREATE TABLE approvals (
 
 **那条 `CHECK` 就是铁律 8。** L3 永远不由外部内容触发 —— 这句话现在是数据库约束,
 不是文档里的一句话。提示注入即使骗过了 agent,也写不进这张表。
+
+#### `executing` 是补上去的,因为原来的顺序会真的发两条
+
+原来执行 job 的顺序是**先执行、再改状态**,理由写在那个模块的开头:
+
+> 反过来的话,改完状态到执行完成之间那一瞬如果进程挂了,那条审批会永远
+> 停在 `executed` 而事情根本没做 —— 两害相权,宁可有极小的概率重发一条。
+
+**那个取舍算错了两件事:**
+
+1. **概率不小。** `list_ready` 取的是 `status='approved'` 的行,两个执行者
+   会同时取到同一条、同时执行、同时发出去。"极小的概率"描述的是崩溃窗口,
+   而这里的窗口是**整个执行时长** —— 代发一条消息要等对面的接口几秒钟
+2. **代价的方向反了。** [03 的 P3 退出条件](03-roadmap.md#退出条件-3)写着
+   "出现任何一次重复执行 → 停止 L3 上线"。而"漏做"不在退出条件里。
+   拿一个会触发退出条件的风险,去换一个不在退出条件里的风险
+
+所以改成三步:**认领 → 执行 → 记结果**。
+
+```
+pending ──同意──→ approved ──认领──→ executing ──┬─→ executed
+                                                  └─→ failed
+```
+
+认领是一条带条件的语句(`UPDATE … SET status='executing' WHERE status='approved'`),
+判断和写入在一起 —— 第二个执行者拿到 0 行,**在发出去之前就知道自己白跑了**。
+
+**卡在 `executing` 的行不自动重试,而且要告警。** 它的含义是"我们开始发了,
+但不知道发出去没有" —— 而那正是唯一不能替用户猜的情况:重试可能发第二条,
+放着不管可能一条都没发。所以由人看一眼,`admin approvals` 里看得到。
+[03 那张验收表](03-roadmap.md#验收标准-3)里"有没有重复执行"这一行,
+判据从"告警里出现过可能的重复执行"改成"有没有卡住的 `executing`" ——
+前者是事后发现,后者是事前拦住。
 
 ### 2.9 tool_calls · 审计与成本
 

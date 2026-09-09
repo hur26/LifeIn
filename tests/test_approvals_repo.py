@@ -104,10 +104,40 @@ class TestZeroDuplicateExecution:
         assert first is not None and first.status is ApprovalStatus.APPROVED
         assert second is None
 
+    def test_only_one_executor_can_claim_it(self, pg_session, user_id):
+        """**"只做一次"落在这里,而且必须在发出去之前。**
+
+        原来没有这一步:两个执行者都从 `approved` 读到同一条,都执行,
+        都把消息发出去,只是其中一个在写结果时才发现自己是第二个 ——
+        而那时消息已经出去了。
+        """
+        item = a_request(pg_session, user_id)
+        approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+
+        first = approvals.claim_for_execution(
+            user_id, pg_session, approval_id=item.id, now=NOW
+        )
+        second = approvals.claim_for_execution(
+            user_id, pg_session, approval_id=item.id, now=NOW
+        )
+
+        assert first is not None and first.status is ApprovalStatus.EXECUTING
+        assert first.started_at == NOW
+        assert second is None, "第二个执行者必须在动外部世界之前就拿到 None"
+
+    def test_a_claimed_one_is_no_longer_ready(self, pg_session, user_id):
+        """认领之后就不在执行队列里了 —— 否则同一轮里还会被再取一次。"""
+        item = a_request(pg_session, user_id)
+        approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
+
+        assert approvals.list_ready(user_id, pg_session) == []
+
     def test_executing_twice_only_works_once(self, pg_session, user_id):
         """**job 跑两遍时,第二遍拿到 None,于是它知道自己白跑了一趟。**"""
         item = a_request(pg_session, user_id)
         approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
 
         first = approvals.mark_executed(
             user_id, pg_session, approval_id=item.id, now=NOW, result={"sent": True}
@@ -118,9 +148,43 @@ class TestZeroDuplicateExecution:
         assert second is None
 
     def test_executing_something_never_approved_does_nothing(self, pg_session, user_id):
-        """`mark_executed` 从 `approved` 出发 —— 没点过同意的动不了。"""
+        """认领从 `approved` 出发 —— 没点过同意的动不了。"""
         item = a_request(pg_session, user_id)
+        assert (
+            approvals.claim_for_execution(
+                user_id, pg_session, approval_id=item.id, now=NOW
+            )
+            is None
+        )
         assert approvals.mark_executed(user_id, pg_session, approval_id=item.id, now=NOW) is None
+
+    def test_a_claimed_one_that_never_finished_is_visible(self, pg_session, user_id):
+        """**卡在 executing 的行要能被查出来。**
+
+        它的含义是"我们开始发了,但不知道发出去没有" —— 那是唯一不能替用户
+        猜的情况。所以既不重试也不标失败,只让它可见。
+        """
+        item = a_request(pg_session, user_id)
+        approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
+
+        # 刚认领的不算卡住
+        assert approvals.list_stuck(user_id, pg_session, cutoff=NOW - timedelta(minutes=10)) == []
+
+        stuck = approvals.list_stuck(user_id, pg_session, cutoff=NOW + timedelta(minutes=10))
+        assert [i.id for i in stuck] == [item.id]
+
+    def test_stuck_is_judged_by_started_at_not_approved_at(self, pg_session, user_id):
+        """**按认领时刻判,不是按点同意的时刻。**
+
+        后者和执行差着一整个调度周期 —— 拿它判会把刚认领的那条也算成卡住的,
+        而一条会天天误报的告警等于没有告警。
+        """
+        item = a_request(pg_session, user_id)
+        approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW - timedelta(hours=2))
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
+
+        assert approvals.list_stuck(user_id, pg_session, cutoff=NOW - timedelta(minutes=10)) == []
 
     def test_a_rejected_one_cannot_be_approved_later(self, pg_session, user_id):
         item = a_request(pg_session, user_id)
@@ -182,6 +246,7 @@ class TestTheQueues:
 
         for item in (done, waiting):
             approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+        approvals.claim_for_execution(user_id, pg_session, approval_id=done.id, now=NOW)
         approvals.mark_executed(user_id, pg_session, approval_id=done.id, now=NOW)
 
         ready = approvals.list_ready(user_id, pg_session)
@@ -192,6 +257,7 @@ class TestTheQueues:
         而重试要先有人看过 —— 所以它不会自己回到 approved。"""
         item = a_request(pg_session, user_id)
         approvals.approve(user_id, pg_session, approval_id=item.id, now=NOW)
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
 
         after = approvals.mark_failed(
             user_id, pg_session, approval_id=item.id, now=NOW, error="企微接口 500"

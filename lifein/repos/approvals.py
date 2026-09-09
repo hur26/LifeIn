@@ -61,6 +61,17 @@ class ApprovalStatus(StrEnum):
     APPROVED = "approved"
     """人点了同意,**但还没执行**。执行由 job 去做(见 AGENTS §9 第 7 片)。"""
 
+    EXECUTING = "executing"
+    """执行 job 已经认领,**正要动外部世界**。
+
+    这个状态存在的全部理由是"不要发两条":认领是一条带条件的 UPDATE,
+    第二个执行者拿到 0 行,**在发出去之前**就知道自己白跑了。
+
+    **卡在这里的行不自动重试。** 它的含义是"我们开始发了,但不知道发出去
+    没有" —— 重试可能发第二条,放着不管可能一条都没发。那是唯一不能替用户
+    猜的情况,所以由人看一眼(`admin approvals` 里看得到)。
+    """
+
     REJECTED = "rejected"
     EXECUTED = "executed"
     EXPIRED = "expired"
@@ -85,6 +96,10 @@ class Approval:
     expires_at: datetime
     source_event_id: int | None = None
     approved_at: datetime | None = None
+    started_at: datetime | None = None
+    """认领去执行的那一刻。**卡住的那些靠它才判得出来** ——
+    `approved_at` 是"人点同意"的时刻,和执行差着一整个调度周期。"""
+
     executed_at: datetime | None = None
     result: dict[str, Any] | None = None
 
@@ -94,7 +109,7 @@ class Approval:
 
 _COLUMNS = """
     id, agent, tool_name, tool_args, preview_text, idempotency_key, status,
-    expires_at, source_event_id, approved_at, executed_at, result
+    expires_at, source_event_id, approved_at, started_at, executed_at, result
 """
 
 _INSERT = text(f"""
@@ -146,6 +161,35 @@ _LIST_READY = text(f"""
      ORDER BY approved_at
      LIMIT :limit
 """)
+
+_CLAIM = text(f"""
+    UPDATE approvals
+       SET status = 'executing',
+           started_at = :now
+     WHERE user_id = :user_id
+       AND id = :id
+       AND status = 'approved'
+ RETURNING {_COLUMNS}
+""")
+"""认领去执行。**判断和写入在同一条语句里。**
+
+先读再写会留下一个窗口,而这个工具动的是外部世界 —— 那个窗口里发出去的
+第二条消息撤不回来。
+"""
+
+_STUCK = text(f"""
+    SELECT {_COLUMNS} FROM approvals
+     WHERE user_id = :user_id
+       AND status = 'executing'
+       AND started_at <= :cutoff
+     ORDER BY started_at
+     LIMIT :limit
+""")
+"""卡在执行中的那些。
+
+**按 `started_at` 判,不是 `approved_at`** —— 后者是"人点同意"的时刻,
+和执行差着一整个调度周期,拿它判会把刚认领的那条也算成卡住的。
+"""
 
 _EXPIRE = text("""
     UPDATE approvals
@@ -262,18 +306,21 @@ def mark_executed(
     now: datetime,
     result: dict[str, Any] | None = None,
 ) -> Approval | None:
-    """做完了。**从 `approved` 出发** —— 所以 job 跑两遍只有第一遍能改到行。
+    """做完了。**从 `executing` 出发。**
 
-    没有单独的“认领”步骤,这是刻意的:认领要么是又一次 UPDATE(那就有两处
-    要保证一致),要么是先读再写(那中间那一瞬就是重复执行的空间)。
-    **让写结果这一步自己带上 `WHERE status = 'approved'`,一处就够了** ——
-    两个 worker 同时跑时,第二个拿到 None,于是它知道自己白跑了一趟。
+    原来是从 `approved` 出发,而且没有单独的认领步骤 —— 理由写着
+    "让写结果这一步自己带上 WHERE status='approved',一处就够了"。
+    那句话对"只有一条记录会变成 executed"是成立的,**但它不能阻止消息被发两次**:
+    两个执行者都从 `approved` 读到同一条,都执行,都发出去,只是其中一个
+    在写结果时才发现自己是第二个。而那时消息已经出去了。
+
+    见 `claim_for_execution`。
     """
     return _transition(
         user_id,
         session,
         approval_id=approval_id,
-        from_status=ApprovalStatus.APPROVED,
+        from_status=ApprovalStatus.EXECUTING,
         to_status=ApprovalStatus.EXECUTED,
         now=now,
         result=result,
@@ -291,12 +338,16 @@ def mark_failed(
     """没做成。**和 rejected 分开**:一个是你不要,一个是没做成。
 
     后者可能还要重试,而重试要先有人看过 —— 所以它不会自己回到 `approved`。
+
+    从 `executing` 出发:执行前就判失败的那些(工具找不到、入参对不上)
+    也要先认领再标失败,否则那条会留在 `approved` 里,下一轮再试一遍、
+    再失败一遍,而每一轮都发一封告警。
     """
     return _transition(
         user_id,
         session,
         approval_id=approval_id,
-        from_status=ApprovalStatus.APPROVED,
+        from_status=ApprovalStatus.EXECUTING,
         to_status=ApprovalStatus.FAILED,
         now=now,
         result={"error": error},
@@ -316,6 +367,37 @@ def list_open(
 def list_ready(user_id: str, session: Session, *, limit: int = 50) -> list[Approval]:
     """点过同意、还没执行的那些。执行 job 读它。"""
     rows = session.execute(_LIST_READY, {"user_id": user_id, "limit": limit}).all()
+    return [_to_approval(row) for row in rows]
+
+
+def claim_for_execution(
+    user_id: str, session: Session, *, approval_id: int, now: datetime
+) -> Approval | None:
+    """认领一条去执行。**拿不到就别执行** —— 已经有人在做了。
+
+    这是"零重复执行"(03 的 P3 退出条件)真正落地的地方。它必须发生在
+    调用工具**之前**:动外部世界之后再发现自己是第二个,已经晚了。
+    """
+    row = session.execute(
+        _CLAIM, {"user_id": user_id, "id": approval_id, "now": now}
+    ).first()
+    if row is None:
+        log.info("审批 %s 认领不到:别人已经在执行,或状态变了", approval_id)
+        return None
+    return _to_approval(row)
+
+
+def list_stuck(
+    user_id: str, session: Session, *, cutoff: datetime, limit: int = 20
+) -> list[Approval]:
+    """卡在 `executing` 的那些 —— "开始发了,但不知道发出去没有"。
+
+    **不自动重试,也不自动标失败。** 重试可能发第二条,标失败会让人以为
+    没发出去。这个函数的用途只有一个:让人看见它。
+    """
+    rows = session.execute(
+        _STUCK, {"user_id": user_id, "cutoff": cutoff, "limit": limit}
+    ).all()
     return [_to_approval(row) for row in rows]
 
 
@@ -393,6 +475,7 @@ def _to_approval(row) -> Approval:
         expires_at=row.expires_at,
         source_event_id=row.source_event_id,
         approved_at=row.approved_at,
+        started_at=row.started_at,
         executed_at=row.executed_at,
         result=dict(row.result) if row.result else None,
     )
