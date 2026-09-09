@@ -151,6 +151,9 @@ _FIND_MERGEABLE = text(f"""
       FROM transactions
      WHERE user_id = :user_id
        AND amount = :amount
+       AND currency = :currency
+       AND direction = :direction
+       AND kind = :kind
        AND channel <> :channel
        AND occurred_at BETWEEN :window_start AND :window_end
        -- CAST 不能省:裸参数直接跟 IS NULL 比,Postgres 推不出它的类型,
@@ -163,8 +166,73 @@ _FIND_MERGEABLE = text(f"""
             OR account_hint = CAST(:account_hint AS TEXT)
        )
      ORDER BY abs(EXTRACT(EPOCH FROM (occurred_at - :occurred_at)))
-     LIMIT 1
+     LIMIT 2
 """)
+"""能并进哪一笔。**取 2 不是 1** —— 见 `_pick_one`。
+
+`currency`、`direction`、`kind` 三条是后加的,原来只比金额:
+
+- 币种不比:50 USD 并进 50 CNY,总额里少掉一笔外币消费
+- 方向不比:**退款并进支出**。一笔 38.5 的退款短信和 38.5 的消费通知
+  差几分钟到,合并之后账本上既没有那笔支出,也没有那笔退款
+- 类型不比:信用卡还款并进同额消费,而还款本来就不该进统计
+"""
+
+_FIND_UNCLAIMED_STATEMENT = text(f"""
+    SELECT {_COLUMNS}
+      FROM transactions
+     WHERE user_id = :user_id
+       AND amount = :amount
+       AND currency = :currency
+       AND direction = :direction
+       AND kind = :kind
+       AND stage = 'reconciled'
+       AND cardinality(merged_from_event_ids) = 0
+       AND occurred_at BETWEEN :window_start AND :window_end
+       AND (
+            account_hint IS NULL
+            OR CAST(:account_hint AS TEXT) IS NULL
+            OR account_hint = CAST(:account_hint AS TEXT)
+       )
+     ORDER BY abs(EXTRACT(EPOCH FROM (occurred_at - :occurred_at)))
+     LIMIT 2
+""")
+"""先导进来的对账单行里,还没有人认领的那一条。
+
+**这一路是"对账单先到、实时通知后到"时唯一能挡住重复记账的东西。**
+那个顺序不罕见:头一次接入时先手动导一份历史账单;补跑对账 job 而当天
+晚些时候那笔消费的短信才被采到;卡刚绑上而这个月的账单里已经有它。
+
+补录出来的行 `stage='reconciled'`,而 `record()` 对 reconciled 故意跳过
+5 分钟合并;晚上那条通知走实时那一路,拿 5 分钟去比对账单上的**入账日**,
+差着几天,永远比不上 —— 于是两笔各记一次。
+
+`cardinality(merged_from_event_ids) = 0` 是幂等键:认领过一次之后
+`occurred_at` 已经换成消费当时了,第二条通知再来走 5 分钟那一路就比得上,
+不会把第三条第四条一起吞进来。
+"""
+
+_CLAIM_STATEMENT = text(f"""
+    UPDATE transactions
+       SET merged_from_event_ids = merged_from_event_ids || :event_id,
+           occurred_at = :occurred_at,
+           account_hint = COALESCE(account_hint, :account_hint),
+           confidence = GREATEST(confidence, :confidence)
+     WHERE user_id = :user_id
+       AND id = :txn_id
+       AND cardinality(merged_from_event_ids) = 0
+ RETURNING {_COLUMNS}
+""")
+"""认领。**`WHERE cardinality(...) = 0` 是判断和写入同一条语句** ——
+先查后写会在并发下让两条通知同时认领同一行。
+
+`occurred_at` 换成实时那条的时间:**只有这一处会改已有行的时间**,
+理由是对账单给的是入账日,实时通知给的是消费当时,而两阶段入账里
+"时间以实时为准、商户以对账单为准"(ADR-012)。不换的话一笔周六晚上的
+消费会停在周一,而月度报表按天切。
+
+`merchant_raw` 不动:对账单上那个才是真商户,实时通知里多半是"财付通"。
+"""
 
 _MERGE = text(f"""
     UPDATE transactions
@@ -319,13 +387,21 @@ def record(
     stage: Stage = Stage.REALTIME,
     merge_window: timedelta = MERGE_WINDOW,
 ) -> RecordResult:
-    """记一笔。**两层去重都在这里发生,顺序不能换。**
+    """记一笔。**三层去重都在这里发生,顺序不能换。**
 
-    1. 先找**跨渠道的同一笔**(时间窗查询)—— 找到就合并,不新建
-    2. 再插入,靠 `UNIQUE (user_id, source_event_id)` 挡住重复上报
+    1. 同一条事件又送上来一次 → `UNIQUE (user_id, source_event_id)`,什么都不做
+    2. **跨渠道的同一笔**(5 分钟窗口)→ 合并,不新建
+    3. **先导进来、还没人认领的对账单行**(3 天窗口)→ 认领,不新建
+    4. 都没有 → 新建
 
-    顺序反过来的话,支付宝那条会先插进去,再也不会去找银行短信那条 ——
-    两条各记一笔,而月底你只会看到总额多了一倍。
+    2 在 3 前面:5 分钟那一路更严,能匹配上就该用它。3 只在 2 落空之后跑,
+    所以正常顺序(实时先到、对账单后到)一次都不会走到它。
+
+    1 必须在 2 前面。反过来的话,同一条通知重投时会先去找"跨渠道的同一笔",
+    而它自己上次记下的那笔就在那里 —— 只是 channel 相同所以匹配不上,
+    于是插入撞唯一键。绕一圈得到同样的结果,只是多查了一次。
+    真正不能换的是别的两处:2 在插入之前(否则支付宝那条先插进去,
+    再也不会去找银行短信那条,两条各记一笔),3 在插入之前(同理)。
     """
     if amount <= 0:
         # 金额的正负由 direction 表达,不由符号 —— 混着来的话
@@ -368,18 +444,26 @@ def record(
         # 结果是把便利店连买两次同价商品里的第二笔悄悄吃掉。
         return _insert(user_id, session, params)
 
-    mergeable = session.execute(
-        _FIND_MERGEABLE,
-        {
-            "user_id": user_id,
-            "amount": amount,
-            "channel": channel,
-            "account_hint": account_hint,
-            "occurred_at": occurred_at,
-            "window_start": occurred_at - merge_window,
-            "window_end": occurred_at + merge_window,
-        },
-    ).first()
+    shape = {
+        "user_id": user_id,
+        "amount": amount,
+        "currency": currency,
+        "direction": direction.value,
+        "kind": kind.value,
+        "account_hint": account_hint,
+        "occurred_at": occurred_at,
+    }
+
+    mergeable = _pick_one(
+        session.execute(
+            _FIND_MERGEABLE,
+            {**shape, "channel": channel,
+             "window_start": occurred_at - merge_window,
+             "window_end": occurred_at + merge_window},
+        ).all(),
+        what="跨渠道合并",
+        source_event_id=source_event_id,
+    )
 
     if mergeable:
         merged = session.execute(
@@ -405,7 +489,94 @@ def record(
             transaction=_to_txn(merged), created=False, merged_into=int(mergeable.id)
         )
 
+    claimed = _claim_statement_row(
+        session, shape=shape, source_event_id=source_event_id, confidence=confidence
+    )
+    if claimed is not None:
+        return claimed
+
     return _insert(user_id, session, params)
+
+
+def _claim_statement_row(
+    session: Session,
+    *,
+    shape: dict,
+    source_event_id: int,
+    confidence: float,
+    window: timedelta = RECONCILE_WINDOW,
+) -> RecordResult | None:
+    """认领一条先导进来、还没人认领的对账单行。**没有就返回 None。**
+
+    这一路只在 5 分钟合并落空之后跑,所以正常顺序(实时先到、对账单后到)
+    一次都不会走到它。它挡的是反过来的顺序 —— 见 `_FIND_UNCLAIMED_STATEMENT`。
+    """
+    occurred_at = shape["occurred_at"]
+    candidate = _pick_one(
+        session.execute(
+            _FIND_UNCLAIMED_STATEMENT,
+            {**shape,
+             "window_start": occurred_at - window,
+             "window_end": occurred_at + window},
+        ).all(),
+        what="认领对账单行",
+        source_event_id=source_event_id,
+    )
+    if candidate is None:
+        return None
+
+    row = session.execute(
+        _CLAIM_STATEMENT,
+        {
+            "user_id": shape["user_id"],
+            "txn_id": candidate.id,
+            "event_id": [source_event_id],
+            "occurred_at": occurred_at,
+            "account_hint": shape["account_hint"],
+            "confidence": confidence,
+        },
+    ).first()
+    if row is None:
+        # 并发下另一条通知先认领了。**退回新建那一路是错的** ——
+        # 那样就又记了两笔;按重复处理也不对,这条事件确实还没入账。
+        # 让调用方看到 None,由外层的 `_insert` 去撞唯一键或新建
+        log.info("认领对账单行 %s 落空:刚被别人认领了", candidate.id)
+        return None
+
+    log.info(
+        "认领对账单行:事件 %s 并入交易 %s,时间从 %s 换成消费当时 %s",
+        source_event_id,
+        candidate.id,
+        candidate.occurred_at.isoformat(),
+        occurred_at.isoformat(),
+    )
+    return RecordResult(
+        transaction=_to_txn(row), created=False, merged_into=int(candidate.id)
+    )
+
+
+def _pick_one(rows: list, *, what: str, source_event_id: int):
+    """候选唯一才用它。**两条以上一律不合并。**
+
+    原来这里是 `ORDER BY 时间差 LIMIT 1` —— 两笔都匹配时它悄悄挑一个,
+    而"两张卡里各有一笔同额"正是最需要人来看的情况。
+
+    不合并的结果是账本上多一笔。这是有意选的:**少了一笔比多了一笔更难发现**
+    —— 多出来的那笔打开账本就看得见,少掉的那笔要到月底才觉得
+    "这个月怎么花得少"(06 §2.6)。
+    """
+    if not rows:
+        return None
+    if len(rows) > 1:
+        log.warning(
+            "%s 有 %d 条候选,拿不准是哪一笔,按新的记:事件 %s 对上了交易 %s",
+            what,
+            len(rows),
+            source_event_id,
+            [int(r.id) for r in rows],
+        )
+        return None
+    return rows[0]
 
 
 def _insert(user_id: str, session: Session, params: dict) -> RecordResult:

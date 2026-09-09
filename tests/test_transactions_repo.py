@@ -395,3 +395,288 @@ class TestReconciliation:
 
         assert result.created is True
         assert result.merged_into is None
+
+
+class TestWhatMustNotMerge:
+    """跨渠道合并原来只比金额。**"像不像同一笔"不等于"是不是同一件事"。**
+
+    每一条都对应一种会真发生的错,而错的方向都一样:账本上少一笔,
+    而少掉的那笔没有任何迹象 —— 你只会觉得这个月花得少。
+    """
+
+    def test_a_refund_does_not_merge_into_an_expense(self, pg_session, user_id):
+        """**方向不同不能并。**
+
+        一笔 38.5 的退款短信和 38.5 的消费通知差几分钟到,并起来之后账本上
+        既没有那笔支出,也没有那笔退款 —— 一次消费加一次退款变成了一行。
+        """
+        a_txn(pg_session, user_id, external_id="pay")
+        refund = a_txn(
+            pg_session,
+            user_id,
+            external_id="refund",
+            channel="bank_sms",
+            occurred_at=NOW + timedelta(minutes=2),
+            direction=Direction.CREDIT,
+            kind=TxnKind.REFUND,
+        )
+        assert refund.created is True
+        assert refund.merged_into is None
+
+    def test_a_repayment_does_not_merge_into_an_expense(self, pg_session, user_id):
+        """**类型不同不能并。** 还款本来就不进统计,并进消费之后
+        那笔消费的 kind 也说不清了。"""
+        a_txn(pg_session, user_id, external_id="buy")
+        repay = a_txn(
+            pg_session,
+            user_id,
+            external_id="repay",
+            channel="bank_sms",
+            occurred_at=NOW + timedelta(minutes=1),
+            kind=TxnKind.REPAYMENT,
+        )
+        assert repay.created is True
+
+    def test_another_currency_does_not_merge(self, pg_session, user_id):
+        """**币种不同不能并。** 50 USD 并进 50 CNY,总额里少掉一笔外币消费。"""
+        a_txn(pg_session, user_id, external_id="cny", amount=Decimal("50.00"))
+        usd = a_txn(
+            pg_session,
+            user_id,
+            external_id="usd",
+            amount=Decimal("50.00"),
+            currency="USD",
+            channel="bank_sms",
+            occurred_at=NOW + timedelta(minutes=1),
+        )
+        assert usd.created is True
+
+    def test_two_candidates_means_no_merge(self, pg_session, user_id):
+        """**拿不准就不合并。**
+
+        原来是 `ORDER BY 时间差 LIMIT 1`,两笔都匹配时它悄悄挑一个 ——
+        而"两张卡里各有一笔同额"正是最需要人来看的情况。
+
+        不合并的代价是账本上多一笔,那是有意选的:多出来的那笔打开账本
+        就看得见,少掉的那笔要到月底才觉得"这个月怎么花得少"。
+        """
+        # 便利店连买两次同价的东西:同一条渠道,所以它们自己不会互相合并
+        # (06 §2.6 那句"约束会把第二笔悄悄吃掉"说的就是这种)
+        a_txn(pg_session, user_id, external_id="a", channel="alipay", account_hint=None)
+        a_txn(
+            pg_session,
+            user_id,
+            external_id="b",
+            channel="alipay",
+            account_hint=None,
+            occurred_at=NOW + timedelta(minutes=1),
+        )
+        third = a_txn(
+            pg_session,
+            user_id,
+            external_id="c",
+            channel="bank_sms",
+            account_hint=None,
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+        assert third.created is True, "两条候选时应该新建,而不是挑一条并进去"
+        assert _ledger_rows(pg_session, user_id) == 3
+
+    def test_the_ordinary_cross_channel_merge_still_works(self, pg_session, user_id):
+        """收紧之后正常那一路不能被误伤 —— 支付宝 + 银行短信仍然并成一笔。"""
+        first = a_txn(pg_session, user_id, external_id="alipay", account_hint=None)
+        second = a_txn(
+            pg_session,
+            user_id,
+            external_id="sms",
+            channel="bank_sms",
+            merchant_raw=None,
+            occurred_at=NOW + timedelta(minutes=3),
+        )
+        assert second.merged_into == first.transaction.id
+        assert _ledger_rows(pg_session, user_id) == 1
+        # 互相补上对方缺的:支付宝有商户没卡号,银行短信反过来
+        assert (second.transaction.merchant_raw, second.transaction.account_hint) == (
+            "财付通",
+            "1234",
+        )
+
+
+class TestTheStatementArrivingFirst:
+    """**先导对账单、后来实时通知,原来会记两笔。**
+
+    那个顺序不罕见:头一次接入时先手动导一份历史账单;补跑对账 job 而当天
+    晚些时候那笔消费的短信才被采到;卡刚绑上而这个月的账单里已经有它。
+
+    对账补录的行 `stage='reconciled'`,而 `record()` 对 reconciled 故意跳过
+    5 分钟合并;晚上那条通知走实时那一路,拿 5 分钟去比对账单上的**入账日**,
+    差着几天 —— 永远比不上。
+    """
+
+    STATEMENT_DAY = NOW - timedelta(days=2)
+    """对账单上的日期。**是入账日,不是消费日** —— 这正是 3 天窗口存在的理由。"""
+
+    def a_statement_row(self, session, user_id, **overrides):
+        return a_txn(
+            session,
+            user_id,
+            external_id="statement-line",
+            channel="statement",
+            stage=Stage.RECONCILED,
+            occurred_at=self.STATEMENT_DAY,
+            merchant_raw="星巴克(国贸店)",
+            confidence=1.0,
+            **overrides,
+        )
+
+    def test_the_later_notification_is_claimed_not_recorded_again(
+        self, pg_session, user_id
+    ):
+        line = self.a_statement_row(pg_session, user_id)
+
+        sms = a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+
+        assert sms.created is False
+        assert sms.merged_into == line.transaction.id
+        assert _ledger_rows(pg_session, user_id) == 1
+
+    def test_the_time_becomes_the_real_one(self, pg_session, user_id):
+        """**只有这一处会改已有行的 occurred_at。**
+
+        对账单给的是入账日,实时通知给的是消费当时。两阶段入账里
+        "时间以实时为准、商户以对账单为准"(ADR-012),而这一次先落地的
+        恰好是权威性较低的那一半。不换的话一笔周六晚上的消费会停在周一,
+        而月度报表按天切。
+        """
+        self.a_statement_row(pg_session, user_id)
+        sms = a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+
+        assert sms.transaction.occurred_at == NOW
+        # 商户名不动:对账单上那个才是真商户,通知里多半是"财付通"
+        assert sms.transaction.merchant_raw == "星巴克(国贸店)"
+
+    def test_the_source_stays_traceable(self, pg_session, user_id):
+        """认领掉的那条事件 id 必须留下来 —— 任何时候都能问
+        "这一笔是从哪几条通知拼出来的"(06 §2.6)。"""
+        self.a_statement_row(pg_session, user_id)
+        sms = a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+
+        merged = pg_session.execute(
+            text("SELECT merged_from_event_ids FROM transactions WHERE user_id = :u"),
+            {"u": user_id},
+        ).scalar_one()
+        assert len(merged) == 1
+        # 那条事件查不到自己的 transactions 行(它没有一行),但问得出
+        # "它被并进了哪一笔" —— 这正是 `merged_from_event_ids` 存在的意义
+        assert get_by_event(user_id, pg_session, source_event_id=merged[0]) is None
+        holder = pg_session.execute(
+            text(
+                "SELECT id FROM transactions"
+                " WHERE user_id = :u AND :e = ANY(merged_from_event_ids)"
+            ),
+            {"u": user_id, "e": merged[0]},
+        ).scalar_one()
+        assert holder == sms.transaction.id
+
+    def test_a_second_notification_merges_the_ordinary_way(self, pg_session, user_id):
+        """认领之后 `occurred_at` 已经是消费当时了,所以第二条通知走 5 分钟
+        那一路就比得上 —— 不需要、也不该再认领一次。"""
+        self.a_statement_row(pg_session, user_id)
+        a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+
+        alipay = a_txn(
+            pg_session,
+            user_id,
+            external_id="alipay-2",
+            channel="alipay",
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+        assert alipay.created is False
+        assert _ledger_rows(pg_session, user_id) == 1
+
+    def test_a_claimed_row_is_not_claimed_twice(self, pg_session, user_id):
+        """已经认领过的行不再是候选。第三条通知(离得远、5 分钟比不上)
+        该新建,而不是把自己也塞进那一行。"""
+        self.a_statement_row(pg_session, user_id)
+        a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+
+        far = a_txn(
+            pg_session,
+            user_id,
+            external_id="another-day",
+            channel="wechat",
+            occurred_at=NOW + timedelta(hours=6),
+        )
+        assert far.created is True
+        assert _ledger_rows(pg_session, user_id) == 2
+
+    def test_outside_the_reconcile_window_it_is_a_new_one(self, pg_session, user_id):
+        """超出 3 天就不是同一笔了。**窗口开大的代价是认错两笔同额消费**,
+        所以它必须有个头。"""
+        self.a_statement_row(pg_session, user_id)
+        late = a_txn(
+            pg_session,
+            user_id,
+            external_id="much-later",
+            channel="bank_sms",
+            occurred_at=NOW + timedelta(days=5),
+        )
+        assert late.created is True
+        assert _ledger_rows(pg_session, user_id) == 2
+
+    def test_a_refund_does_not_claim_a_statement_expense(self, pg_session, user_id):
+        """认领这一路和 5 分钟那一路守同一套判据:方向、类型、币种都要对上。"""
+        self.a_statement_row(pg_session, user_id)
+        refund = a_txn(
+            pg_session,
+            user_id,
+            external_id="refund",
+            channel="bank_sms",
+            direction=Direction.CREDIT,
+            kind=TxnKind.REFUND,
+        )
+        assert refund.created is True
+
+    def test_the_normal_order_never_takes_this_path(self, pg_session, user_id):
+        """实时先到、对账单后到时,走的仍然是 `backfill` 那一路 ——
+        认领只在 5 分钟合并落空之后跑,而这里根本轮不到它。
+        """
+        realtime = a_txn(pg_session, user_id, external_id="sms", channel="bank_sms")
+        statement_event = an_event(pg_session, user_id, external_id="statement-line")
+
+        match = find_reconcilable(
+            user_id,
+            pg_session,
+            amount=Decimal("38.50"),
+            occurred_at=self.STATEMENT_DAY,
+            account_hint="1234",
+        )
+        assert match is not None and match.id == realtime.transaction.id
+        after = backfill(
+            user_id,
+            pg_session,
+            txn_id=match.id,
+            statement_event_id=statement_event,
+            merchant_raw="星巴克(国贸店)",
+        )
+        assert after.stage is Stage.RECONCILED
+        # 回填不改时间:实时那条给的就是消费当时
+        assert after.occurred_at == NOW
+        assert _ledger_rows(pg_session, user_id) == 1
+        assert is_reconciled(user_id, pg_session, statement_event_id=statement_event)
+
+
+def _ledger_rows(session, user_id) -> int:
+    return session.execute(
+        text("SELECT count(*) FROM transactions WHERE user_id = :u"), {"u": user_id}
+    ).scalar_one()
+
+
+def _ledger_ids(session, user_id) -> list[int]:
+    return [
+        row.id
+        for row in session.execute(
+            text("SELECT id FROM transactions WHERE user_id = :u ORDER BY id"),
+            {"u": user_id},
+        ).all()
+    ]
