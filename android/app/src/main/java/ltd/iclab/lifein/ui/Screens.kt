@@ -6,12 +6,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -167,7 +169,9 @@ fun PendingScreen(repo: Repository) {
                 items(list, key = { it.id }) { item ->
                     PendingRow(
                         item = item,
-                        onConfirm = { scope.launch { repo.confirm(item.id); refresh() } },
+                        onConfirm = { edits ->
+                            scope.launch { repo.confirm(item.id, edits); refresh() }
+                        },
                         onReject = { scope.launch { repo.reject(item.id); refresh() } },
                     )
                 }
@@ -177,18 +181,41 @@ fun PendingScreen(repo: Repository) {
 }
 
 @Composable
-private fun PendingRow(item: PendingDto, onConfirm: () -> Unit, onReject: () -> Unit) {
+private fun PendingRow(
+    item: PendingDto,
+    onConfirm: (Map<String, String>?) -> Unit,
+    onReject: () -> Unit,
+) {
+    // 账目上改过的那几项。**只在这一行的生命周期里存在** ——
+    // 点了确认就随刷新一起没了,而没点确认的修改本来就不该留下
+    var kind by remember(item.id) { mutableStateOf(item.txnKind) }
+    var category by remember(item.id) { mutableStateOf(item.category) }
+
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
-            Text(item.title, style = MaterialTheme.typography.titleMedium)
+            Text(item.headline, style = MaterialTheme.typography.titleMedium)
             item.startsAt?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
             Text(
                 "来自 ${item.agent} · ${item.reason}",
                 style = MaterialTheme.typography.bodySmall,
             )
+
+            if (item.isTransaction) {
+                TransactionEditor(
+                    kind = kind,
+                    category = category,
+                    onKind = { kind = it },
+                    onCategory = { category = it },
+                )
+            }
+
             if (item.isKnown) {
                 Row {
-                    TextButton(onClick = onConfirm) { Text("确认") }
+                    TextButton(
+                        onClick = {
+                            onConfirm(if (item.isTransaction) edits(item, kind, category) else null)
+                        },
+                    ) { Text("确认") }
                     TextButton(onClick = onReject) { Text("不对") }
                 }
             } else {
@@ -197,6 +224,62 @@ private fun PendingRow(item: PendingDto, onConfirm: () -> Unit, onReject: () -> 
                 Text(
                     "这类(${item.targetTable})要新版本的 App 才能处理",
                     style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 改过的那几项,没改就返回 null(原样确认)。
+ *
+ * **只送改过的**:全量送回去和原样确认在服务端是两种状态(`edited` 和
+ * `confirmed`),而"用户到底动没动过"正是评测集要区分的那件事。
+ */
+private fun edits(item: PendingDto, kind: String?, category: String?): Map<String, String>? {
+    val changed = mutableMapOf<String, String>()
+    if (kind != null && kind != item.txnKind) changed["kind"] = kind
+    if (category != null && category != item.category) changed["category"] = category
+    return changed.ifEmpty { null }
+}
+
+/**
+ * 账目能改的就两项:**是哪种资金变动、算哪一类支出**。
+ *
+ * 金额、方向、时间不给改(06 §6.7)—— 它们是规则从原文里抠出来的,
+ * 而这条进队列的原因是"这是不是一笔支出说不准",不是"钱数说不准"。
+ * 数抠错了正确的动作是点「不对」,然后手动补一笔。
+ */
+@Composable
+private fun TransactionEditor(
+    kind: String?,
+    category: String?,
+    onKind: (String) -> Unit,
+    onCategory: (String) -> Unit,
+) {
+    Text("这是", style = MaterialTheme.typography.bodySmall)
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        PendingDto.KINDS.forEach { (value, label) ->
+            FilterChip(selected = kind == value, onClick = { onKind(value) }, label = { Text(label) })
+        }
+    }
+
+    // 只有支出才有分类。收入、转账、还款给分类没有意义,而报表只统计支出 ——
+    // 给它们配一个分类会让人以为那笔钱进了那个类目的统计
+    if (kind == "expense") {
+        Text("算在", style = MaterialTheme.typography.bodySmall)
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            PendingDto.CATEGORIES.forEach { name ->
+                FilterChip(
+                    selected = category == name,
+                    onClick = { onCategory(name) },
+                    label = { Text(name) },
                 )
             }
         }

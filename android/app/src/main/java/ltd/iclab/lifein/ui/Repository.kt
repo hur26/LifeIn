@@ -79,10 +79,11 @@ class Repository(private val context: Context) {
         api().pending().pending
     }
 
-    suspend fun confirm(id: Long, editedTitle: String? = null) = withContext(Dispatchers.IO) {
-        // 只送标题这一项。provenance 与 created_by_agent 一律由服务端沿用
-        // 队列里那份 —— 出处不由客户端说了算(铁律 5)
-        val payload = editedTitle?.takeIf { it.isNotBlank() }?.let { mapOf("title" to it) }
+    suspend fun confirm(id: Long, edits: Map<String, String>? = null) = withContext(Dispatchers.IO) {
+        // 送什么由调用方决定,但**送什么算数由服务端决定**:它按 target_table
+        // 取一份白名单,别的字段一律丢掉。provenance、created_by_agent、
+        // source_event_id 永远沿用队列里那份 —— 出处不由客户端说了算(铁律 5)
+        val payload = edits?.filterValues { it.isNotBlank() }?.ifEmpty { null }
         api().resolvePending(id, ResolveBody(action = "confirm", payload = payload))
         // 刚确认的那条日程该尽快进日历。等半小时的话,用户会以为没生效
         Schedules.syncCalendarNow(context)

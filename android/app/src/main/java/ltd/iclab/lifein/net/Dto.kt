@@ -116,16 +116,84 @@ data class PendingDto(
 ) {
     /**
      * 认不认识这一类。**不认识的只展示,不给确认按钮**(06 §6.7)——
-     * P2 的账目进来时,这个版本的 App 会把它列出来但不让点,
-     * 而不是拿错误的形状去确认。
+     * 服务端加一类待确认不必等 App 发版,而没发版的 App 也不会拿错误的
+     * 形状去确认。
+     *
+     * `transactions` 是 P2 加进来的。加它之前这里只有 `todos`,而服务端
+     * 那一侧同样只会写 `todos` —— 两边一起改才有意义:只改一边的结果是
+     * **按钮点得动但拿一个 422**,或者**服务端接得住而没人点得动**。
      */
-    val isKnown: Boolean get() = targetTable == "todos"
+    val isKnown: Boolean get() = targetTable in KNOWN_TABLES
+
+    val isTransaction: Boolean get() = targetTable == "transactions"
 
     val title: String
         get() = (payload["title"] as? JsonPrimitive)?.content ?: "(没有标题)"
 
     val startsAt: String?
         get() = (payload["starts_at"] as? JsonPrimitive)?.contentOrNull
+
+    // ---------- 账目那一类的字段 ----------
+
+    private fun str(key: String): String? =
+        (payload[key] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+
+    val amount: String? get() = str("amount")
+
+    val direction: String? get() = str("direction")
+
+    /** 商户。取不到就退回渠道名 —— 空着比"未知商户"更让人不知道这是什么。 */
+    val merchant: String get() = str("merchant_raw") ?: str("channel") ?: "(没有商户)"
+
+    /**
+     * 资金变动的类型(`expense` / `repayment` / …)。
+     *
+     * **叫 `txnKind` 不叫 `kind`**:`kind` 已经被 `PendingDto` 的构造参数占了,
+     * 那个是待确认的类别(`transaction` / `calendar_event`),两者不是一回事。
+     * 撞名字的话编译器直接报冲突 —— 而更糟的情况是它没报,那时两个"kind"
+     * 会在某一处被互相当成对方用。
+     */
+    val txnKind: String? get() = str("kind")
+
+    val category: String? get() = str("category")
+
+    /**
+     * 这一条在列表里的一行标题。
+     *
+     * **账目不能用 `title`** —— 它的 payload 里根本没有那个字段,
+     * 于是会显示成"(没有标题)",而一条看不出金额的账没人点得下去。
+     */
+    val headline: String
+        get() = if (isTransaction) {
+            val sign = if (direction == "credit") "+" else "-"
+            "$sign${amount ?: "?"} · $merchant"
+        } else {
+            title
+        }
+
+    companion object {
+        val KNOWN_TABLES = setOf("todos", "transactions")
+
+        /**
+         * 资金变动的类型,和服务端 `TxnKind` 一一对应。
+         *
+         * **顺序不是随手排的**:`repayment` 排在 `expense` 后面,因为
+         * "信用卡还款被记成支出"是这个队列里最常见的那类错 ——
+         * 消费那一刻已经记过一次,再记一次每个统计数字都会偏大。
+         */
+        val KINDS = listOf(
+            "expense" to "支出",
+            "repayment" to "还款",
+            "income" to "收入",
+            "transfer" to "转账",
+            "refund" to "退款",
+        )
+
+        /** 和服务端 `CATEGORIES` 同一份封闭枚举。多一个少一个都会被工具挡回来。 */
+        val CATEGORIES = listOf(
+            "餐饮", "交通", "购物", "居住", "通信", "娱乐", "医疗", "教育", "人情", "其他",
+        )
+    }
 }
 
 @Serializable
