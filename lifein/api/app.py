@@ -33,7 +33,7 @@ from lifein.db import session_scope
 from lifein.jobs.qa_reply import QaDeps, default_gateway, handle_message
 from lifein.jobs.weixin_inbox import start_inbox_thread
 from lifein.repos import users
-from lifein.scheduler import build_scheduler, run_digest_for_all_users
+from lifein.scheduler import build_scheduler, quota_checker, run_digest_for_all_users
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,8 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
                         channel=svc.channel,
                         resolve_user=svc.resolve_user,
                         gateway_factory=default_gateway,
+                        # 问答是花钱最快的那条路,而它原来完全不受上限管
+                        within_quota=quota_checker(svc, job="qa_reply"),
                     ),
                     now=datetime.now(UTC),
                 )

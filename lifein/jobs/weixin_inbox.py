@@ -30,6 +30,7 @@ from lifein.channels import weixin_inbound
 from lifein.channels.weixin import WeixinSessionExpired, WeixinUnavailable
 from lifein.jobs.qa_reply import QaDeps, default_gateway, handle_message
 from lifein.repos import channel_state, credentials
+from lifein.scheduler import quota_checker
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +139,8 @@ def _handle_one(user_id: str, message, *, services, session_factory: SessionFact
                     channel=services.channel,
                     resolve_user=services.resolve_user,
                     gateway_factory=default_gateway,
+                    # 问答是花钱最快的那条路,而它原来完全不受上限管
+                    within_quota=quota_checker(services, job="weixin_inbox"),
                 ),
                 now=datetime.now(UTC),
             )

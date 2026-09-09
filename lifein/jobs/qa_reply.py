@@ -76,6 +76,16 @@ MAX_RECALLED_FACTS = 8
 """
 
 UNSUPPORTED_REPLY = "我这边只认文字消息,图片和语音还看不了。"
+OVER_QUOTA_REPLY = (
+    "这个月的模型额度用完了,我先歇着。"
+    "**采集没停,已经收到的东西都还在** —— 额度回来之后照样查得到。"
+)
+"""超上限时回的那句话。
+
+**两件事都要说**:为什么答不了,以及**数据没丢**。
+只说前半句的话,用户会以为这段时间的东西没被记下来,
+而那正是他最该担心、也最容易误会的一件事。
+"""
 FAILED_REPLY = "这次没答上来,过会儿再问我一次。"
 
 MAX_QUESTION_CHARS = 500
@@ -90,6 +100,16 @@ class QaDeps:
 
     企微认 UserID、iLink 认对方的 user id,**这个映射是通道的事,不是问答的事**。
     注入进来,问答就不用为每加一个入站通道改一次。
+    """
+
+    within_quota: Callable[[Session, str], bool] | None = None
+    """这个用户这个月还有额度吗。**None 就是不管。**
+
+    问答是这个系统里**花钱最快的一条路**:一次问答两到三次模型调用,
+    而用户想问几次就问几次。定时任务那边挡住的几毛钱,聊一下午就还回去了。
+
+    做成注入而不是在这里直接读配置:这个模块不该知道"额度"是从哪来的,
+    而调度层和 API 层各有各的 `Services`。
     """
 
     gateway_factory: GatewayFactory | None = None
@@ -145,6 +165,19 @@ def handle_message(
         if decided.card is not None:
             deps.channel.send(user.id, decided.card)
         return ReplyResult(handled=True, user_id=user.id, reason=decided.action or "approval")
+
+    # **额度检查排在审批指令后面,排在所有模型调用前面。**
+    #
+    # 后面:"同意 12" 一次模型调用都不需要,而挡住它意味着一条已经排队等着
+    # 发的消息永远发不出去 —— 那是把一个成本问题变成了一个功能故障。
+    #
+    # 前面:再往后就已经花掉了(`plan_action` 是第一次调用)。
+    if deps.within_quota is not None and not deps.within_quota(session, user.id):
+        # **这里回一句话,而别的入口不回**(见 `repos/quota` 模块开头):
+        # 他刚问了一句话,而对一个直接的提问保持沉默看起来像系统坏了
+        log.info("用户 %s 额度用完,这次问答不调模型", user.id)
+        _reply(deps, user.id, message, OVER_QUOTA_REPLY)
+        return ReplyResult(handled=False, user_id=user.id, reason="over_quota")
 
     # 代发意图排在检索前面:如果这句话是"跟老王说我晚点到",那它不是提问,
     # 检索和回答都白跑。而**那次判断只看这句话本身**,一个外部素材都不带

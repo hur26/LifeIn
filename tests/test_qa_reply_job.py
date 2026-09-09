@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -613,3 +614,81 @@ class TestProposingASend:
 
         assert result.handled and result.reason is None
         assert len(seen) == 2, "没接审批队列时不该多花一次调用去判代发"
+
+
+class TestTheCostCap:
+    """**问答是花钱最快的一条路,而它原来完全不受上限管。**
+
+    一次问答两到三次模型调用,用户想问几次就问几次 —— 一个人聊一下午,
+    定时任务那边省下的几毛钱一次就还回去了。
+    """
+
+    def test_over_quota_answers_with_a_sentence_not_silence(
+        self, pg_session, registered_user
+    ):
+        """**这一条是例外:别的入口超上限不吭声,问答要回一句话。**
+
+        他刚问了一句话,而对一个直接的提问保持沉默看起来像系统坏了。
+        """
+        llm, seen = recording_llm([{"person": ""}, {"answer": "x", "refs": []}])
+        d, channel = recall_deps(llm)
+        d = replace(d, within_quota=lambda session, user_id: False)
+
+        result = handle_message(
+            pg_session, message=message("报销批了吗"), deps=d, now=NOW
+        )
+
+        assert result.reason == "over_quota"
+        assert seen == [], "超上限之后一次模型调用都不该发生"
+        # 两件事都要说:为什么答不了,以及数据没丢
+        assert "额度" in channel.sent[-1].summary
+        assert "还在" in channel.sent[-1].summary
+
+    def test_approval_commands_still_work_over_quota(self, pg_session, registered_user):
+        """**"同意 12" 不受上限管。**
+
+        它一次模型调用都不需要,而挡住它意味着一条已经排队等着发的消息
+        永远发不出去 —— 那是把一个成本问题变成了一个功能故障。
+        """
+        from lifein.models.normalized import Trust
+        from lifein.repos import approvals
+
+        item = approvals.enqueue(
+            registered_user,
+            pg_session,
+            agent="qa",
+            tool_name="message.send",
+            tool_args={"text": "我晚点到", "title": "来自 LifeIn"},
+            preview_text="替你发一条消息:我晚点到",
+            trust=Trust.USER_INPUT,
+            now=NOW,
+        )
+        llm, seen = recording_llm([])
+        d, _ = recall_deps(llm)
+        d = replace(d, within_quota=lambda session, user_id: False)
+
+        result = handle_message(
+            pg_session, message=message(f"同意 {item.id}"), deps=d, now=NOW
+        )
+
+        assert result.handled is True
+        assert result.reason != "over_quota"
+        assert approvals.get(registered_user, pg_session, approval_id=item.id).status is (
+            approvals.ApprovalStatus.APPROVED
+        )
+        assert seen == []
+
+    def test_within_quota_lets_it_through(self, pg_session, registered_user):
+        seed_event(pg_session, registered_user)
+        llm = scripted_llm(
+            [{"person": ""}, {"answer": "批了,1280 元。", "refs": ["m1"], "confident": True}]
+        )
+        d, channel = recall_deps(llm)
+        d = replace(d, within_quota=lambda session, user_id: True)
+
+        result = handle_message(
+            pg_session, message=message("报销批了吗"), deps=d, now=NOW
+        )
+
+        assert result.handled and result.reason is None
+        assert "1280" in channel.sent[-1].summary

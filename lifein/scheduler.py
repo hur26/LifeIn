@@ -172,6 +172,9 @@ def within_quota(
 
     **不告警给用户。** 他对"你这个月的模型账单到上限了"做不了任何事;
     要处理的是你,而你看的是告警通道。
+
+    **问答那一条是例外**,它会回一句话 —— 因为他刚问了一句话,
+    而对一个直接的提问保持沉默看起来像系统坏了(见 `repos/quota` 模块开头)。
     """
     cap = services.settings.monthly_cost_cap_cny if services.settings else 0.0
     if not cap:
@@ -184,6 +187,24 @@ def within_quota(
         services.alerter.alert(f"{job} 因额度上限跳过", f"user={user_id}: {exc}")
         return False
     return True
+
+
+def quota_checker(services: Services, *, job: str) -> Callable[[Session, str], bool]:
+    """把 `within_quota` 包成问答那边要的形状:`(session, user_id) -> bool`。
+
+    **问答不是定时任务,但它一样花钱** —— 而且花得最快:一次问答两到三次
+    模型调用,用户想问几次就问几次。判据从来不是"是不是定时任务",
+    是"会不会调模型"(`repos/quota` 里那张表)。
+
+    `now` 在这里现取:问答是随时来的,没有一个"这一轮"的时刻可言。
+    """
+
+    def check(session: Session, user_id: str) -> bool:
+        return within_quota(
+            services, session, user_id, now=datetime.now(UTC), job=job
+        )
+
+    return check
 
 
 def run_digest_for_all_users(

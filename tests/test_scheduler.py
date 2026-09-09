@@ -217,3 +217,94 @@ def test_a_missed_approval_run_is_not_made_up():
 
     assert job.misfire_grace_time is not None
     assert job.misfire_grace_time <= 300
+
+
+class TestEveryModelSpenderIsCapped:
+    """**判据是"会不会调模型",不是"是不是定时任务"。**
+
+    上限最初只挡住了定时任务那一半,而花钱最快的那条路根本没被挡:
+    问答一次两到三次模型调用,而用户想问几次就问几次 ——
+    一个人聊一下午,定时任务那边省下的几毛钱一次就还回去了。
+
+    这一组盯的是**那张豁免清单是不是还成立**:新加一个会调模型的入口而忘了
+    挂上限,下面第一条会红。
+    """
+
+    NO_MODEL = {
+        # 对账回填不调模型:归类只查 merchant_rules(那个模块开头写着理由)
+        "reconcile",
+        # 下面这些一次模型调用都没有
+        "coverage_watch",
+        "approvals",
+        "reminders",
+        "collector_watch",
+        "notification_retention",
+    }
+    """**豁免的理由只有一个**:这个入口一次模型调用都不会发生。
+
+    改这份清单之前先回答一个问题:那个 job 现在调模型了吗?
+    调了就不是加进来,是给它挂上限。
+    """
+
+    def runners(self) -> dict[str, str]:
+        """`scheduler.py` 里每个 `run_*_for_all_users` 的源码。"""
+        import inspect
+
+        from lifein import scheduler
+
+        return {
+            name.removeprefix("run_").removesuffix("_for_all_users"): inspect.getsource(fn)
+            for name, fn in vars(scheduler).items()
+            if name.startswith("run_") and name.endswith("_for_all_users")
+        }
+
+    def test_every_runner_either_checks_quota_or_is_on_the_list(self):
+        for job, source in self.runners().items():
+            if "within_quota" in source:
+                continue
+            assert job in self.NO_MODEL, (
+                f"{job} 既不查额度,也不在「它不调模型」那份清单里。"
+                "确实不调模型的话,把它加进 NO_MODEL 并在那里写清理由;"
+                "调模型的话给它挂上 within_quota —— 这一条挡的正是「忘了挂」。"
+            )
+
+    def test_the_exempt_ones_really_do_not_call_the_model(self):
+        """**"它不调模型"这句话必须是被验证过的,不是被相信的。**
+
+        清单本身会过期:某天有人给提醒加一句"让模型润色一下",而这份清单
+        不会自己更新。所以直接去那个 job 的源码里找模型的影子。
+        """
+        import importlib
+        import inspect
+
+        modules = {
+            "reconcile": "lifein.jobs.reconcile",
+            "coverage_watch": "lifein.jobs.coverage_watch",
+            "approvals": "lifein.jobs.approval_execute",
+            "reminders": "lifein.jobs.reminders",
+            "collector_watch": "lifein.jobs.collector_watch",
+            "notification_retention": "lifein.jobs.notification_retention",
+        }
+        for job, name in modules.items():
+            source = inspect.getsource(importlib.import_module(name))
+            assert "LLMClient" not in source and "llm.chat" not in source, (
+                f"{job} 现在会调模型了,但它还在豁免清单里 —— 那等于它不受成本上限管"
+            )
+
+    def test_the_question_answering_path_is_capped(self):
+        """**问答不是定时任务,但它一样花钱,而且花得最快。**
+
+        两个入站入口(企微回调、微信长轮询)各自装配一次 `QaDeps`,
+        所以两处都要挂 —— 漏一处的表现是"从那个通道问就不花钱",
+        而那种漏法在账单上看得见、在代码里看不见。
+        """
+        import inspect
+
+        from lifein.api import app as api_app
+        from lifein.jobs import weixin_inbox
+
+        for module in (api_app, weixin_inbox):
+            source = inspect.getsource(module)
+            assert "within_quota=" in source, (
+                f"{module.__name__} 装配 QaDeps 时没挂额度检查"
+            )
