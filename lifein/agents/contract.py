@@ -128,5 +128,16 @@ def validate_all() -> None:
 
 
 def clear_registry() -> None:
-    """测试专用。"""
+    """测试专用。**清完要还回去** —— 理由见 `governance/registry.clear_registry`。"""
     _REGISTRY.clear()
+
+
+def snapshot_registry() -> dict[str, AgentSpec]:
+    """测试专用:存一份当前的 agent 注册表。"""
+    return dict(_REGISTRY)
+
+
+def restore_registry(snapshot: dict[str, AgentSpec]) -> None:
+    """测试专用:还原。"""
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)

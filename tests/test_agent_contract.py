@@ -18,7 +18,13 @@ from lifein.agents.contract import (
     get_agent,
     validate_all,
 )
-from lifein.governance.registry import ToolLevel, clear_registry, tool
+from lifein.governance.registry import (
+    ToolLevel,
+    clear_registry,
+    restore_registry,
+    snapshot_registry,
+    tool,
+)
 
 
 class In(BaseModel):
@@ -35,11 +41,18 @@ class NoArgs(BaseModel):
 
 @pytest.fixture(autouse=True)
 def _clean():
+    """**清空之后要还回去。**
+
+    "导入即注册":`@tool` / `@agent` 只在模块第一次被 import 时跑一次。
+    清完不还,整个进程里的注册表就一直是空的 —— 而后面哪些测试会红
+    取决于文件名的字母顺序,那是最难查的一类红。
+    """
+    tools, agents = snapshot_registry(), agent_contract.snapshot_registry()
     clear_registry()
     agent_contract.clear_registry()
     yield
-    clear_registry()
-    agent_contract.clear_registry()
+    restore_registry(tools)
+    agent_contract.restore_registry(agents)
 
 
 def register_tool(name: str) -> None:

@@ -161,5 +161,22 @@ def registered_tools() -> dict[str, ToolSpec]:
 
 
 def clear_registry() -> None:
-    """清空注册表。**测试专用**,生产代码调它一定是哪里错了。"""
+    """清空注册表。**测试专用**,生产代码调它一定是哪里错了。
+
+    **清完要还回去**,用下面两个。原因是"导入即注册":`@tool` 只在模块第一次
+    被 import 时跑一次,清空之后再调 `bootstrap.register_tools()` 什么都不会
+    发生 —— 模块早就在 `sys.modules` 里了。于是清过的那个测试文件之后,
+    整个进程里的注册表就是空的,而**后面哪些测试会红取决于文件名的字母顺序**。
+    """
     _REGISTRY.clear()
+
+
+def snapshot_registry() -> dict[str, ToolSpec]:
+    """测试专用:把当前注册表存一份,配合 `restore_registry` 用。"""
+    return dict(_REGISTRY)
+
+
+def restore_registry(snapshot: dict[str, ToolSpec]) -> None:
+    """测试专用:还原成 `snapshot_registry()` 拿到的那份。"""
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)

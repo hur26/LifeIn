@@ -15,6 +15,8 @@ from lifein.governance.registry import (
     clear_registry,
     get_tool,
     registered_tools,
+    restore_registry,
+    snapshot_registry,
     tool,
 )
 
@@ -25,9 +27,11 @@ class NoArgs(BaseModel):
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
+    """清空之后要还回去 —— 理由见 `clear_registry` 的说明。"""
+    snapshot = snapshot_registry()
     clear_registry()
     yield
-    clear_registry()
+    restore_registry(snapshot)
 
 
 def test_registered_tool_is_retrievable():
