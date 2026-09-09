@@ -11,20 +11,24 @@ venv/
 !.env.example
 *.pem
 *.key
-secrets/
-credentials/
-tokens/
+/secrets/
+/tokens/
 
 # 数据 —— 含个人隐私,绝对不能进仓库
-data/
+#
+# **这些规则一律加 `/` 前缀,只匹配仓库根目录下的那一个。**
+# 不加的话 Git 会在**每一层目录**上匹配 —— 而 2026-09 就出过一次:
+# 无前缀的 `data/` 把 `android/.../lifein/data/`(Secrets、Enrollment、Db)
+# 整包挡在了仓库外,本机编得过、clone 下来编不过,
+# 而那三个文件正是 Keystore、配码解析、离线队列所在的地方。
+/data/
+/exports/
 *.db
 *.sqlite3
-*.csv
-exports/
 
 # 日志
 *.log
-logs/
+/logs/
 
 # 编辑器与系统
 .vscode/
@@ -43,3 +47,13 @@ logs/
 # 评测集里是真实的邮件与群消息,和 R12 同级敏感。只有示例进库
 evals/*.jsonl
 !evals/*.example.jsonl
+
+# ---------------------------------------------------------------------------
+# 加规则之前先想一遍:**它会不会在别的目录层级上误伤源码?**
+#
+# `foo/` 匹配任意层级的 foo 目录,`/foo/` 只匹配根目录那一个。
+# 判断方法就一条命令 —— 加完规则跑它,列出来的东西里不该有源码:
+#
+#     git status --ignored --short | grep '^!!'
+#
+# `tests/test_gitignore.py` 把这件事变成了一条会红的测试。
