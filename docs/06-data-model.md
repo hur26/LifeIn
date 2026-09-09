@@ -1504,5 +1504,39 @@ CREATE TABLE console_links (
 每点一次就换一张的话,每次点击都要回 App 一趟。安全性靠那十五分钟,
 不靠"只能用一次"。
 
+#### token 只在门口出现一次
+
+上面那条"多次可用"说的是**这张 token 活多久**,不是**它出现在多少个地方**。
+原来页面里每个链接都带着它(`/console/export?t=…`),于是那串东西在整个会话里
+反复出现 —— 进浏览器历史、进反代的访问日志、可能进 Referer。
+而导出那一条下下来的是全部个人数据:**任何拿到那行历史记录的人,
+十五分钟内点一下就有**。
+
+所以进门那一次换成会话 cookie:
+
+```
+GET /console?t=<token>
+  → 303 See Other  Location: /console
+    Set-Cookie: lifein_console=<token>; HttpOnly; Secure; SameSite=Strict;
+                Path=/console; Max-Age=<这张 token 还剩几秒>
+```
+
+地址栏和后面每一次请求里都不再有 token。cookie 上那四样都不是可选的:
+`HttpOnly`(页面脚本读不到)、`Secure`(不走明文)、`SameSite=Strict`
+(别的站点点过来时不带上)、`Path=/console`(别的接口拿不到它)。
+`Max-Age` 跟着 token 走 —— **活得更长的 cookie 是一个看起来还能用、
+实际已经作废的会话**。
+
+**`Secure` 意味着控制台必须走 HTTPS**,和 App 那边"base_url 必须是 https"
+是同一条。为本机调试放开它,等于让线上那份也少一道。
+
+#### 导出是 POST,不是链接
+
+`POST /console/export`,**只认 cookie,不认 query**。
+
+GET 会被浏览器预取、被 Referer 带走、被"重新打开上次的标签页"重放,
+而下载一份全部个人数据不该是一个能被顺手重放的动作。
+一个表单按钮和一个链接在用户眼里没有区别,而在这几件事上差很远。
+
 **过期的直接删。** 和 `enrollment_codes` 不一样:那张要留"谁什么时候配上的"
 的痕迹,而"某人打开过控制台"不是那种事。

@@ -20,11 +20,20 @@ token 在 Web 上直接用不了。这个模块是那个问题的答案:App 里�
 所以它是**短命的多次可用** —— 十五分钟内这一张一直有效,过期就回首页。
 安全性靠的是那十五分钟,不是"只能用一次"。
 
-## URL 里带 token 的代价,以及为什么仍然接受
+## URL 里带 token 的代价,以及它怎么被缩小的
 
-token 会进浏览器历史,可能进 Referer(所以页面里没有任何外链)。
+token 会进浏览器历史,可能进反代的访问日志、可能进 Referer。
 十五分钟之后它什么都不是,而**替代方案是给这个系统再加一个登录面**,
 那比一条会过期的历史记录危险得多(R11 已经有够多的凭据面了)。
+
+**但原来它出现的次数远不止一次。** 页面里每个链接都带着它
+(`/console/export?t=…`),于是那串东西在整个会话里反复出现 ——
+而导出那一条下下来的是全部个人数据。
+
+现在它只在门口出现一次:`/console?t=…` 认出人之后换成一个 HttpOnly 的
+cookie,再跳到干净的 URL(见 [`api/console.py`](../api/console.py))。
+**这张 token 本身仍然是"短命的多次可用"** —— 那一条没变,变的是它出现在
+几个地方。
 """
 
 from __future__ import annotations
@@ -50,6 +59,19 @@ TOKEN_BYTES = 16
 
 
 @dataclass(frozen=True)
+class Resolved:
+    """一张认出来的 token:是谁的、什么时候作废。
+
+    **两样一起给。** 会话 cookie 活得比 token 长的话,那是一个看起来还能用、
+    实际已经作废的会话 —— 表现是点导出之后跳回首页说"链接过期了",
+    而地址栏什么都没变。
+    """
+
+    user_id: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
 class ConsoleLink:
     id: int
     user_id: str
@@ -63,7 +85,7 @@ _INSERT = text("""
 """)
 
 _RESOLVE = text("""
-    SELECT user_id FROM console_links
+    SELECT user_id, expires_at FROM console_links
      WHERE token_hash = :token_hash AND expires_at > :now
 """)
 
@@ -82,13 +104,21 @@ def issue(
     return token, ConsoleLink(id=row.id, user_id=str(row.user_id), expires_at=row.expires_at)
 
 
-def resolve(session: Session, *, token: str, now: datetime) -> str | None:
-    """这张 token 是谁的。**过期或不认识都返回 None,不区分。**"""
+def resolve(session: Session, *, token: str, now: datetime) -> Resolved | None:
+    """这张 token 是谁的、还能用多久。**过期或不认识都返回 None,不区分。**
+
+    **过期时间跟着一起返回,不另开一个函数。** 会话 cookie 的 `Max-Age` 要用它,
+    而单开一个 `expires_at(token)` 会是这个仓储里第三种"不带 user_id"的形状 ——
+    `tests/test_repo_contract.py` 只认两种(算 user_id 的、按时间清理的),
+    而那条限制是对的:多一种形状就多一处要解释"它凭什么不用 user_id"。
+
+    这里本来就是"算出 user_id"的那一次查询,顺手多带一列没有新增任何破例。
+    """
     row = session.execute(_RESOLVE, {"token_hash": _hash(token), "now": now}).first()
     if row is None:
         log.info("控制台链接无效或已过期")
         return None
-    return str(row.user_id)
+    return Resolved(user_id=str(row.user_id), expires_at=row.expires_at)
 
 
 def purge_expired(session: Session, *, cutoff: datetime) -> int:

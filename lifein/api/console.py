@@ -27,6 +27,31 @@
 **链接失效之后回到的是首页,不是报错页。** 一个过期的链接对用户来说
 不是"出错了",是"再点一次" —— 而报错页会让人以为自己做错了什么。
 
+## token 进了 URL,所以它只在门口出现一次
+
+URL 里的 token 会进浏览器历史、进反代的访问日志、可能进 Referer。
+原来页面里每个链接都带着它(`/console/export?t=…`),于是那串东西**在整个
+会话里反复出现**,而**导出那一条是全部个人数据**:任何拿到那行历史记录的人,
+十五分钟内点一下就能把它下下来。
+
+改成两步:
+
+1. `/console?t=…` 认出人之后 **换成一个 HttpOnly 的 cookie,然后 303 跳到
+   干净的 `/console`** —— 地址栏和后面每一次请求里都不再有 token
+2. 页面里的链接一个都不带 token。导出读 cookie,不读 query
+
+**导出还改成了 POST。** GET 会被浏览器预取、被 Referer 带走、被"重新打开
+上次的标签页"重放,而**下载一份全部个人数据不该是一个能被顺手重放的动作**。
+一个表单按钮和一个链接在用户眼里没有区别。
+
+cookie 上的四样都不是可选的:`HttpOnly`(页面脚本读不到)、`Secure`
+(不走明文)、`SameSite=Strict`(别的站点点过来时不带上)、
+`Path=/console`(别的接口拿不到它)。
+
+**`Secure` 意味着控制台必须走 HTTPS。** 这和 App 那边"base_url 必须是 https"
+是同一条(ADR-022 之后服务端本来就在 TLS 后面),而为了本机调试放开它,
+等于让线上那份也少一道。
+
 ## 页面是服务端渲染的,没有前端框架
 
 三个页面、几十行 HTML。上一个前端框架意味着一套构建、一份依赖清单、
@@ -40,8 +65,10 @@ import html
 import json
 import logging
 from datetime import datetime, timedelta
+from typing import Annotated
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Cookie, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from lifein.api.deps import AppCaller, NowDep, SessionDep
@@ -50,6 +77,10 @@ from lifein.repos import console_links, credentials, export, users
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["console"])
+
+COOKIE = "lifein_console"
+"""会话 cookie 的名字。**值就是那张 token** —— 库里存的仍然是它的 sha256,
+换个名字并不会多一层保护,而少一个概念少一处会写错的地方。"""
 
 LINK_TTL = timedelta(minutes=15)
 """控制台链接活多久。**比配码那张长一点** —— 配码是当场扫,
@@ -72,9 +103,29 @@ def make_link(caller: AppCaller, session: SessionDep, now: NowDep) -> ConsoleLin
 
 
 @router.get("/console")
-def console_home(session: SessionDep, now: NowDep, t: str | None = None) -> Response:
-    """控制台首页:这个人有哪些设备、能导出、能读隐私说明。"""
-    user_id = console_links.resolve(session, token=t, now=now) if t else None
+def console_home(
+    session: SessionDep,
+    now: NowDep,
+    t: str | None = None,
+    lifein_console: Annotated[str | None, Cookie()] = None,
+) -> Response:
+    """控制台首页:这个人有哪些设备、能导出、能读隐私说明。
+
+    **带 `?t=` 进来的那一次不渲染页面,而是换 cookie 之后跳到干净的 URL。**
+    见模块开头:token 只在门口出现一次。
+    """
+    if t:
+        link = console_links.resolve(session, token=t, now=now)
+        if link is not None:
+            return _redirect_with_cookie(t, expires_in=link.expires_at - now)
+        # token 不认识就当没带,落到下面那张"再点一次"的页面
+
+    link = (
+        console_links.resolve(session, token=lifein_console, now=now)
+        if lifein_console
+        else None
+    )
+    user_id = link.user_id if link else None
     if user_id is None:
         # **过期的链接不是错误,是"再点一次"。** 报错页会让人以为自己做错了什么
         return _page(
@@ -105,8 +156,9 @@ def console_home(session: SessionDep, now: NowDep, t: str | None = None) -> Resp
         手机丢了告诉白杨,吊销这台的两条即可,别的设备不受影响。</p>
 
         <h2>你的数据</h2>
-        <p><a href="/console/export?t={html.escape(t or '')}">下载一份导出</a>
-        (JSON,不含凭据)</p>
+        <form method="post" action="/console/export">
+          <button type="submit">下载一份导出</button>(JSON,不含凭据)
+        </form>
         <p class="hint">这份文件里有你的全部内容。<strong>凭据不在里面</strong> ——
         它会躺在你的下载目录,而如果里面有邮箱授权码,
         那份文件就比它保护的东西还危险。</p>
@@ -121,12 +173,25 @@ def console_home(session: SessionDep, now: NowDep, t: str | None = None) -> Resp
     )
 
 
-@router.get("/console/export")
-def download_export(session: SessionDep, now: NowDep, t: str | None = None) -> Response:
-    """把导出文件直接下下来。**同一个一次性 token 换出来的会话内有效。**"""
-    user_id = console_links.resolve(session, token=t, now=now) if t else None
-    if user_id is None:
+@router.post("/console/export")
+def download_export(
+    session: SessionDep,
+    now: NowDep,
+    lifein_console: Annotated[str | None, Cookie()] = None,
+) -> Response:
+    """把导出文件直接下下来。**只认 cookie,而且只认 POST。**
+
+    GET 会被浏览器预取、被 Referer 带走、被"重新打开上次的标签页"重放,
+    而这一条下下来的是**全部个人数据** —— 不该是一个能被顺手重放的动作。
+    """
+    link = (
+        console_links.resolve(session, token=lifein_console, now=now)
+        if lifein_console
+        else None
+    )
+    if link is None:
         return _page("LifeIn", "<p>这个链接过期了。在 App 里重新点一次。</p>")
+    user_id = link.user_id
 
     data = export.export_user(user_id, session, now=now)
     payload = {
@@ -161,6 +226,26 @@ def privacy() -> Response:
         return _page("隐私说明", "<p>隐私说明暂时读不到。在接入之前请先问白杨要一份。</p>")
 
     return _page("隐私说明", f"<pre>{html.escape(text)}</pre>")
+
+
+def _redirect_with_cookie(token: str, *, expires_in: timedelta) -> Response:
+    """把 token 收进 cookie,然后跳到没有 query 的 `/console`。
+
+    **303 而不是 302**:303 明确要求跳过去用 GET,而这条本来就是 GET ——
+    写死它是为了不依赖各家浏览器对 302 的历史习惯。
+    """
+    response = RedirectResponse(url="/console", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(
+        key=COOKIE,
+        value=token,
+        # **cookie 不该活得比 token 长**(见 `console_links.Resolved`)
+        max_age=max(int(expires_in.total_seconds()), 0),
+        httponly=True,   # 页面脚本读不到
+        secure=True,     # 不走明文 —— 控制台必须在 TLS 后面
+        samesite="strict",  # 别的站点点过来时不带上
+        path="/console",  # 别的接口拿不到它
+    )
+    return response
 
 
 def _page(title: str, body: str) -> Response:
