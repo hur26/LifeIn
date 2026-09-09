@@ -244,6 +244,43 @@ def _tools_registered():
         importlib.reload(qa_agent)
 
 
+def recording_llm(payloads):
+    """和 `scripted_llm` 一样,但把每次发出去的**用户消息原文**留下来。
+
+    ADR-025 那条保证("提议那次调用看不到任何外部素材")只能这样验:
+    断言 agent 的输出没用 —— 要看的是**发出去的上下文里到底有什么**。
+    """
+    seen: list[str] = []
+    queue = list(payloads)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        joined = chr(10).join(
+            m["content"] for m in body["messages"] if m["role"] == "user"
+        )
+        seen.append(joined)
+        out = queue.pop(0) if queue else {}
+        return httpx.Response(
+            200,
+            json={
+                "model": "m",
+                "choices": [{"message": {"content": json.dumps(out, ensure_ascii=False)}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+            },
+        )
+
+    return (
+        LLMClient(
+            base_url="https://llm.example.com/v1",
+            api_key="k",
+            model="m",
+            max_retries=0,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        ),
+        seen,
+    )
+
+
 def scripted_llm(payloads) -> LLMClient:
     """按顺序回一串响应:第一次是检索线索,第二次才是答案。"""
     queue = list(payloads)
@@ -401,6 +438,9 @@ def test_recall_failure_still_produces_an_answer(pg_session, registered_user):
 
     def exploding_gateway(user_id, session):
         class Boom:
+            # 没接审批队列 —— 这个用例测的是检索,和 L3 那条路无关
+            can_approve = False
+
             def call(self, *_args, **_kwargs):
                 raise RuntimeError("记忆层挂了")
 
@@ -432,3 +472,144 @@ def test_without_a_gateway_nothing_is_recalled(pg_session, registered_user):
 
     names = [row.tool_name for row in tool_rows(pg_session, registered_user)]
     assert names == ["llm.chat"], "没有网关时连检索线索那一次都不该调"
+
+
+# ---------- P3:代发消息(ADR-025) ----------
+
+
+def approving_deps(llm, *, now=NOW):
+    """带审批队列的网关。**没有它 L3 只会被拒**,而那正是这条链路原来的样子。"""
+    from lifein.governance.approval_queue import PostgresApprovalQueue
+    from lifein.governance.gateway import Gateway
+    from lifein.repos.tool_calls import PostgresAuditSink
+
+    channel = FakeChannel()
+
+    def factory(user_id, session):
+        return Gateway(
+            PostgresAuditSink(user_id, session),
+            PostgresApprovalQueue(session, now=now),
+        )
+
+    return (
+        QaDeps(
+            llm=llm,
+            channel=channel,
+            resolve_user=resolve_wecom,
+            gateway_factory=factory,
+        ),
+        channel,
+    )
+
+
+class TestProposingASend:
+    """**这条路原来在生产里一次都不会被触发。**
+
+    `message.send` 注册了、网关会转审批、回调会改状态、执行 job 会去做 ——
+    而没有一个 agent 的白名单里有它,所以 `approvals` 永远是空的。
+    一段编译得过、测试也绿、而永远不会运行的代码(ADR-025)。
+    """
+
+    def test_an_instruction_becomes_an_approval(self, pg_session, registered_user):
+        from lifein.repos import approvals
+
+        llm = scripted_llm([{"send": True, "to": "老王", "text": "今晚饭局我去不了了"}])
+        d, channel = approving_deps(llm)
+
+        result = handle_message(
+            pg_session, message=message("跟老王说今晚饭局我去不了了"), deps=d, now=NOW
+        )
+
+        assert result.reason == "approval_required"
+        (item,) = approvals.list_open(registered_user, pg_session, now=NOW)
+        assert item.tool_name == "message.send"
+        assert item.tool_args["text"] == "今晚饭局我去不了了"
+        # 卡片上要写清楚**这一次**要做什么,不是"代发一条消息"那种描述
+        assert "今晚饭局我去不了了" in channel.sent[-1].summary
+
+    def test_nothing_is_sent_before_you_tap_agree(self, pg_session, registered_user):
+        """审批卡片不是消息本身。**这一步一个字都不该发给老王。**"""
+        llm = scripted_llm([{"send": True, "to": "老王", "text": "我晚点到"}])
+        d, channel = approving_deps(llm)
+
+        handle_message(pg_session, message=message("跟老王说我晚点到"), deps=d, now=NOW)
+
+        # 只有那张"要我替你发出去吗"的卡片,发给用户本人
+        assert len(channel.sent) == 1
+        assert channel.sent[0].title == "要我替你发出去吗?"
+
+    def test_a_question_is_still_answered(self, pg_session, registered_user):
+        """**拿不准一律当提问。** 漏一次他会再说一遍,发错一次撤不回来。"""
+        seed_event(pg_session, registered_user)
+        llm = scripted_llm(
+            [
+                {"send": False},
+                {"person": ""},
+                {"answer": "批了,1280 元。", "refs": ["m1"], "confident": True},
+            ]
+        )
+        d, channel = approving_deps(llm)
+
+        result = handle_message(
+            pg_session, message=message("老王上周说了什么"), deps=d, now=NOW
+        )
+
+        assert result.handled and result.reason is None
+        assert "1280" in channel.sent[-1].summary
+
+    def test_saying_send_without_a_body_proposes_nothing(self, pg_session, registered_user):
+        """说要发却没给正文。**不猜** —— 猜出来的那条会被人点同意。"""
+        from lifein.repos import approvals
+
+        seed_event(pg_session, registered_user)
+        llm = scripted_llm(
+            [
+                {"send": True, "to": "老王", "text": "   "},
+                {"person": ""},
+                {"answer": "不知道", "refs": [], "confident": False},
+            ]
+        )
+        d, _ = approving_deps(llm)
+
+        handle_message(pg_session, message=message("跟老王说"), deps=d, now=NOW)
+        assert approvals.list_open(registered_user, pg_session, now=NOW) == []
+
+    def test_the_proposal_never_sees_external_material(self, pg_session, registered_user):
+        """**ADR-025 的那条结构性保证。**
+
+        网关那道 `trust is user_input` 挡不住"检索回来的邮件里写着一句指令"
+        —— 问句确实是用户打的。挡住它的是:提议那次调用的上下文里
+        **一个外部素材块都没有**。
+
+        这里直接看发出去的第一条请求:里面只能有用户那句话,
+        不能出现任何被隔离标记包起来的素材。
+        """
+        seed_memory(pg_session, registered_user)
+        llm, seen = recording_llm([{"send": False}, {"person": ""}, {"answer": "x", "refs": []}])
+        d, _ = approving_deps(llm)
+
+        handle_message(
+            pg_session, message=message("上次和张三聊的是什么"), deps=d, now=NOW
+        )
+
+        first = seen[0]
+        assert "上次和张三聊的是什么" in first
+        assert "<external" not in first, "提议那次调用不许带任何外部素材(ADR-025)"
+
+    def test_without_an_approval_queue_it_stays_a_question(self, pg_session, registered_user):
+        """P0/P1 那种没接审批队列的部署。**不是错误** —— L3 本来就还没上线。
+
+        而且那时不该白花一次模型调用:第一次请求就该是检索线索,不是代发判断。
+        """
+        seed_event(pg_session, registered_user)
+        llm, seen = recording_llm(
+            [{"person": ""}, {"answer": "批了。", "refs": ["m1"], "confident": True}]
+        )
+        d, _ = recall_deps(llm)
+
+        result = handle_message(
+            pg_session, message=message("跟老王说我晚点到"), deps=d, now=NOW
+        )
+
+        assert result.handled and result.reason is None
+        assert len(seen) == 2, "没接审批队列时不该多花一次调用去判代发"

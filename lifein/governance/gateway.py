@@ -109,6 +109,16 @@ class Gateway:
         self._audit = audit
         self._approvals = approvals
 
+    @property
+    def can_approve(self) -> bool:
+        """接没接审批队列。**调用方拿它决定要不要走 L3 那条路。**
+
+        没接的时候 L3 会被拒(下面 `_handle_l3` 里那一段),而**在花掉一次
+        模型调用之前就知道这件事**比事后拿一个 Denied 好:P0/P1 那种部署
+        本来就还没上线 L3,那不是错误。
+        """
+        return self._approvals is not None
+
     def call(self, ctx: CallContext, tool_name: str, args: Mapping[str, Any]) -> Any:
         try:
             spec = get_tool(tool_name)

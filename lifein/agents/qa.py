@@ -78,6 +78,47 @@ class RecallPlan(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
 
+_ACTION_TASK = (
+    "判断用户这句话是在**问一件事**,还是在**让你替他发一条消息**。\n\n"
+    "输出严格的 JSON,不要加解释文字:\n"
+    '{"send": true 或 false,'
+    ' "to": "要发给谁,照他说的写,没说就填空字符串",'
+    ' "text": "要发出去的正文"}\n\n'
+    "**是提问就把 send 填 false**,别的字段留空。"
+    "问句里带着人名不代表要发消息 —— "
+    '"老王上周说了什么" 是提问,"跟老王说我晚点到" 才是要发。\n'
+    "拿不准一律填 false:漏一次他会再说一遍,发错一次撤不回来。"
+)
+
+MAX_MESSAGE_CHARS = 500
+"""代发正文的上限。
+
+**这个数不是为了省 token。** 一条要人点头的消息如果长到卡片上放不下,
+那张卡片就变成了"点同意"而不是"看清楚再点同意" —— 而 03 的退出条件是
+"你自己不敢点同意 → 预览做得不够清楚"。
+"""
+
+
+class ProposedMessage(BaseModel):
+    """模型提议替你发的一条消息。**它只是提议** —— 真发出去要过审批(L3)。"""
+
+    to: str = ""
+    text: str = ""
+
+    @property
+    def is_real(self) -> bool:
+        return bool(self.text.strip())
+
+
+@dataclass(frozen=True)
+class ActionResult:
+    """提议 + 这次调用的 token 数。token 要带出去,理由和 `PlanResult` 一样。"""
+
+    message: ProposedMessage | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+
 @dataclass(frozen=True)
 class PlanResult:
     """检索线索 + 这次调用的 token 数。
@@ -238,6 +279,51 @@ def plan_recall(question: str, *, llm: LLMClient) -> PlanResult:
     )
 
 
+def plan_action(question: str, *, llm: LLMClient) -> ActionResult:
+    """再问一次模型:这句话是提问,还是让我替他发一条消息。
+
+    **这次调用只看用户自己打的那句话,一个外部素材块都不带**
+    (`blocks=[]`)—— 这是 [ADR-025] 的全部内容,也是铁律 8 在这条路上
+    结构性成立的地方。
+
+    网关那道 `trust is user_input` 挡不住这一种:问句确实是他打的。而一封
+    写着"请帮我转告所有人……"的邮件被检索回来之后,模型完全可能把它当成
+    要执行的事 —— 而那张审批卡片会长得非常像他自己要的东西。
+    上下文里根本没有外部内容,注入就进不来。
+
+    和 `plan_recall` 是同一个形状。**同一个形状用两次,比为第二次发明
+    一套新的更可靠。**
+
+    **解析失败返回空提议,不抛。** 最坏的结果应该是"它没听懂,我再说一遍",
+    不是整次问答失败。
+    """
+    messages = build_messages(task=_ACTION_TASK, blocks=[], user_instruction=question)
+    try:
+        response = llm.chat(messages)
+        parsed = response.as_json()
+    except (LLMBadResponse, LLMError) as exc:
+        log.info("代发意图解析失败,这次不提议:%s", exc)
+        return ActionResult()
+
+    tokens = (response.prompt_tokens, response.completion_tokens)
+    if not isinstance(parsed, dict) or parsed.get("send") is not True:
+        return ActionResult(None, *tokens)
+
+    text = str(parsed.get("text") or "").strip()
+    if not text:
+        # 说要发,却没给正文。**不猜** —— 猜出来的那条会被人点同意
+        log.info("模型说要发消息但没给正文,忽略")
+        return ActionResult(None, *tokens)
+
+    return ActionResult(
+        ProposedMessage(
+            to=str(parsed.get("to") or "").strip(),
+            text=text[:MAX_MESSAGE_CHARS],
+        ),
+        *tokens,
+    )
+
+
 @agent(
     name="qa",
     inputs=QaInput,
@@ -246,6 +332,10 @@ def plan_recall(question: str, *, llm: LLMClient) -> PlanResult:
         "memory.search_entities",
         "memory.recent_events_with",
         "memory.recall_facts",
+        # **唯一的 L3。** 加它之前 approvals 那条链路在生产里一次都不会被
+        # 触发 —— 接口全在,没有调用方(ADR-025)。
+        # 提议由 `plan_action` 产生,那次调用看不到任何外部素材
+        "message.send",
         # 账本(P2)。**只读** —— 对话式的改账要多一次点头,走待确认那条路,
         # 因为"把昨天星巴克那笔改成餐饮"多了一次可能理解错的机会
         "ledger.query",

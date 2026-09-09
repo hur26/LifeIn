@@ -38,11 +38,12 @@ from lifein.agents.qa import (
     RecalledEvent,
     RecalledFact,
     answer,
+    plan_action,
     plan_recall,
 )
 from lifein.channels.base import Card, Channel, InboundMessage
 from lifein.governance.audit import ToolCallRecord
-from lifein.governance.gateway import CallContext, Gateway
+from lifein.governance.gateway import ApprovalRequired, CallContext, Denied, Gateway
 from lifein.governance.registry import ToolLevel
 from lifein.jobs import approval_reply
 from lifein.llm.client import LLMClient, LLMError
@@ -145,6 +146,14 @@ def handle_message(
             deps.channel.send(user.id, decided.card)
         return ReplyResult(handled=True, user_id=user.id, reason=decided.action or "approval")
 
+    # 代发意图排在检索前面:如果这句话是"跟老王说我晚点到",那它不是提问,
+    # 检索和回答都白跑。而**那次判断只看这句话本身**,一个外部素材都不带
+    # (ADR-025)—— 铁律 8 在这条路上就是这么成立的
+    proposed = _propose_send(session, user_id=user.id, question=question, deps=deps)
+    if proposed is not None:
+        deps.channel.send(user.id, proposed)
+        return ReplyResult(handled=True, user_id=user.id, reason="approval_required")
+
     events = raw_events.fetch_normalized_between(user.id, session, start=now - lookback, end=now)
     recalled, recalled_facts = _recall(session, user_id=user.id, question=question, deps=deps)
 
@@ -187,6 +196,77 @@ def handle_message(
 
     _reply(deps, user.id, message, result.output.answer, refs=result.output.refs)
     return ReplyResult(handled=True, user_id=user.id)
+
+
+def _propose_send(
+    session: Session,
+    *,
+    user_id: str,
+    question: str,
+    deps: QaDeps,
+) -> Card | None:
+    """这句话是不是"替我发一条消息"。是的话过网关,拿回一张审批卡片。
+
+    **这是 `approvals` 在生产里唯一的入口。** 加它之前整条 L3 链路没有调用方
+    —— 工具注册了、网关会转审批、回调会改状态、执行 job 会去做,而没有一个
+    agent 的白名单里有 `message.send`,所以它一次都不会被触发(ADR-025)。
+
+    返回 `None` 表示"这是个提问,照常走问答"。**任何失败也返回 None** ——
+    最坏的结果应该是"它把我的指令当成提问答了一遍",而不是没有回音。
+
+    没配审批队列时不调 `plan_action`:那次调用要花钱,而拿到提议也发不出去。
+    """
+    if deps.gateway_factory is None:
+        return None
+
+    gateway = deps.gateway_factory(user_id, session)
+    if not gateway.can_approve:
+        # 没接审批队列的部署(P0/P1 那种)。**不是错误** —— L3 本来就还没上线
+        return None
+
+    planned = plan_action(question, llm=deps.llm)
+    _record_llm_call(
+        session,
+        user_id=user_id,
+        stage="action",
+        question_len=len(question),
+        prompt_tokens=planned.prompt_tokens,
+        completion_tokens=planned.completion_tokens,
+    )
+    if planned.message is None or not planned.message.is_real:
+        return None
+
+    ctx = CallContext(
+        user_id=user_id,
+        agent="qa",
+        # 问句是用户本人打的。**而提议是只看这句话产生的** ——
+        # 两件事都成立,这条 L3 才配得上 user_input(铁律 8)
+        trust=Trust.USER_INPUT,
+        session=session,
+    )
+    title = f"发给{planned.message.to}" if planned.message.to else "来自 LifeIn"
+    try:
+        gateway.call(
+            ctx,
+            "message.send",
+            {"text": planned.message.text, "title": title[:40]},
+        )
+    except ApprovalRequired as pending:
+        log.info("代发消息进审批队列:#%s", pending.approval_id)
+        return Card(
+            title="要我替你发出去吗?",
+            summary=pending.preview_text,
+            footer=f"回复「同意 {pending.approval_id}」发出,「拒绝 {pending.approval_id}」作罢",
+        )
+    except Denied as exc:
+        # 网关挡下了(白名单、入参、或者 trust)。**照常走问答** ——
+        # 用户会看到一句答非所问的回答,而那比一句"被拒绝了"更容易看出哪里不对
+        log.warning("代发提议被网关挡下:%s", exc)
+        return None
+
+    # 走到这里说明 L3 没有转成审批就返回了 —— 那是网关的 bug,不是正常路径
+    log.error("message.send 没有进审批队列就返回了,不该发生")
+    return None
 
 
 def _recall(
