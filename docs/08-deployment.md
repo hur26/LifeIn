@@ -230,6 +230,16 @@ python -m lifein.admin test-imap --user <uuid>
 > **授权码从交互输入读,不做成命令行参数。** 参数会进 shell history、
 > 出现在 `ps` 的输出里、被跳板机的会话录制录下来 —— 三处都不是能事后清干净的。
 
+> **`alembic upgrade head` 这一行留着,但它不再是唯一的一道。**
+> 进程启动时会自己比一次库版本,落后就先升到 head 再继续
+> ([ADR-030](04-tech-decisions.md#adr-030--库版本落后由进程自己发现并在空闲时段自己补上));
+> 之后每天 `SCHEMA_CHECK_AT`(默认 04:00)再核对一次。
+>
+> 加这一道是因为 2026-09-10 漏跑过一次:库停在 `0007`、代码在 `0014`,
+> 而进程照常启动,缺的列直到 job 跑起来才被读到 —— 于是"少跑了一条命令"
+> 以「审批执行异常」的形状每三分钟报一次,一天 85 封。
+> **能被漏掉的步骤迟早会被漏掉**,所以这一行现在有兜底,而不是被替代。
+
 **`test-imap` 必须打印"登录成功"才往下走。** 它真连了一次邮箱 ——
 163 那个 `ID` 握手对不对,只有这一步能证明。
 
@@ -529,6 +539,10 @@ scp lifein.dump user@云服务器:/tmp/
 sudo -u postgres pg_restore -d lifein --no-owner --role=lifein /tmp/lifein.dump
 cd /opt/lifein && .venv/bin/python -m alembic upgrade head   # 应当显示已是 head
 ```
+
+**这一步现在也有兜底**:`python -m lifein` 起来时会自己比一次库版本
+(ADR-030)。但迁数据这一段仍然要手动跑一遍 —— 你要在**起服务之前**
+就知道还原出来的库是不是完整的,而不是让服务启动时顺手把它改掉。
 
 还原完立刻对一遍条数,**对不上就停下**:
 

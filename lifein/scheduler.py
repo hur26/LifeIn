@@ -25,8 +25,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
 
+from lifein import schema_guard
 from lifein.bootstrap import Services, build_adapters, build_own_identifiers
-from lifein.db import session_scope
+from lifein.db import get_engine, session_scope
 from lifein.jobs import notification_retention
 from lifein.jobs.approval_execute import ExecuteDeps
 from lifein.jobs.approval_execute import run_once as run_approvals_once
@@ -64,6 +65,7 @@ APPROVAL_JOB_ID = "approval_execute"
 REMINDER_JOB_ID = "reminders"
 COLLECTOR_JOB_ID = "collector_watch"
 RETENTION_JOB_ID = "notification_retention"
+SCHEMA_JOB_ID = "schema_check"
 
 RETENTION_DELAY_MINUTES = 60
 """通知保留期清理排在摘要之后一小时。
@@ -509,6 +511,75 @@ def run_approvals_for_all_users(
     return executed
 
 
+def run_schema_check(services: Services) -> int:
+    """核对库版本,落后就升到 head。返回这次真的应用了几个版本(ADR-030)。
+
+    **它是这里唯一不按用户分的 job。** 别的都是"给每个用户跑一遍",而库结构
+    是整个进程共用的一件事 —— 所以这里没有 `user_id`,也不认领 `job_runs`
+    的窗口:补跑一次昨天的版本校验没有意义,今天这次看到的就是现在的状态。
+
+    **排在空闲时段**(`SCHEMA_CHECK_AT`,默认 04:00)。它可能真的去改表结构,
+    而那件事不该和摘要、记账那几个撞在一起。
+
+    需要这一次的理由是 `migrations/versions/*.py` **是 alembic 运行时从磁盘
+    读的**:一次 `git pull` 不重启进程,磁盘上的 head 就已经前进了,
+    而那种漂移只有重启才会暴露 —— 这个进程可能几周不重启。
+    """
+    engine = get_engine(services.settings)
+    try:
+        state = schema_guard.inspect_schema(engine)
+    except Exception as exc:  # noqa: BLE001 —— 连不上库、找不到 alembic.ini,都只是"这次没查成"
+        log.exception("库版本自检失败")
+        services.alerter.alert("库版本自检异常", f"{type(exc).__name__}: {exc}")
+        return 0
+
+    if state.unknown:
+        # **开着自动升级也不升。** 自动升级的前提是"这些迁移本来就是这次部署
+        # 带来的",而认不出来的版本不满足那个前提(ADR-030)
+        services.alerter.alert(
+            "库版本对不上", state.describe() + " —— 这一种不会自动处理,要人来看"
+        )
+        return 0
+
+    if state.is_current:
+        log.info("库版本自检:%s", state.describe())
+        return 0
+
+    if not services.settings.schema_auto_upgrade:
+        services.alerter.alert(
+            "库版本落后",
+            state.describe() + " —— SCHEMA_AUTO_UPGRADE 是关的,要人工跑 alembic upgrade head",
+        )
+        return 0
+
+    log.warning("库版本落后,开始自动升级:%s", state.describe())
+    try:
+        upgraded = schema_guard.upgrade_to_head(engine)
+    except Exception as exc:  # noqa: BLE001 —— 迁移失败整条回滚,库还停在原来那个版本
+        log.exception("库版本自动升级失败")
+        services.alerter.alert(
+            "库版本自动升级失败",
+            state.describe() + "\n" + f"{type(exc).__name__}: {exc}",
+        )
+        return 0
+
+    if not upgraded.is_current:
+        # 没抢到锁(别的进程正在升)也会走到这里 —— 那不是失败,下一次会看到最新
+        services.alerter.alert("库版本自动升级没做完", upgraded.describe())
+        return 0
+
+    detail = f"{state.current or '空库'} → {upgraded.head},应用了 {len(state.pending)} 个版本:" + (
+        "、".join(reversed(state.pending))
+    )
+    started = schema_guard.startup_head()
+    if started is not None and started != upgraded.head:
+        # 库跟上了磁盘上的代码,而这个进程还跑着启动时那一份 —— 那是另一头的漂移
+        detail += "\n\n" + f"磁盘上的代码比这个进程新(启动时 head 是 {started}),重启它。"
+    # **成功也告警。** 一次无人值守的结构变更不该只留在日志里
+    services.alerter.alert("库版本已自动升级", detail)
+    return len(state.pending)
+
+
 def run_reminders_for_all_users(
     services: Services,
     *,
@@ -620,6 +691,7 @@ def build_scheduler(
     reminder_runner: Callable[[Services], int] | None = None,
     collector_runner: Callable[[Services], int] | None = None,
     retention_runner: Callable[[Services], int] | None = None,
+    schema_runner: Callable[[Services], int] | None = None,
 ) -> BackgroundScheduler:
     """按配置建调度器。**不 start** —— 由调用方决定什么时候起。"""
     run = runner or run_digest_for_all_users
@@ -633,6 +705,7 @@ def build_scheduler(
     run_reminders = reminder_runner or run_reminders_for_all_users
     run_collector_watch = collector_runner or run_collector_watch_for_all_users
     run_retention = retention_runner or run_notification_retention_for_all_users
+    run_schema = schema_runner or run_schema_check
     hour, minute = services.settings.digest_hour_minute
     memory_hour, memory_minute = _shift(hour, minute, MEMORY_DELAY_MINUTES)
     plan_hour, plan_minute = _shift(hour, minute, PLAN_DELAY_MINUTES)
@@ -641,6 +714,9 @@ def build_scheduler(
     monthly_hour, monthly_minute = _shift(hour, minute, MONTHLY_DELAY_MINUTES)
     cov_hour, cov_minute = _shift(hour, minute, COVERAGE_DELAY_MINUTES)
     retention_hour, retention_minute = _shift(hour, minute, RETENTION_DELAY_MINUTES)
+    # **不跟着摘要走。** 别的 job 排的都是"摘要之后第几分钟",而这一个要的是
+    # 空闲,和摘要几点跑没有关系 —— 它自己配一个时刻(ADR-030)
+    schema_hour, schema_minute = services.settings.schema_check_hour_minute
 
     scheduler = BackgroundScheduler(timezone=services.settings.tzinfo)
     scheduler.add_job(
@@ -756,6 +832,18 @@ def build_scheduler(
         max_instances=1,
         # 睡醒之后立刻补一次:机器停着的这段时间正是最可能掉线的时候
         misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        lambda: run_schema(services),
+        trigger=CronTrigger(
+            hour=schema_hour, minute=schema_minute, timezone=services.settings.tzinfo
+        ),
+        id=SCHEMA_JOB_ID,
+        name="库版本自检",
+        coalesce=True,
+        max_instances=1,
+        # 错过一小时以内的照跑。这件事晚一点做没关系,不做才有关系
+        misfire_grace_time=3600,
     )
     return scheduler
 

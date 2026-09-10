@@ -135,6 +135,32 @@ class Settings(BaseSettings):
     7 天是给补跑留的余量:窗口补偿最多三天(job_runs),再加一次手动重跑。
     调小更安全,但小于 3 会让补跑读到空正文。"""
     alert_channel: str = "email"
+    alert_dedup_window_m: int = 60
+    """同一条告警多久之内只发一封,单位分钟。**0 表示不去重。**
+
+    见 ADR-031。事故那天同一封信发了 85 次,而它们讲的是同一件事 ——
+    第 85 封没有比第 1 封多说任何东西,只是让前面 84 封更容易被忽略。
+
+    **收敛的只有邮件,日志一条不少。** 被压住的那些照样写 ERROR,
+    而窗口结束后的第一封信会带上"这段时间里还发生了 N 次"。
+    """
+
+    schema_auto_upgrade: bool = True
+    """库版本落后时自动升到 head(ADR-030)。
+
+    **关掉它不等于放着不管** —— 关掉之后库版本落后会让进程**起不来**,
+    而不是安静地跑下去。两种都比事故那天的"照常启动,然后每三分钟告警一次"强。
+    """
+
+    schema_check_at: str = "04:00"
+    """每天什么时候核对一次库版本。
+
+    要挑一个**空闲时段**:这一步可能真的去改表结构,而它不该和摘要、记账
+    那几个 job 撞在一起。默认 04:00 在最早的那个 job(摘要 08:00)之前四小时。
+
+    需要它是因为 `migrations/versions/*.py` 是 alembic **运行时从磁盘读的** ——
+    一次 `git pull` 不重启进程,磁盘上的 head 就已经前进了。
+    """
 
     # ---------- 邮件兜底通道(P1,可选)----------
     # 配了才启用。它是降级链的最后一环,也是告警的出口 —— 告警不能走
@@ -216,12 +242,12 @@ class Settings(BaseSettings):
         """发件地址。没单独配就用登录名 —— 国内邮箱两者基本一致。"""
         return self.smtp_from or self.smtp_username or ""
 
-    @field_validator("daily_digest_at")
+    @field_validator("daily_digest_at", "schema_check_at")
     @classmethod
-    def _check_digest_at(cls, v: str) -> str:
+    def _check_time_of_day(cls, v: str, info) -> str:
         hh, _, mm = v.partition(":")
         if not (hh.isdigit() and mm.isdigit() and 0 <= int(hh) < 24 and 0 <= int(mm) < 60):
-            raise ValueError(f"DAILY_DIGEST_AT 要形如 08:00,实际 {v!r}")
+            raise ValueError(f"{info.field_name.upper()} 要形如 08:00,实际 {v!r}")
         return v
 
     @field_validator("alert_channel")
@@ -241,6 +267,11 @@ class Settings(BaseSettings):
     @property
     def digest_hour_minute(self) -> tuple[int, int]:
         hh, _, mm = self.daily_digest_at.partition(":")
+        return int(hh), int(mm)
+
+    @property
+    def schema_check_hour_minute(self) -> tuple[int, int]:
+        hh, _, mm = self.schema_check_at.partition(":")
         return int(hh), int(mm)
 
     def require(self, *names: str) -> None:

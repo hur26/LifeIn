@@ -32,6 +32,25 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # **在装配之前先比一次库版本**(ADR-030)。2026-09-10 那次事故里,库停在
+    # 0007、代码在 0014,而进程照常启动 —— 缺的列直到 job 跑起来才被读到,
+    # 于是"部署漏了一条命令"以"审批执行异常"的形状每三分钟报一次。
+    #
+    # 连不上库不在这里拦:那是另一回事,而且 run-lifein.cmd / systemd 本来
+    # 就会重试。这里只拦"连上了,但对不上"。
+    from lifein.db import get_engine
+    from lifein.schema_guard import SchemaOutOfDate, ensure_schema_current
+
+    try:
+        ensure_schema_current(
+            get_engine(settings), auto_upgrade=settings.schema_auto_upgrade
+        )
+    except SchemaOutOfDate as exc:
+        logging.getLogger("lifein").error("库版本对不上,不启动:%s", exc)
+        return 2
+    except Exception:  # noqa: BLE001 —— 连不上库只是"这次没查成",不该挡住启动
+        logging.getLogger("lifein").exception("库版本没校验成,继续启动")
+
     from lifein.bootstrap import build_services
 
     services = build_services(settings)
