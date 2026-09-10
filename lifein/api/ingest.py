@@ -1,4 +1,4 @@
-"""采集端的两个端点 —— [06 §6.4 / §6.5](../../docs/06-data-model.md#6-接口契约)。
+"""采集端的三个端点 —— [06 §6.4 / §6.5 / §6.14](../../docs/06-data-model.md#6-接口契约)。
 
 **这一组只能写。** 它拿的是 `scope=ingest` 的凭据,而那种凭据在仓储层
 取不出任何查询数据(R11 那句"最重要的一条")。手机丢了、App 被逆向,
@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from lifein.api.deps import Caller, IngestCaller, NowDep, SessionDep
 from lifein.repos import collector, raw_events
+from lifein.sources import device_calendar
 from lifein.sources.notification import DropReason, NotificationAdapter
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,33 @@ class IngestBatchIn(BaseModel):
     events: list[NotificationIn] = Field(default_factory=list, max_length=MAX_BATCH)
 
 
+class CalendarEventIn(BaseModel):
+    """一条日程。**字段宽松**,理由和 `NotificationIn` 一样:
+    形状不对的由归一化计数丢弃,不是整批 422。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    event_id: str | None = None
+    calendar: str | None = None
+    title: str | None = None
+    description: str | None = None
+    location: str | None = None
+    starts_at: str | None = None
+    ends_at: str | None = None
+    organizer: str | None = None
+    attendees: list[str] = Field(default_factory=list, max_length=50)
+    self_organized: bool = False
+    """这条是不是本人建的。**设备说了算** —— "这台手机上哪个账户是本人"
+    服务端不知道(06 §6.14)。"""
+
+    cancelled: bool = False
+
+
+class CalendarBatchIn(BaseModel):
+    device_id: str
+    events: list[CalendarEventIn] = Field(default_factory=list, max_length=MAX_BATCH)
+
+
 class HeartbeatIn(BaseModel):
     device_id: str
     app_version: str | None = None
@@ -101,6 +129,49 @@ def ingest_events(
         dropped,
     )
     return {"accepted": result.inserted, "duplicates": result.duplicates, "dropped": dropped}
+
+
+@router.post("/calendar")
+def ingest_calendar(
+    body: CalendarBatchIn,
+    caller: IngestCaller,
+    session: SessionDep,
+    now: NowDep,
+) -> dict[str, Any]:
+    """收一批日程(06 §6.14)。
+
+    **和 `/events` 分开,不是共用一个端点。** 那一条的筛选链是给通知写的:
+    白名单、验证码丢弃、交易解析 —— 日历一样都不需要,而日历需要的
+    (回环过滤、只读勾选过的那几个)全都发生在设备端。硬塞进同一个端点,
+    结果是一条布尔参数外加两条互不相干的分支。
+
+    **回环过滤不在这里。** 见 06 §6.14:App 自己写进系统日历的那些日程
+    如果被读回来,会指数级地繁殖 —— 而挡它的 `device_ref` 表就在设备手上。
+    这里只如实回报设备说它滤掉了多少(`dropped.loopback`),
+    **那个数不该长期是 0**:它是那道防线还活着的唯一证据。
+    """
+    _same_device(body.device_id, caller)
+
+    screened = [
+        device_calendar.normalize(item.model_dump(), received_at=now) for item in body.events
+    ]
+    result = raw_events.insert_events(caller.user_id, session, screened)
+    unusable = sum(1 for e in screened if e.normalized is None)
+
+    log.info(
+        "日历上报 device=%s 收下 %d 重复 %d 解不开 %d",
+        caller.device_id,
+        result.inserted,
+        result.duplicates,
+        unusable,
+    )
+    return {
+        "accepted": result.inserted,
+        "duplicates": result.duplicates,
+        # 解不开的**照样入库**(留着重跑),所以它不算 dropped —— 单独一个数。
+        # 混进 dropped 的话"丢了"和"存下来但还没解开"就分不开了
+        "unusable": unusable,
+    }
 
 
 @router.post("/heartbeat")
