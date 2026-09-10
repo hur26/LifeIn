@@ -23,7 +23,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from lifein.agents.contract import validate_all
-from lifein.alerts import Alerter, EmailAlerter, LoggingAlerter
+from lifein.alerts import Alerter, EmailAlerter, LoggingAlerter, ThrottledAlerter
 from lifein.channels.base import Channel, InboundMessage
 from lifein.channels.email import EmailChannel, SmtpConfig, SmtpTransport
 from lifein.channels.fallback import FallbackChannel
@@ -128,6 +128,9 @@ def build_services(settings: Settings | None = None) -> Services:
         if email_channel is not None
         else LoggingAlerter()
     )
+    # 同一条告警一小时内只发一封(ADR-031)。**包在最外面**,这样将来加第二条
+    # 出口时收敛仍然只有一处 —— 每条通道各收敛各的,等于没收敛
+    alerter = ThrottledAlerter(alerter, window_m=s.alert_dedup_window_m)
 
     return Services(
         settings=s,
