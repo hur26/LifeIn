@@ -576,7 +576,7 @@ async def revoke_device(
     if not _signed_in(settings, lifein_admin, now):
         return _login_page(settings, now)
 
-    device_id = str(payload.get("device_id", "")).strip()
+    device_id = _clean_device_id(payload.get("device_id"))
     user = users.get_user(user_id, session)
     if user is None or not device_id:
         return _back(f"/admin/users/{user_id}")
@@ -640,7 +640,7 @@ def ops_page(
         name = ui.esc(user.display_name)
         for run in job_runs.recent(user_id, session, limit=30):
             if run.failed:
-                failed_rows.append([name, *_run_row(run)[:-1], ui.esc(run.error or "")[:120]])
+                failed_rows.append([name, *_run_row(run)[:-1], ui.esc((run.error or "")[:120])])
         for item in approvals.list_stuck(user_id, session, cutoff=now - STUCK_AFTER):
             stuck_rows.append(
                 [name, ui.esc(item.agent), ui.mono(item.tool_name), ui.when(item.created_at)]
@@ -789,6 +789,16 @@ def _revoke_form(user, device_rows: list) -> str:
         + ui.button("吊销", tone="danger"),
         cls="inline-form",
     )
+
+
+def _clean_device_id(raw: object) -> str:
+    """表单里那个设备名。**先剪掉换行再进日志。**
+
+    它最后会进一条参数化的 SQL(注入不了),但也会进 `log.warning` ——
+    而一个带换行的值能在日志里伪造出一整行看起来像是系统写的记录。
+    审计日志是这一层唯一的痕迹(模块开头那段),**能被伪造的痕迹不如没有**。
+    """
+    return "".join(c for c in str(raw or "") if c.isprintable()).strip()[:128]
 
 
 def _beat_badge(beat, stale_after: datetime) -> str:

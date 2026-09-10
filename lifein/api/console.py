@@ -428,7 +428,7 @@ async def revoke_device(
     if user_id is None:
         return _expired()
 
-    device_id = str(payload.get("device_id", "")).strip()
+    device_id = _clean_device_id(payload.get("device_id"))
     if not device_id:
         return _back("/console/devices")
 
@@ -941,6 +941,15 @@ def _device_table(
     if with_actions:
         headers.append("")
     return ui.table(headers, rows, empty="还没有配过设备")
+
+
+def _clean_device_id(raw: object) -> str:
+    """表单里那个设备名。**先剪掉不可打印字符再进日志。**
+
+    它进的是一条参数化的 SQL(注入不了),但也进 `log.info` —— 而一个带换行的
+    值能在日志里伪造出一整行看起来像是系统写的记录。
+    """
+    return "".join(c for c in str(raw or "") if c.isprintable()).strip()[:128]
 
 
 def _kind_label(kind: str) -> str:
