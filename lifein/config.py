@@ -97,6 +97,23 @@ class Settings(BaseSettings):
     #
     # 消息面现在只有两条:微信(iLink)主推,邮件兜底。
 
+    # ---------- 控制台的运营层(P4) ----------
+    console_admin_password_hash: str | None = None
+    """运营层的口令派生值(`scrypt$…`,见 `lifein/console_auth.py`)。
+
+    **留空 = 运营层整个不存在**,用户层(App 发出的一次性链接)不受影响。
+    这是一个正经的部署选择:一个人自己用的时候运营层没有存在的必要,
+    而**不存在的认证面是攻不破的**(ADR-029)。
+
+    这里放的是派生值不是口令,而且**不校验它的格式** —— 校验要在启动期做,
+    而启动期报"哈希格式不对"等于把"这台机器上配过运营层"写进日志和终端。
+    格式不对的表现是登录一直失败,原因只进日志(`console_auth.verify_password`)。
+    """
+
+    console_admin_session_h: int = 2
+    console_admin_max_attempts: int = 5
+    console_admin_lockout_m: int = 15
+
     # ---------- 采集入口(P1) ----------
     # 采集与查询的密钥**不在环境变量里**:它们按设备签发,加密存 credentials 表
     # (06 §6.1)。一把全局密钥做不到按设备单点吊销,也做不到 P4 的用户隔离(R11)

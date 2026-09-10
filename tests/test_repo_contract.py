@@ -54,8 +54,16 @@ def data_access_functions():
 
 
 ALLOWED_EXEMPTIONS = {
-    # 身份解析那一步手上还没有 user_id —— 它正是要算出这个值
-    "users": {"find_by_wecom_userid", "create_user", "list_active_users"},
+    # 身份解析那一步手上还没有 user_id —— 它正是要算出这个值。
+    # find_admin 是同一个形状:运营台的会话只说明"你是运营者",
+    # 而这个函数把那句话换成一个 user_id(ADR-029)
+    "users": {
+        "find_by_wecom_userid",
+        "find_admin",
+        "create_user",
+        "list_active_users",
+        "list_all_users",
+    },
     # 配码(P4 第 1 片):App 扫码那一刻只有一张码,而"这张码是谁的"就存在
     # 那一行里。peek 是 claim 的只读版,purge_expired 按时间扫全表
     "enrollment": {"claim", "peek", "purge_expired"},
@@ -71,15 +79,27 @@ ALLOWED_EXEMPTIONS = {
 那是一个看得见、要在 review 里解释的动作。
 """
 
-EXEMPTION_REASONS = ("算出 user_id 的那一步", "按时间扫全表且不返回用户数据")
-"""**允许破例的只有这两种形状。**
+EXEMPTION_REASONS = (
+    "算出 user_id 的那一步",
+    "按时间扫全表且不返回用户数据",
+    "只返回 id 的用户枚举",
+)
+"""**允许破例的只有这三种形状。**
 
 第一种:调用方手上还没有 `user_id`,而这个函数正是要算出它
-(`users.find_by_wecom_userid`、`enrollment.claim`、`console_links.resolve`)。
+(`users.find_by_wecom_userid`、`users.find_admin`、`enrollment.claim`、
+`console_links.resolve`)。
 第二种:按时间清理,返回的只有"删了几行"。
+第三种:**只返回 id 的用户枚举** —— 定时任务要知道该给谁跑,
+运营台要知道有哪些人。拿到 id 之后照样得走 `get_user`,
+所以"枚举"不会顺手变成"批量读数据"。
+
+**第三种是 2026-09-10 补上的,不是新开的口子。** `list_active_users`
+一直在清单里,只是当初被塞进了"按时间清理"那一格 —— 它不是那一格的东西,
+而一个分类不准的例外清单挡不住下一次破例。
 
 三个模块看起来是三次破例,其实是**同一个形状的三次出现** ——
-而那正是它可以被接受的理由。第四个出现时先问一句:它是这两种里的哪一种?
+而那正是它可以被接受的理由。第四个出现时先问一句:它是这三种里的哪一种?
 不是的话,那是设计问题,不是例外问题。
 """
 
@@ -104,15 +124,27 @@ def test_every_exemption_is_one_of_the_two_known_shapes():
     """**这条比"只有几个模块"更有用。**
 
     数模块个数会在第四个出现时红一次,然后被人改成 4 —— 那时什么都没挡住。
-    而这条要求每个破例的函数说得清自己属于哪一种形状:算 user_id 的,
-    或者按时间清理且不返回用户数据的。
+    而这条要求每个破例的函数说得清自己属于哪一种形状:算 user_id 的、
+    按时间清理且不返回用户数据的、或者只返回 id 的用户枚举。
     """
-    computes_user_id = {"find_by_wecom_userid", "claim", "resolve", "peek", "create_user"}
-    time_based_cleanup = {"purge_expired", "list_active_users"}
+    computes_user_id = {
+        "find_by_wecom_userid",
+        "find_admin",
+        "claim",
+        "resolve",
+        "peek",
+        "create_user",
+    }
+    time_based_cleanup = {"purge_expired"}
+    id_only_enumeration = {"list_active_users", "list_all_users"}
 
     for module, names in ALLOWED_EXEMPTIONS.items():
         for name in names:
-            assert name in computes_user_id or name in time_based_cleanup, (
+            assert (
+                name in computes_user_id
+                or name in time_based_cleanup
+                or name in id_only_enumeration
+            ), (
                 f"{module}.{name} 不属于已知的两种破例形状"
                 f"({'、'.join(EXEMPTION_REASONS)})—— 那是设计问题,不是例外问题"
             )

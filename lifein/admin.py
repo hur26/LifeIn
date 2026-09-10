@@ -33,6 +33,8 @@
     python -m lifein.admin export --user <uuid> --out my-data.json   # 导出全部数据
     python -m lifein.admin purge-user --user <uuid>      # 彻底注销(要二次确认)
     python -m lifein.admin check-user --user <uuid>      # 接一个朋友之前逐条对
+    python -m lifein.admin console-password              # 生成运营台口令的哈希
+    python -m lifein.admin set-admin --user <uuid>       # 标记运营者本人那一行
 """
 
 from __future__ import annotations
@@ -65,18 +67,80 @@ log = logging.getLogger("lifein.admin")
 def cmd_create_user(args: argparse.Namespace) -> int:
     with session_scope() as session:
         user_id = users.create_user(
-            session, display_name=args.name, wecom_userid=args.wecom_userid, tz=args.tz
+            session,
+            display_name=args.name,
+            wecom_userid=args.wecom_userid,
+            tz=args.tz,
+            is_admin=args.admin,
         )
     print(f"已创建用户 {user_id}")
+    if args.admin:
+        print("已标成运营者本人 —— 运营台上那个「切回我自己的账号」会指到这里")
     print("下一步:set-imap 配邮箱凭据,然后 test-imap 实测")
     return 0
 
 
-def cmd_list_users(_args: argparse.Namespace) -> int:
+def cmd_list_users(args: argparse.Namespace) -> int:
+    """**默认连停用的一起列。**
+
+    停用的那些正是最需要在这份清单上看见的:看不见就恢复不了,
+    而"这个人是不是已经停了"是接朋友进来之后最常问的一句。
+    """
     with session_scope() as session:
-        for user_id in users.list_active_users(session):
+        user_ids = (
+            users.list_active_users(session) if args.active_only else users.list_all_users(session)
+        )
+        for user_id in user_ids:
             user = users.get_user(user_id, session)
-            print(f"{user.id}  {user.display_name}  wecom={user.wecom_userid}  tz={user.tz}")
+            marks = "".join(
+                [
+                    "  [运营者]" if user.is_admin else "",
+                    "  [已停用]" if not user.active else "",
+                ]
+            )
+            print(
+                f"{user.id}  {user.display_name}  wecom={user.wecom_userid}  tz={user.tz}{marks}"
+            )
+    return 0
+
+
+def cmd_set_admin(args: argparse.Namespace) -> int:
+    """标记运营者本人那一行(06 §2.10)。
+
+    **这一列不是权限位。** 运营台的口令在环境变量里,和它没关系 ——
+    改这一行不会让谁登得进运营台,它只回答"那个切回普通用户版的按钮
+    该切到哪个账号"。
+    """
+    with session_scope() as session:
+        if not users.get_user(args.user, session):
+            print("没有这个用户", file=sys.stderr)
+            return 1
+        users.set_admin(args.user, session, is_admin=not args.unset)
+    print("已取消标记" if args.unset else "已标成运营者本人")
+    return 0
+
+
+def cmd_console_password(_args: argparse.Namespace) -> int:
+    """生成运营台口令的哈希。**当场读一次口令,打出一行,不写任何文件。**
+
+    口令从交互读,和这个 CLI 里所有凭据一样:命令行参数会进 shell history、
+    会出现在 `ps` 的输出里、会被跳板机的会话录制录下来(模块开头那段)。
+    """
+    from lifein.console_auth import hash_password
+
+    password = getpass.getpass("运营台口令:")
+    if len(password) < 12:
+        # 12 位不是安全阈值,是"别用一个单词"。真正的强度来自 scrypt 那几十毫秒,
+        # 而那几十毫秒挡不住一个在字典里的口令
+        print("太短了 —— 至少 12 位,而且别用一个能查到的词", file=sys.stderr)
+        return 1
+    if password != getpass.getpass("再输一遍:"):
+        print("两次不一样", file=sys.stderr)
+        return 1
+
+    print("\n把下面这一行放进 .env(07 §2.8):\n")
+    print(f"CONSOLE_ADMIN_PASSWORD_HASH={hash_password(password)}\n")
+    print("口令本身没有被存在任何地方 —— 忘了就再跑一次这条命令换一个")
     return 0
 
 
@@ -1304,10 +1368,24 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--name", required=True)
     create.add_argument("--wecom-userid", required=True, help="企微成员 UserID,推送目标")
     create.add_argument("--tz", default="Asia/Shanghai")
+    create.add_argument(
+        "--admin",
+        action="store_true",
+        help="标成运营者本人(不是权限位,见 06 §2.10)",
+    )
     create.set_defaults(func=cmd_create_user)
 
-    listing = sub.add_parser("list-users", help="列出未停用的用户")
+    listing = sub.add_parser("list-users", help="列出用户(默认连停用的一起)")
+    listing.add_argument("--active-only", action="store_true", help="只列未停用的")
     listing.set_defaults(func=cmd_list_users)
+
+    set_admin = sub.add_parser("set-admin", help="标记运营者本人那一行(不是权限位)")
+    set_admin.add_argument("--user", required=True)
+    set_admin.add_argument("--unset", action="store_true", help="取消标记")
+    set_admin.set_defaults(func=cmd_set_admin)
+
+    console_pw = sub.add_parser("console-password", help="生成运营台口令的哈希(口令交互输入)")
+    console_pw.set_defaults(func=cmd_console_password)
 
     imap = sub.add_parser("set-imap", help="配邮箱凭据(授权码交互输入)")
     imap.add_argument("--user", required=True)
