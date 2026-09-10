@@ -291,20 +291,29 @@ class TestEveryModelSpenderIsCapped:
                 f"{job} 现在会调模型了,但它还在豁免清单里 —— 那等于它不受成本上限管"
             )
 
-    def test_the_question_answering_path_is_capped(self):
+    def test_every_place_that_builds_qadeps_caps_it(self):
         """**问答不是定时任务,但它一样花钱,而且花得最快。**
 
-        两个入站入口(企微回调、微信长轮询)各自装配一次 `QaDeps`,
-        所以两处都要挂 —— 漏一处的表现是"从那个通道问就不花钱",
-        而那种漏法在账单上看得见、在代码里看不见。
+        **不点名具体哪个模块,而是去找"谁装配了 QaDeps"** —— 入站通道会变
+        (企微那一路 2026-09-10 整个退出了,ADR-026),而"装配 QaDeps 的地方
+        都要挂额度"这条规则不会变。点名模块的话,那个模块消失时这一条会
+        以一种指错方向的方式红:它会说"api.app 没挂额度",而真相是
+        api.app 根本不再收消息了。
+
+        漏一处的表现是"从那个通道问就不花钱" ——
+        那种漏法在账单上看得见、在代码里看不见。
         """
-        import inspect
+        import pathlib
 
-        from lifein.api import app as api_app
-        from lifein.jobs import weixin_inbox
+        root = pathlib.Path(__file__).resolve().parents[1] / "lifein"
+        builders = []
+        for path in root.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8")
+            if "QaDeps(" in source and "def " in source:
+                builders.append((path.relative_to(root).as_posix(), source))
 
-        for module in (api_app, weixin_inbox):
-            source = inspect.getsource(module)
-            assert "within_quota=" in source, (
-                f"{module.__name__} 装配 QaDeps 时没挂额度检查"
-            )
+        assert builders, "一个装配 QaDeps 的地方都没有?那问答根本跑不起来"
+        for name, source in builders:
+            assert "within_quota=" in source, f"{name} 装配 QaDeps 时没挂额度检查"

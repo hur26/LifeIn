@@ -4,7 +4,6 @@
 
 | 组 | 谁在调 | 认证 |
 | --- | --- | --- |
-| `/wecom/*` | 企微平台 | 平台签名 |
 | `/ingest/*` | 手机上的采集器 | 设备密钥签名,**只能写** |
 | `/app/*` | 手机上的界面 | 长期设备凭据换来的短期 token |
 
@@ -21,19 +20,16 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, status
 
 from lifein.api import console, enroll, ingest, query
 from lifein.api.deps import AuthRejected
 from lifein.bootstrap import Services, build_services
-from lifein.channels.wecom_callback import CallbackRejected
 from lifein.db import session_scope
-from lifein.jobs.qa_reply import QaDeps, default_gateway, handle_message
 from lifein.jobs.weixin_inbox import start_inbox_thread
 from lifein.repos import users
-from lifein.scheduler import build_scheduler, quota_checker, run_digest_for_all_users
+from lifein.scheduler import build_scheduler, run_digest_for_all_users
 
 log = logging.getLogger(__name__)
 
@@ -93,63 +89,6 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
-
-    @app.get("/wecom/callback")
-    def verify(msg_signature: str, timestamp: str, nonce: str, echostr: str) -> Response:
-        """企微后台配置回调地址时的一次性握手。"""
-        svc: Services = app.state.services
-        if svc.callback is None:
-            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-        try:
-            plain = svc.callback.verify_url(
-                msg_signature=msg_signature, timestamp=timestamp, nonce=nonce, echostr=echostr
-            )
-        except CallbackRejected as exc:
-            log.warning("回调 URL 验证失败:%s", exc)
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-        return Response(content=plain, media_type="text/plain")
-
-    @app.post("/wecom/callback")
-    async def receive(request: Request, msg_signature: str, timestamp: str, nonce: str) -> Response:
-        svc: Services = app.state.services
-        if svc.callback is None:
-            # 没配企微就没有这个入口。回 503 而不是 404 —— 它是"暂时没开",
-            # 不是"不存在",配上就有了
-            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-        body = await request.body()
-
-        try:
-            message = svc.callback.parse_message(
-                body=body, msg_signature=msg_signature, timestamp=timestamp, nonce=nonce
-            )
-        except CallbackRejected as exc:
-            # 只记不回:告诉对方错在哪一步等于帮他调试
-            log.warning("回调被拒:%s", exc)
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            with session_scope() as session:
-                handle_message(
-                    session,
-                    message=message,
-                    deps=QaDeps(
-                        llm=svc.llm,
-                        channel=svc.channel,
-                        resolve_user=svc.resolve_user,
-                        gateway_factory=default_gateway,
-                        # 问答是花钱最快的那条路,而它原来完全不受上限管
-                        within_quota=quota_checker(svc, job="qa_reply"),
-                    ),
-                    now=datetime.now(UTC),
-                )
-        except Exception:  # noqa: BLE001
-            # 企微会对非 200 重投。问答失败重投也不会好,而重投意味着再花一次
-            # 模型钱、再回一次消息 —— 所以处理失败照样回 200,失败记在日志里
-            log.exception("处理回调消息失败,msg_id=%s", message.msg_id)
-
-        # 企微要求 5 秒内响应。空响应表示"收到了,不用回消息" ——
-        # 真正的回复是我们主动 send 出去的,不走这个响应体
-        return Response(content="", media_type="text/plain")
 
     return app
 

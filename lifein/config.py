@@ -90,19 +90,12 @@ class Settings(BaseSettings):
     llm_price_prompt_per_1k: float = 0.0
     llm_price_completion_per_1k: float = 0.0
 
-    # ---------- 企业微信(全部可选)----------
-    # 配了才启用。企微要配"企业可信 IP"必须先有可信域名或接收消息服务器 URL,
-    # 而那两个都要公网 —— 对一台家里的机器是过不去的坎。
-    # iLink 开放之后推送和问答都能走微信(ADR-018),所以这一整组降为可选。
-    # 代价:没有企微就没有兜底通道,也没有日历数据源(企微日程)。
-    wecom_corp_id: str | None = None
-    wecom_agent_id: str | None = None
-    wecom_secret: SecretStr | None = None
-    wecom_callback_token: SecretStr | None = None
-    wecom_callback_aes_key: SecretStr | None = None
-    wecom_calendar_id: str | None = None
-    """要读取的日历 cal_id。企微的日程接口按日历取,而自建应用没有
-    "列出我的全部日历"这个能力(07 §2.4)。没配就不采日历。"""
+    # ---------- 企业微信 ----------
+    # **整组没了**(ADR-026,2026-09-10)。它此前的位置是"兜底与审批入口",
+    # 而两件事都不成立:兜底一直是邮件(企微要配"企业可信 IP",那要公网域名,
+    # 它一天都没被真正配起来过),审批按钮从来没实现过。
+    #
+    # 消息面现在只有两条:微信(iLink)主推,邮件兜底。
 
     # ---------- 采集入口(P1) ----------
     # 采集与查询的密钥**不在环境变量里**:它们按设备签发,加密存 credentials 表
@@ -232,20 +225,6 @@ class Settings(BaseSettings):
     def digest_hour_minute(self) -> tuple[int, int]:
         hh, _, mm = self.daily_digest_at.partition(":")
         return int(hh), int(mm)
-
-    @property
-    def wecom_enabled(self) -> bool:
-        """企微是否配全了。**部分配置视同没配** —— 半套配置只会在运行时炸得
-        莫名其妙,不如当它不存在,让降级路径接手。"""
-        return all(
-            [
-                self.wecom_corp_id,
-                self.wecom_agent_id,
-                self.wecom_secret,
-                self.wecom_callback_token,
-                self.wecom_callback_aes_key,
-            ]
-        )
 
     def require(self, *names: str) -> None:
         """要求这些配置项已填,否则抛 ConfigError。

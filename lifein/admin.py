@@ -1216,13 +1216,22 @@ def cmd_check_user(args: argparse.Namespace) -> int:
         rules = collector.list_whitelist(args.user, session)
         beats = collector.list_heartbeats(args.user, session)
         state = data_control.state(args.user, session)
+        # 有没有微信会话。**只看在不在,不解密** —— 这一条要回答的是
+        # "他收不收得到主动消息",而那只取决于有没有配过
+        has_weixin = (
+            credentials.get_credential(
+                args.user, session, kind="weixin", settings=get_settings()
+            )
+            is not None
+        )
 
     kinds = {d.kind for d in devices}
     checks = [
         (
-            bool(user.wecom_userid),
+            has_weixin,
             "推送地址",
-            "没有 wecom_userid —— 他收不到任何主动消息(摘要、提醒、审批卡片)",
+            "没配微信会话 —— 他收不到任何主动消息(摘要、提醒、审批)。"
+            "跑 admin login-weixin 扫一次码",
         ),
         (
             "app_device" in kinds,

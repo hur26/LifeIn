@@ -30,7 +30,7 @@ from lifein.alerts import Alerter
 from lifein.governance.audit import ToolCallRecord
 from lifein.governance.registry import ToolLevel
 from lifein.llm.client import LLMClient, LLMError
-from lifein.repos import embeddings, entities, facts, job_runs, raw_events, users
+from lifein.repos import embeddings, entities, facts, job_runs, raw_events
 from lifein.repos.tool_calls import record_tool_call
 
 log = logging.getLogger(__name__)
@@ -171,13 +171,13 @@ def _extract_window(
         result.no_events = True
         return
 
-    user = users.get_user(user_id, session)
-    own = [*deps.own_identifiers]
-    if user:
-        # 企微 userid 也是"自己":日程的组织者就是你本人
-        own.append(user.wecom_userid)
-
-    memory = extract(MemoryInput(events=stored, own_identifiers=own), llm=deps.llm)
+    # "自己是谁"现在只有邮箱地址一项。企微 userid 那一条跟着企微一起走了
+    # (ADR-026)—— 它此前的用途是"日程的组织者就是你本人",
+    # 而日程数据源本身已经不在了
+    memory = extract(
+        MemoryInput(events=stored, own_identifiers=list(deps.own_identifiers)),
+        llm=deps.llm,
+    )
     output = memory.output
     result.events_considered = output.considered_events
     result.dropped_ungrounded = output.dropped_ungrounded

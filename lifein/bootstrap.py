@@ -27,9 +27,6 @@ from lifein.alerts import Alerter, EmailAlerter, LoggingAlerter
 from lifein.channels.base import Channel, InboundMessage
 from lifein.channels.email import EmailChannel, SmtpConfig, SmtpTransport
 from lifein.channels.fallback import FallbackChannel
-from lifein.channels.wecom import WecomChannel
-from lifein.channels.wecom_callback import WecomCallback
-from lifein.channels.wecom_client import WecomClient
 from lifein.channels.weixin import BASE_URL as WEIXIN_BASE_URL
 from lifein.channels.weixin import WeixinChannel, WeixinSession
 from lifein.config import Settings, get_settings
@@ -37,7 +34,6 @@ from lifein.db import session_scope
 from lifein.llm.client import LLMClient
 from lifein.repos import credentials, users
 from lifein.sources.base import PullAdapter
-from lifein.sources.calendar_source import CalendarConfig, WecomCalendarAdapter
 from lifein.sources.email_adapter import EmailAdapter
 from lifein.sources.imap_client import ImapConfig, ImapMailbox
 
@@ -91,10 +87,6 @@ class Services:
     卡片走推送(有长度上限,会被截断),完整版走邮件。降级链只会挑一条发,
     所以那件事拿不到这个引用就做不成(03 那句"企微卡片 + 邮件长版")。"""
 
-    wecom: WecomClient | None = None
-    callback: WecomCallback | None = None
-    """没配企微时是 None。企微要配可信 IP 得先有公网域名,而 iLink 让这件事
-    在 P0 变成可选的 —— 但代价要说清:没有兜底通道,也没有日历数据源。"""
 
 
 def build_services(settings: Settings | None = None) -> Services:
@@ -115,34 +107,15 @@ def build_services(settings: Settings | None = None) -> Services:
         embedding_dim=s.embedding_dim,
     )
 
-    # ADR-018:微信优先,企微兜底。微信没配过会话时 WeixinChannel 会抛错,
-    # 于是自动落到企微 —— 所以"还没配微信"和"微信坏了"走的是同一条路径,
-    # 不需要在这里判断配没配
+    # ADR-026:降级链只剩两条 —— 微信(iLink)主推,邮件兜底。
+    # 微信没配过会话时 WeixinChannel 会抛错,于是自动落到邮件 ——
+    # 所以"还没配微信"和"微信坏了"走的是同一条路径,不需要在这里判断配没配
     channels: list[Channel] = [WeixinChannel(load_session=_load_weixin_session)]
-
-    wecom: WecomClient | None = None
-    callback: WecomCallback | None = None
-    if s.wecom_enabled:
-        wecom = WecomClient(
-            corp_id=s.wecom_corp_id,
-            secret=s.wecom_secret.get_secret_value(),
-            agent_id=s.wecom_agent_id,
-        )
-        channels.append(WecomChannel(wecom, resolve_userid=_resolve_wecom_userid))
-        callback = WecomCallback(
-            token=s.wecom_callback_token.get_secret_value(),
-            aes_key=s.wecom_callback_aes_key.get_secret_value(),
-            corp_id=s.wecom_corp_id,
-        )
-    else:
-        # 只剩一条通道的时候必须说出来。"没有兜底"和"兜底没生效"表现一样,
-        # 而前者是你自己选的、后者是故障 —— 启动时说一次,免得以后分不清
-        log.warning("未配置企业微信:没有兜底推送通道,也没有日历数据源")
 
     email_channel = _build_email_channel(s)
     if email_channel is not None:
-        # 排在最后:前面两条的共同失效方式是平台(会话过期、接口改版、
-        # 账号受限),而邮件不依赖任何平台政策(R6)
+        # 排在最后:微信的失效方式是平台(会话过期、接口改版、账号受限),
+        # 而邮件不依赖任何平台政策(R6)。**企微退出之后它是唯一的兜底**
         channels.append(email_channel)
     else:
         log.warning("未配置 SMTP:降级链最后没有邮件兜底,告警也只写日志")
@@ -159,9 +132,7 @@ def build_services(settings: Settings | None = None) -> Services:
     return Services(
         settings=s,
         llm=llm,
-        wecom=wecom,
         channel=channel,
-        callback=callback,
         alerter=alerter,
         email_channel=email_channel,
     )
@@ -284,14 +255,13 @@ def _load_weixin_session(user_id: str) -> WeixinSession | None:
 def resolve_user_for_message(session: Session, message: InboundMessage) -> users.User | None:
     """按通道把发送者换成本系统用户。
 
-    企微给的是成员 UserID,直接查 `users.wecom_userid`。
     iLink 给的是对方在 bot 会话里的 user id —— 那个值存在微信凭据里,
     所以反过来遍历用户去比对。**P0 只有一个用户**,这个"遍历"就是一次比较;
     P4 要换成一张索引表,到时候只改这个函数。
-    """
-    if message.channel == "wecom":
-        return users.find_by_wecom_userid(session, wecom_userid=message.sender)
 
+    **只剩微信一条**(ADR-026)。企微那一路连同它的 `users.wecom_userid`
+    查询一起走了。
+    """
     if message.channel == "weixin":
         settings = get_settings()
         for user_id in users.list_active_users(session):
@@ -304,24 +274,10 @@ def resolve_user_for_message(session: Session, message: InboundMessage) -> users
     return None
 
 
-def _resolve_wecom_userid(user_id: str) -> str:
-    """user_id → 企微 userid。
-
-    自己开事务:推送可能发生在任何上下文里(定时任务、回调、手动触发),
-    让调用方传 session 会把这个映射的存在扩散到每一处调用点。
-    """
-    with session_scope() as session:
-        user = users.get_user(user_id, session)
-        if user is None:
-            raise LookupError(f"用户不存在:{user_id}")
-        return user.wecom_userid
-
-
 def build_own_identifiers(user_id: str, session: Session, services: Services) -> list[str]:
     """这个用户"自己"是谁。记忆抽取拿它把用户本人排除在实体之外。
 
-    目前只有邮箱地址一项 —— 企微 userid 由记忆 job 自己从 `users` 里取,
-    那张表它本来就要读。凭据只在这个模块里被读,别处拿不到明文。
+    目前只有邮箱地址一项。凭据只在这个模块里被读,别处拿不到明文。
     """
     imap = credentials.get_credential(user_id, session, kind="imap", settings=services.settings)
     username = (imap or {}).get("username", "")
@@ -355,15 +311,8 @@ def build_adapters(user_id: str, session: Session, services: Services) -> list[P
     else:
         log.warning("用户 %s 没有配 IMAP 凭据,跳过邮箱采集", user_id)
 
-    user = users.get_user(user_id, session)
-    if user and s.wecom_calendar_id and services.wecom is not None:
-        adapters.append(
-            WecomCalendarAdapter(
-                services.wecom,
-                CalendarConfig(cal_id=s.wecom_calendar_id, owner_wecom_userid=user.wecom_userid),
-            )
-        )
-    else:
-        log.warning("未配置企微日历(需要 WECOM_* 与 WECOM_CALENDAR_ID),跳过日历采集")
-
+    # **日历数据源现在是空的**(ADR-026)。企微日程是此前唯一的一条,
+    # 而它跟着企微一起退出了 —— 补它的路径是从手机系统日历读
+    # (App 本来就有 READ_CALENDAR,而且那样连别的日历一起覆盖了),
+    # 但那是一片新工作,不在这次改动里
     return adapters

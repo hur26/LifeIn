@@ -22,16 +22,6 @@ BASE = {
     "llm_model": "m",
 }
 
-WITH_WECOM = {
-    **BASE,
-    "wecom_corp_id": "c",
-    "wecom_agent_id": "1",
-    "wecom_secret": "s",
-    "wecom_callback_token": "t",
-    "wecom_callback_aes_key": "a",
-}
-
-
 def build(**overrides) -> Settings:
     return Settings(_env_file=None, **{**BASE, **overrides})
 
@@ -46,8 +36,8 @@ def test_minimal_config_is_enough_for_p0():
     # 采集与查询的密钥不在配置里 —— 按设备签发,进 credentials 表(06 §6.1)
     assert not hasattr(s, "ingest_secret")
     assert s.ingest_max_skew_s == 300
-    # 企微整组可选:配可信 IP 要先有公网域名,而 iLink 让它不再是必需
-    assert s.wecom_enabled is False
+    # 配码要写进二维码的那个地址不填也能起 —— 它只挡住"添加设备"那一个动作
+    assert s.public_base_url is None
 
 
 @pytest.mark.parametrize(
@@ -68,10 +58,15 @@ def test_bad_digest_time_is_rejected():
         build(daily_digest_at="8点")
 
 
-def test_alert_channel_cannot_be_wecom():
-    # 告警走企微,企微挂掉时告警会跟着一起丢
-    with pytest.raises(ValidationError):
-        build(alert_channel="wecom")
+def test_alert_channel_can_only_be_email():
+    """**告警不许走主通道。**
+
+    告警最需要发出去的时刻,正是主通道挂了的时刻 —— 走微信的话,
+    "微信会话过期了"这条告警会试着用那个过期的会话发出去(07 §2.6)。
+    """
+    for bad in ("weixin", "wecom", "ilink"):
+        with pytest.raises(ValidationError):
+            build(alert_channel=bad)
 
 
 def test_require_reports_missing_p1_config():
@@ -87,21 +82,10 @@ def test_require_reports_missing_p1_config():
 def test_secrets_do_not_leak_in_repr():
     # 配置对象会被打日志、被 dump 进错误上报,凭据不能跟着一起出去
     marker = "SUPER-SECRET-VALUE-9f3a"
-    s = build(llm_api_key=marker, wecom_secret=marker)
+    s = build(llm_api_key=marker, smtp_password=marker)
     assert marker not in repr(s)
     assert marker not in str(s.model_dump())
     assert s.llm_api_key.get_secret_value() == marker
-
-
-class TestWecomOptional:
-    def test_fully_configured_wecom_is_enabled(self):
-        assert Settings(_env_file=None, **WITH_WECOM).wecom_enabled is True
-
-    def test_partial_wecom_config_counts_as_absent(self):
-        """半套配置只会在运行时炸得莫名其妙,不如当它不存在,让降级接手。"""
-        half = {**WITH_WECOM}
-        del half["wecom_callback_aes_key"]
-        assert Settings(_env_file=None, **half).wecom_enabled is False
 
 
 class TestBlankValuesAreNotConfigured:
