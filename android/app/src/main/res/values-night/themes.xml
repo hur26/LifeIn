@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 深色下的底座。见 values/themes.xml 里那段"白闪一下"。 -->
+<resources>
+    <style name="Theme.LifeIn" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101413</item>
+    </style>
+</resources>

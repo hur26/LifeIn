@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小组件那几个颜色。**和 App 里那份色板是同一个绿**(ui/theme/Theme.kt)——
+  桌面上那一小块和点进去之后的第一屏要看起来是同一个东西。
+
+  Compose 那边读不到这里,反过来也一样:RemoteViews 里没有 Compose,
+  所以这三个值是**有意重复的一份**。改主色时两处一起改。
+-->
+<resources>
+    <color name="widget_bg">#FFFFFFFF</color>
+    <color name="widget_title">#2C6B5C</color>
+    <color name="widget_text">#191D1B</color>
+    <color name="widget_dim">#59616E</color>
+</resources>

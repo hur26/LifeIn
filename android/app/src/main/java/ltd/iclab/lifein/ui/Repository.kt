@@ -40,6 +40,18 @@ import ltd.iclab.lifein.work.WidgetRefresh
  */
 class Repository(private val context: Context) {
 
+    /**
+     * 换一条控制台链接,**返回可以直接丢给浏览器的绝对地址**。
+     *
+     * 拼 `base_url` 这一步在这里做,不在服务端:那个值是"手机连的是哪台机器",
+     * 而**服务端从请求头里推出来的地址是发请求的人说了算的**
+     * (`Settings.public_base_url` 那段说的是同一件事)。
+     */
+    suspend fun consoleLink(): String = withContext(Dispatchers.IO) {
+        val enrollment = LifeInApp.instance.secrets.load() ?: error("还没配码")
+        enrollment.baseUrl.trimEnd('/') + LifeInApi(enrollment).consoleLink().url
+    }
+
     private fun api(): LifeInApi {
         val enrollment = LifeInApp.instance.secrets.load()
             ?: error("还没配码。先在配置页粘贴 issue-device 打出来的那一串")

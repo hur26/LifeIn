@@ -453,3 +453,15 @@ data class DeletedDto(
     val facts: Int = 0,
     val total: Int = 0,
 )
+
+/**
+ * 一条能在浏览器里打开的控制台链接(P4 第 9 片,ADR-029)。
+ *
+ * **`url` 是相对路径**(`/console?t=…`),要拼上 `base_url` 才能打开 ——
+ * 服务端不猜自己的公网地址,而手机这边本来就知道自己在连哪台机器。
+ */
+@Serializable
+data class ConsoleLinkDto(
+    val url: String,
+    @SerialName("expires_at") val expiresAt: String,
+)

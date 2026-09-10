@@ -3,27 +3,36 @@
   桌面小组件的样子。四行封顶 —— RemoteViews 里做列表要挂一个
   RemoteViewsService,而小组件本来就只该"看一眼"(ADR-020),
   多出来的那些打开 App 看。
+
+  **每一个 TextView 都显式写了 textColor。** 不写的话它跟着各家启动器
+  给的默认样式走,而那个值在深色壁纸的桌面上可能是白的 —— 表现是
+  "小组件是空的",而它其实有内容,只是白字白底。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="12dp"
-    android:background="#F2FFFFFF">
+    android:padding="14dp"
+    android:background="@drawable/widget_bg">
 
     <TextView
         android:id="@+id/widget_title"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="6dp"
         android:text="@string/widget_label"
         android:textStyle="bold"
-        android:textSize="14sp" />
+        android:textSize="13sp"
+        android:letterSpacing="0.02"
+        android:textColor="@color/widget_title" />
 
     <TextView
         android:id="@+id/widget_row_0"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="3dp"
         android:textSize="13sp"
+        android:textColor="@color/widget_text"
         android:maxLines="1"
         android:ellipsize="end" />
 
@@ -31,7 +40,9 @@
         android:id="@+id/widget_row_1"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="3dp"
         android:textSize="13sp"
+        android:textColor="@color/widget_text"
         android:maxLines="1"
         android:ellipsize="end" />
 
@@ -39,7 +50,9 @@
         android:id="@+id/widget_row_2"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginBottom="3dp"
         android:textSize="13sp"
+        android:textColor="@color/widget_text"
         android:maxLines="1"
         android:ellipsize="end" />
 
@@ -48,17 +61,27 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="13sp"
+        android:textColor="@color/widget_text"
         android:maxLines="1"
         android:ellipsize="end" />
 
     <!--
       最后刷新时间要显示出来:小组件的刷新受各家省电策略限制,
       而"上面这些是什么时候的"是用户唯一能自己判断的依据(ADR-020)。
+
+      它被推到底部(layout_weight 顶开上面的空白),而不是紧跟在最后一条
+      待办后面 —— 待办有一条还是四条,这一行的位置都不该跟着跳。
     -->
+    <Space
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
     <TextView
         android:id="@+id/widget_updated"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
         android:textSize="10sp"
-        android:alpha="0.6" />
+        android:textColor="@color/widget_dim" />
 </LinearLayout>

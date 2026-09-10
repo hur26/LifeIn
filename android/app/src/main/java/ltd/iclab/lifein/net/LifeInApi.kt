@@ -222,6 +222,17 @@ class LifeInApi(
     fun collectorStatus(): CollectorStatus =
         authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
 
+    /**
+     * 换一条能在浏览器里打开的控制台链接。**十五分钟,短命的多次可用。**
+     *
+     * 这是那个控制台唯一的入口 —— 它没有登录页,因为**浏览器打开一个链接时
+     * 带不了 `Authorization` 头**,而给它加一个用户名口令等于多一个会被
+     * 攻破的认证面(ADR-029)。
+     */
+    fun consoleLink(): ConsoleLinkDto = authed {
+        json.decodeFromString(ConsoleLinkDto.serializer(), bearerPost(PATH_CONSOLE_LINK, it, "{}"))
+    }
+
     // ---------- 内部 ----------
 
     /**
@@ -379,6 +390,7 @@ class LifeInApi(
         const val PATH_COLLECTION = "/app/collector/collection"
         const val PATH_STOP_COLLECT = "/app/collector/stop"
         const val PATH_COLLECTED = "/app/data/collected"
+        const val PATH_CONSOLE_LINK = "/app/console/link"
 
         private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 

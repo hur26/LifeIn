@@ -6,24 +6,42 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Card
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -33,28 +51,84 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import ltd.iclab.lifein.LifeInApp
+import ltd.iclab.lifein.collect.CollectorState
 import ltd.iclab.lifein.calendar.CalendarChoice
 import ltd.iclab.lifein.calendar.CalendarInfo
 import ltd.iclab.lifein.calendar.CalendarReader
+import ltd.iclab.lifein.net.CollectionStateDto
 import ltd.iclab.lifein.net.CollectorStatus
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.ui.theme.EmptyState
+import ltd.iclab.lifein.ui.theme.LoadingState
+import ltd.iclab.lifein.ui.theme.NoticeBanner
+import ltd.iclab.lifein.ui.theme.SectionCard
+import ltd.iclab.lifein.ui.theme.Space
+import ltd.iclab.lifein.ui.theme.StatTile
+import ltd.iclab.lifein.ui.theme.StatusChip
+import ltd.iclab.lifein.ui.theme.Tone
 import ltd.iclab.lifein.work.Schedules
-import androidx.compose.material3.AlertDialog
-import ltd.iclab.lifein.net.CollectionStateDto
 
 /**
- * 三个页面:今天、待确认、状态。
+ * 三个页面:今天、待确认、我的。
  *
- * 刻意都很朴素 —— 这个 App 的价值在采集和同步,不在界面。
- * 界面只要回答三个问题:**今天要干什么、有什么等我点头、采集器还活着吗**。
+ * 界面要回答三个问题:**今天要干什么、有什么等我点头、这套东西还活着吗**。
+ * 每一页的顶栏上都有一个刷新键 —— 这个 App 不接收推送(ADR-014),
+ * 数据是打开时拉的,**所以"我刚在电脑上改了,这儿怎么没变"必须有一个答案**。
  */
+
+/** 每一页共用的顶栏。标题左对齐、动作在右,五页一个样子。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ScreenBar(
+    title: String,
+    subtitle: String? = null,
+    onRefresh: (() -> Unit)? = null,
+    actions: @Composable () -> Unit = {},
+) {
+    TopAppBar(
+        title = {
+            Column {
+                Text(title, style = MaterialTheme.typography.titleLarge)
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        actions = {
+            actions()
+            if (onRefresh != null) {
+                IconButton(onClick = onRefresh) { Icon(Icons.Default.Refresh, "刷新") }
+            }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = MaterialTheme.colorScheme.background,
+        ),
+    )
+}
+
+/** 连不上服务端那一条。**措辞统一在这里** —— 五个页面各写一句会有五种说法。 */
+@Composable
+private fun OfflineNotice(message: String, onRetry: () -> Unit) {
+    NoticeBanner(
+        "连不上服务端:$message",
+        tone = Tone.Problem,
+        icon = Icons.Default.Warning,
+        action = "重试" to onRetry,
+    )
+}
+
+// ---------------------------------------------------------------- 今天
 
 @Composable
 fun TodosScreen(repo: Repository) {
     var todos by remember { mutableStateOf<List<TodoDto>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
-    var draft by remember { mutableStateOf("") }
+    var adding by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     suspend fun refresh() {
@@ -82,104 +156,195 @@ fun TodosScreen(repo: Repository) {
 
     LaunchedEffect(Unit) { refresh() }
 
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = draft,
-                onValueChange = { draft = it },
-                label = { Text("加一条待办") },
-                modifier = Modifier.weight(1f),
+    Scaffold(
+        topBar = {
+            ScreenBar(
+                title = "今天",
+                subtitle = todos?.let { "${it.size} 件事等着" },
+                onRefresh = { scope.launch { refresh() } },
             )
-            TextButton(
-                enabled = draft.isNotBlank(),
-                onClick = {
-                    scope.launch {
-                        runCatching { repo.addTodo(draft) }
-                            .onSuccess {
-                                draft = ""
-                                refresh()
-                            }
-                            .onFailure { error = it.message }
-                    }
-                },
-            ) { Text("加") }
-        }
+        },
+        floatingActionButton = {
+            FloatingActionButton(onClick = { adding = true }) {
+                Icon(Icons.Default.Add, "加一条待办")
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { insets ->
+        Column(Modifier.fillMaxSize().padding(insets)) {
+            error?.let {
+                Row(Modifier.padding(horizontal = Space.lg, vertical = Space.sm)) {
+                    OfflineNotice(it) { scope.launch { refresh() } }
+                }
+            }
 
-        error?.let {
-            Text("连不上服务端:$it", color = MaterialTheme.colorScheme.error)
-        }
-
-        when (val list = todos) {
-            null -> Loading()
-            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(list, key = { it.id }) { todo ->
-                    TodoRow(
-                        todo = todo,
-                        onDone = { scope.launch { repo.complete(todo.id); refresh() } },
-                        onCancel = { scope.launch { repo.cancel(todo.id); refresh() } },
+            when (val list = todos) {
+                null -> LoadingState()
+                else -> if (list.isEmpty()) {
+                    EmptyState(
+                        Icons.Default.DateRange,
+                        "今天没有安排",
+                        "邮件和日历里的日程会自己进来。想手动加一条,点右下角那个加号。",
                     )
+                } else {
+                    LazyColumn(
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            start = Space.lg, end = Space.lg, top = Space.sm, bottom = 88.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        items(list, key = { it.id }) { todo ->
+                            TodoRow(
+                                todo = todo,
+                                onDone = { scope.launch { repo.complete(todo.id); refresh() } },
+                                onCancel = { scope.launch { repo.cancel(todo.id); refresh() } },
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+
+    if (adding) {
+        AddTodoDialog(
+            onSubmit = { title ->
+                scope.launch {
+                    runCatching { repo.addTodo(title) }.onFailure { error = it.message }
+                    adding = false
+                    refresh()
+                }
+            },
+            onDismiss = { adding = false },
+        )
+    }
 }
 
+/**
+ * 一条待办。
+ *
+ * **「完成」做成一个圆形的图标按钮放在左边,不是一个文字按钮放在下面。**
+ * 它是这一行上出现频率最高的动作,而放在左边意味着一屏七八条时,
+ * 手指走的是一条直线。
+ */
 @Composable
 private fun TodoRow(todo: TodoDto, onDone: () -> Unit, onCancel: () -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
-            Text(todo.title, style = MaterialTheme.typography.titleMedium)
-            todo.startsAt?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-            if (todo.awaitingCalendar) {
-                // ADR-020 的那条"看得见的延迟":服务端记了要写日历,设备还没写进去。
-                // 这一行不显示的话,"以为写进日历了其实没有"就变成了静默丢失
-                Text(
-                    "还没写进系统日历",
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
+    SectionCard {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(Space.md),
+            verticalAlignment = Alignment.Top,
+        ) {
+            IconButton(onClick = onDone, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Default.CheckCircle,
+                    "完成",
+                    tint = MaterialTheme.colorScheme.primary,
                 )
             }
-            Row {
-                TextButton(onClick = onDone) { Text("完成") }
-                TextButton(onClick = onCancel) { Text("撤销") }
+            Column(
+                Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(Space.xs),
+            ) {
+                Text(todo.title, style = MaterialTheme.typography.bodyLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+                    todo.startsAt?.let { StatusChip(shortTime(it)) }
+                    if (todo.awaitingCalendar) {
+                        // ADR-020 的那条"看得见的延迟":服务端记了要写日历,设备还没写进去。
+                        // 这一行不显示的话,"以为写进日历了其实没有"就变成了静默丢失
+                        StatusChip("还没写进日历", Tone.Problem)
+                    }
+                }
             }
+            TextButton(onClick = onCancel) { Text("撤销") }
         }
     }
 }
 
 @Composable
-fun PendingScreen(repo: Repository) {
+private fun AddTodoDialog(onSubmit: (String) -> Unit, onDismiss: () -> Unit) {
+    var draft by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("加一条待办") },
+        text = {
+            OutlinedTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                label = { Text("要做什么") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            Button(enabled = draft.isNotBlank(), onClick = { onSubmit(draft.trim()) }) {
+                Text("加上")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("算了") } },
+    )
+}
+
+// ---------------------------------------------------------------- 待确认
+
+@Composable
+fun PendingScreen(repo: Repository, onCount: (Int) -> Unit = {}) {
     var items by remember { mutableStateOf<List<PendingDto>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     suspend fun refresh() {
         runCatching { repo.pending() }
-            .onSuccess { items = it; error = null }
+            .onSuccess {
+                items = it
+                error = null
+                onCount(it.size)
+            }
             .onFailure { error = it.message }
     }
 
     LaunchedEffect(Unit) { refresh() }
 
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("待确认", style = MaterialTheme.typography.headlineSmall)
-        Text(
-            "拿不准的都在这儿。**不确认就不会写进你的待办和日历**(铁律 7)。",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    Scaffold(
+        topBar = {
+            ScreenBar(
+                title = "待确认",
+                subtitle = "拿不准的都在这儿,不确认就不会写进你的待办和账本",
+                onRefresh = { scope.launch { refresh() } },
+            )
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { insets ->
+        Column(Modifier.fillMaxSize().padding(insets)) {
+            error?.let {
+                Row(Modifier.padding(horizontal = Space.lg, vertical = Space.sm)) {
+                    OfflineNotice(it) { scope.launch { refresh() } }
+                }
+            }
 
-        when (val list = items) {
-            null -> Loading()
-            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(list, key = { it.id }) { item ->
-                    PendingRow(
-                        item = item,
-                        onConfirm = { edits ->
-                            scope.launch { repo.confirm(item.id, edits); refresh() }
-                        },
-                        onReject = { scope.launch { repo.reject(item.id); refresh() } },
+            when (val list = items) {
+                null -> LoadingState()
+                else -> if (list.isEmpty()) {
+                    EmptyState(
+                        Icons.Default.CheckCircle,
+                        "没有要确认的",
+                        "拿不准的东西才会到这儿来(铁律 7)。空着说明它这段时间都很有把握。",
                     )
+                } else {
+                    LazyColumn(
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            start = Space.lg, end = Space.lg, top = Space.sm, bottom = Space.xl
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        items(list, key = { it.id }) { item ->
+                            PendingRow(
+                                item = item,
+                                onConfirm = { edits ->
+                                    scope.launch { repo.confirm(item.id, edits); refresh() }
+                                },
+                                onReject = { scope.launch { repo.reject(item.id); refresh() } },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -197,41 +362,48 @@ private fun PendingRow(
     var kind by remember(item.id) { mutableStateOf(item.txnKind) }
     var category by remember(item.id) { mutableStateOf(item.category) }
 
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
-            Text(item.headline, style = MaterialTheme.typography.titleMedium)
-            item.startsAt?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-            Text(
-                "来自 ${item.agent} · ${item.reason}",
-                style = MaterialTheme.typography.bodySmall,
+    SectionCard {
+        Text(item.headline, style = MaterialTheme.typography.bodyLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+            StatusChip(item.agent, Tone.Neutral)
+            item.startsAt?.let { StatusChip(shortTime(it)) }
+        }
+        Text(
+            item.reason,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (item.isTransaction) {
+            HorizontalDivider(Modifier.padding(vertical = Space.xs))
+            TransactionEditor(
+                kind = kind,
+                category = category,
+                onKind = { kind = it },
+                onCategory = { category = it },
             )
+        }
 
-            if (item.isTransaction) {
-                TransactionEditor(
-                    kind = kind,
-                    category = category,
-                    onKind = { kind = it },
-                    onCategory = { category = it },
-                )
+        if (item.isKnown) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = Space.xs),
+                horizontalArrangement = Arrangement.spacedBy(Space.sm),
+            ) {
+                Button(
+                    onClick = {
+                        onConfirm(if (item.isTransaction) edits(item, kind, category) else null)
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("确认") }
+                OutlinedButton(onClick = onReject, modifier = Modifier.weight(1f)) { Text("不对") }
             }
-
-            if (item.isKnown) {
-                Row {
-                    TextButton(
-                        onClick = {
-                            onConfirm(if (item.isTransaction) edits(item, kind, category) else null)
-                        },
-                    ) { Text("确认") }
-                    TextButton(onClick = onReject) { Text("不对") }
-                }
-            } else {
-                // 不认识的 target_table 只展示不给按钮(06 §6.7):
-                // 服务端加一类待确认不必等 App 发版,而老版本也不会拿错误的形状去确认
-                Text(
-                    "这类(${item.targetTable})要新版本的 App 才能处理",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
+        } else {
+            // 不认识的 target_table 只展示不给按钮(06 §6.7):
+            // 服务端加一类待确认不必等 App 发版,而老版本也不会拿错误的形状去确认
+            NoticeBanner(
+                "这类(${item.targetTable})要新版本的 App 才能处理",
+                tone = Tone.Attention,
+            )
         }
     }
 }
@@ -263,23 +435,35 @@ private fun TransactionEditor(
     onKind: (String) -> Unit,
     onCategory: (String) -> Unit,
 ) {
-    Text("这是", style = MaterialTheme.typography.bodySmall)
+    Text(
+        "这是",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
     Row(
         Modifier.horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(Space.xs),
     ) {
         PendingDto.KINDS.forEach { (value, label) ->
-            FilterChip(selected = kind == value, onClick = { onKind(value) }, label = { Text(label) })
+            FilterChip(
+                selected = kind == value,
+                onClick = { onKind(value) },
+                label = { Text(label) },
+            )
         }
     }
 
     // 只有支出才有分类。收入、转账、还款给分类没有意义,而报表只统计支出 ——
     // 给它们配一个分类会让人以为那笔钱进了那个类目的统计
     if (kind == "expense") {
-        Text("算在", style = MaterialTheme.typography.bodySmall)
+        Text(
+            "算在",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Row(
             Modifier.horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(Space.xs),
         ) {
             PendingDto.CATEGORIES.forEach { name ->
                 FilterChip(
@@ -292,88 +476,36 @@ private fun TransactionEditor(
     }
 }
 
+// ---------------------------------------------------------------- 我的
+
 /**
- * 读哪几个日历(06 §6.14)。**默认一个都不读。**
+ * 状态页 —— **这个 App 里唯一一处能回答"它还活着吗"的地方**,
+ * 也是关掉采集、删数据、解绑设备的地方。
  *
- * 手机上常有生日、节假日、订阅的球赛、公司全员会 —— 全读会把摘要淹掉,
- * 而淹掉的摘要等于没有摘要。和上面那份放行来源是同一条思路(R10):
- * 默认拒绝、用户显式放行、随时能改。
- *
- * **勾完立刻读一遍**,不等那两小时的周期任务:勾了却什么都不发生,
- * 会让人以为这个开关没生效。
+ * 顶上三块数字回答"活着吗",下面按"你的数据 → 采集范围 → 这台设备"三段排。
+ * **顺序不是随便的**:一个人打开这一页,最可能的原因是"我想少采一点"
+ * 或者"我想停下来",而那两件事在最上面。
  */
-@Composable
-private fun CalendarPicker() {
-    val context = LifeInApp.instance
-    var calendars by remember { mutableStateOf<List<CalendarInfo>?>(null) }
-    var chosen by remember { mutableStateOf(CalendarChoice.selected(context)) }
-
-    LaunchedEffect(Unit) {
-        calendars = runCatching { CalendarReader.list(context) }.getOrDefault(emptyList())
-    }
-
-    Text("读哪几个日历(默认一个都不读)", style = MaterialTheme.typography.titleSmall)
-
-    when {
-        calendars == null -> Text("正在看手机上有哪些日历…", style = MaterialTheme.typography.bodySmall)
-
-        calendars!!.isEmpty() -> Text(
-            "读不到任何日历 —— 多半是还没给日历权限,在上面那个按钮里给一下",
-            style = MaterialTheme.typography.bodySmall,
-        )
-
-        else -> {
-            if (chosen.isEmpty()) {
-                Text(
-                    "一个都没勾 —— 日程不会进摘要,也不会被提取成待办",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            calendars!!.forEach { calendar ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = calendar.id in chosen,
-                        onCheckedChange = { on ->
-                            chosen = if (on) chosen + calendar.id else chosen - calendar.id
-                            CalendarChoice.choose(context, chosen)
-                            // 勾完立刻读一遍 —— 见这个函数的说明
-                            Schedules.collectCalendarNow(context)
-                        },
-                    )
-                    Column {
-                        Text(calendar.name.ifBlank { "(没有名字)" })
-                        if (calendar.account.isNotBlank()) {
-                            Text(calendar.account, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
-            Text(
-                "只读,不改。App 自己写进日历的那些日程不会被读回来 —— " +
-                    "否则一条日程会变成两条、四条。",
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
-    }
-}
-
-
 @Composable
 fun StatusScreen(
     repo: Repository,
     localListenerEnabled: Boolean,
     queued: Int,
-    /**
-     * 页面末尾的那几个动作(开权限、解绑)。用插槽塞进**同一个可滚动的列**里 ——
-     * 放在外面的话它们会被这一页的内容顶出屏幕,而"打开通知使用权"恰恰是
-     * 新装的手机上最需要点的那一个。
-     */
-    footer: @Composable () -> Unit = {},
+    checkCalendarPermission: () -> Boolean,
+    onOpenListenerSettings: () -> Unit,
+    onRequestCalendar: () -> Unit,
+    onOpenUrl: (String) -> Unit,
+    onUnenroll: () -> Unit,
 ) {
     var status by remember { mutableStateOf<CollectorStatus?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var newSource by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf<String?>(null) }
+    // 点完"授权"之后加一,好让下面那句重新问一次系统
+    var permissionTick by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
+    val context = LifeInApp.instance
+    val hasCalendarPermission = remember(permissionTick) { checkCalendarPermission() }
 
     suspend fun refresh() {
         runCatching { repo.collectorStatus() }
@@ -383,88 +515,285 @@ fun StatusScreen(
 
     LaunchedEffect(Unit) { refresh() }
 
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text("采集器", style = MaterialTheme.typography.headlineSmall)
-
-        // 手机这一侧的事实,不依赖网络 —— 权限没开时这一行就是答案
-        Text(if (localListenerEnabled) "通知监听:已开启" else "通知监听:没有权限,去系统设置里开")
-        Text("待上报:$queued 条")
-
-        HorizontalDivider()
-        error?.let { Text("拉不到服务端状态:$it", color = MaterialTheme.colorScheme.error) }
-
-        status?.devices?.forEach { device ->
-            Text("${device.deviceId} · 最后心跳 ${device.lastSeenAt ?: "从没有过"}")
-            if (device.stale) {
-                Text("服务端认为这台已经掉线", color = MaterialTheme.colorScheme.error)
-            }
-        }
-
-        HorizontalDivider()
-        CalendarPicker()
-
-        HorizontalDivider()
-        Text("放行的来源(默认拒绝)", style = MaterialTheme.typography.titleSmall)
-        if (status?.whitelist?.isEmpty() == true) {
-            Text(
-                "一条都没有 —— 采集器送上去的东西全会被丢掉",
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-        status?.whitelist?.forEach { rule ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("${rule.pattern} · ${rule.purpose}", modifier = Modifier.weight(1f))
-                // 只能开关,**没有删除**:留着那一行才回答得了"曾经放行过谁"(06 §6.9)
-                Switch(
-                    checked = rule.enabled,
-                    onCheckedChange = { on ->
-                        scope.launch { repo.toggleSource(rule.id, on); refresh() }
-                    },
+    Scaffold(
+        topBar = { ScreenBar("我的", onRefresh = { scope.launch { refresh() } }) },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { insets ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(insets)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = Space.lg),
+            verticalArrangement = Arrangement.spacedBy(Space.md),
+        ) {
+            if (!localListenerEnabled) {
+                NoticeBanner(
+                    "没有通知使用权,采集器一条都收不到。",
+                    tone = Tone.Problem,
+                    icon = Icons.Default.Warning,
+                    action = "去开" to onOpenListenerSettings,
                 )
             }
-        }
+            error?.let { OfflineNotice(it) { scope.launch { refresh() } } }
+            note?.let { NoticeBanner(it, tone = Tone.Neutral) }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = newSource,
-                onValueChange = { newSource = it },
-                label = { Text("加一个包名") },
-                placeholder = { Text("com.tencent.mm") },
-                modifier = Modifier.weight(1f),
-            )
-            TextButton(
-                enabled = newSource.isNotBlank(),
-                onClick = {
-                    scope.launch {
-                        runCatching { repo.allowSource(newSource) }
-                            .onSuccess { newSource = "" }
-                            .onFailure { error = it.message }
-                        refresh()
+            Row(horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+                StatTile(
+                    label = "通知监听",
+                    value = if (localListenerEnabled) "已开启" else "没权限",
+                    note = "手机这一侧的事实,不依赖网络",
+                    tone = if (localListenerEnabled) Tone.Positive else Tone.Problem,
+                    modifier = Modifier.weight(1f),
+                )
+                StatTile(
+                    label = "待上报",
+                    value = "$queued 条",
+                    note = if (queued > 0) "攒着,联网了会送出去" else "都送出去了",
+                    tone = Tone.Neutral,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            CollectionControls(repo) { note = it }
+
+            SectionCard("这台手机的心跳") {
+                val devices = status?.devices.orEmpty()
+                if (devices.isEmpty()) {
+                    Text(
+                        "服务端还没收到过心跳。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                devices.forEach { device ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(device.deviceId, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "最后心跳 ${device.lastSeenAt ?: "从没有过"}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        StatusChip(
+                            if (device.stale) "掉线" else "正常",
+                            if (device.stale) Tone.Problem else Tone.Positive,
+                        )
                     }
-                },
-            ) { Text("放行") }
-        }
-        Text(
-            "只放消息类。银行与支付类是 P2 的事,不从这里打开。",
-            style = MaterialTheme.typography.bodySmall,
-        )
+                }
+                CollectorState.lastUpload(context)?.let {
+                    Text(
+                        "上次上报:$it",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
 
-        HorizontalDivider()
-        footer()
+            CalendarSection(hasCalendarPermission) {
+                onRequestCalendar()
+                permissionTick++
+            }
+
+            SectionCard("放行的来源") {
+                Text(
+                    "默认拒绝:不在这份名单上的一律丢掉。停用不会删掉那一行 —— " +
+                        "留着才回答得了「曾经放行过谁」。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (status?.whitelist?.isEmpty() == true) {
+                    NoticeBanner("一条都没有 —— 采集器送上去的东西全会被丢掉", Tone.Problem)
+                }
+                status?.whitelist?.forEach { rule ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(rule.pattern, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                rule.purpose,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        // 只能开关,**没有删除**:留着那一行才回答得了"曾经放行过谁"(06 §6.9)
+                        Switch(
+                            checked = rule.enabled,
+                            onCheckedChange = { on ->
+                                scope.launch { repo.toggleSource(rule.id, on); refresh() }
+                            },
+                        )
+                    }
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                ) {
+                    OutlinedTextField(
+                        value = newSource,
+                        onValueChange = { newSource = it },
+                        label = { Text("加一个包名") },
+                        placeholder = { Text("com.tencent.mm") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(
+                        enabled = newSource.isNotBlank(),
+                        onClick = {
+                            scope.launch {
+                                runCatching { repo.allowSource(newSource) }
+                                    .onSuccess { newSource = "" }
+                                    .onFailure { error = it.message }
+                                refresh()
+                            }
+                        },
+                    ) { Text("放行") }
+                }
+                Text(
+                    "只放消息类。银行与支付类要在服务器上单独开。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            SectionCard("在电脑上打开") {
+                Text(
+                    "会生成一条十五分钟有效的链接,在浏览器里能导出数据、加设备、" +
+                        "改放行的来源。不需要密码 —— 那条链接本身就是钥匙,所以别转发它。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            runCatching { repo.consoleLink() }
+                                .onSuccess(onOpenUrl)
+                                .onFailure { note = "打不开:${it.message}" }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("在浏览器打开") }
+            }
+
+            SectionCard("这台设备") {
+                OutlinedButton(onClick = onUnenroll, modifier = Modifier.fillMaxWidth()) {
+                    Text("解绑这台设备")
+                }
+                Text(
+                    "解绑只清掉手机上这份。服务端那两条凭据还有效 —— " +
+                        "手机丢了要在控制台上吊销这一台,或者跑 revoke-device。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Column(Modifier.padding(bottom = Space.xl)) {
+                CollectorState.lastError(context)?.let {
+                    Text(
+                        "最近一次失败:$it",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
     }
 }
 
-
+/**
+ * 读哪几个日历(06 §6.14)。**默认一个都不读。**
+ *
+ * 手机上常有生日、节假日、订阅的球赛、公司全员会 —— 全读会把摘要淹掉,
+ * 而淹掉的摘要等于没有摘要。和放行来源是同一条思路(R10):
+ * 默认拒绝、用户显式放行、随时能改。
+ *
+ * **勾完立刻读一遍**,不等那两小时的周期任务:勾了却什么都不发生,
+ * 会让人以为这个开关没生效。
+ */
 @Composable
-private fun Loading() {
-    Column(
-        Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) { CircularProgressIndicator() }
+private fun CalendarSection(hasPermission: Boolean, onRequestPermission: () -> Unit) {
+    val context = LifeInApp.instance
+    var calendars by remember { mutableStateOf<List<CalendarInfo>?>(null) }
+    var chosen by remember { mutableStateOf(CalendarChoice.selected(context)) }
+
+    LaunchedEffect(hasPermission) {
+        calendars = runCatching { CalendarReader.list(context) }.getOrDefault(emptyList())
+    }
+
+    SectionCard("读哪几个日历") {
+        Text(
+            "默认一个都不读。全读会把摘要淹掉,而淹掉的摘要等于没有摘要。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (!hasPermission) {
+            NoticeBanner(
+                "没有日历权限,日程写不进系统日历,也读不到你的日历。",
+                tone = Tone.Attention,
+                action = "授权" to onRequestPermission,
+            )
+            return@SectionCard
+        }
+
+        when {
+            calendars == null -> Text(
+                "正在看手机上有哪些日历…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            calendars!!.isEmpty() -> Text(
+                "这台手机上一个日历都没有。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            else -> {
+                if (chosen.isEmpty()) {
+                    NoticeBanner(
+                        "一个都没勾 —— 日程不会进摘要,也不会被提取成待办",
+                        tone = Tone.Attention,
+                    )
+                }
+                calendars!!.forEach { calendar ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = calendar.id in chosen,
+                            onCheckedChange = { on ->
+                                chosen = if (on) chosen + calendar.id else chosen - calendar.id
+                                CalendarChoice.choose(context, chosen)
+                                // 勾完立刻读一遍 —— 见这个函数的说明
+                                Schedules.collectCalendarNow(context)
+                            },
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                calendar.name.ifBlank { "(没有名字)" },
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            if (calendar.account.isNotBlank()) {
+                                Text(
+                                    calendar.account,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+                Text(
+                    "只读,不改。App 自己写进日历的那些日程不会被读回来 —— " +
+                        "否则一条日程会变成两条、四条。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
 }
 
 /**
@@ -483,10 +812,9 @@ private fun Loading() {
  * "要么继续采要么全删"。
  */
 @Composable
-fun CollectionControls(repo: Repository) {
+fun CollectionControls(repo: Repository, onNote: (String) -> Unit) {
     val scope = rememberCoroutineScope()
     var state by remember { mutableStateOf<CollectionStateDto?>(null) }
-    var note by remember { mutableStateOf<String?>(null) }
     var confirmingDelete by remember { mutableStateOf(false) }
 
     suspend fun refresh() {
@@ -495,35 +823,48 @@ fun CollectionControls(repo: Repository) {
 
     LaunchedEffect(Unit) { refresh() }
 
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("你的数据", style = MaterialTheme.typography.titleMedium)
-        Text(
-            if (state?.enabled == true) "正在采集" else "没有在采集",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        note?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-
-        if (state?.enabled == true) {
-            TextButton(onClick = {
-                scope.launch {
-                    runCatching { repo.stopCollection() }
-                        .onSuccess { note = it.note }
-                        .onFailure { note = "没关成:${it.message}" }
-                    refresh()
-                }
-            }) { Text("关掉采集") }
-        }
-
-        TextButton(onClick = { confirmingDelete = true }) { Text("删掉已采的数据") }
+    SectionCard(
+        title = "你的数据",
+        trailing = {
+            StatusChip(
+                if (state?.enabled == true) "正在采集" else "没有在采集",
+                if (state?.enabled == true) Tone.Positive else Tone.Attention,
+            )
+        },
+    ) {
         Text(
             "关掉采集不会删数据,删数据也不会自动关掉采集 —— 两件事分开。",
             style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Row(horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+            if (state?.enabled == true) {
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            runCatching { repo.stopCollection() }
+                                .onSuccess { onNote(it.note) }
+                                .onFailure { onNote("没关成:${it.message}") }
+                            refresh()
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("关掉采集") }
+            }
+            OutlinedButton(
+                onClick = { confirmingDelete = true },
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Icons.Default.Delete, null, Modifier.size(16.dp))
+                Text(" 删掉已采的")
+            }
+        }
     }
 
     if (confirmingDelete) {
         AlertDialog(
             onDismissRequest = { confirmingDelete = false },
+            icon = { Icon(Icons.Default.Warning, null) },
             title = { Text("删掉已采的数据?") },
             text = {
                 // **是真删,不是标记。** 说清楚,因为它不可撤销
@@ -536,8 +877,8 @@ fun CollectionControls(repo: Repository) {
                 TextButton(onClick = {
                     scope.launch {
                         runCatching { repo.deleteCollected() }
-                            .onSuccess { note = "删掉了 ${it.total} 条" }
-                            .onFailure { note = "没删成:${it.message}" }
+                            .onSuccess { onNote("删掉了 ${it.total} 条") }
+                            .onFailure { onNote("没删成:${it.message}") }
                         confirmingDelete = false
                         refresh()
                     }
@@ -549,3 +890,7 @@ fun CollectionControls(repo: Repository) {
         )
     }
 }
+
+/** ISO 时间只留到分钟。**列表上没人读秒和时区** —— 而它们会把一行挤到换行。 */
+internal fun shortTime(iso: String): String =
+    iso.take(16).replace('T', ' ')

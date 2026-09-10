@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  深色下的小组件。**不透明,不跟着壁纸走** ——
+  半透明的小组件在花壁纸上会变成一团看不清的东西,
+  而这个小组件存在的全部理由是"扫一眼就知道今天有什么"。
+-->
+<resources>
+    <color name="widget_bg">#FF1B201E</color>
+    <color name="widget_title">#63BDA7</color>
+    <color name="widget_text">#E1E4E1</color>
+    <color name="widget_dim">#A7B2AC</color>
+</resources>

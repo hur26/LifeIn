@@ -5,22 +5,36 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Card
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -32,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import ltd.iclab.lifein.collect.ReceiptScanner
@@ -39,6 +54,13 @@ import ltd.iclab.lifein.net.BudgetDto
 import ltd.iclab.lifein.net.ManualTxnBody
 import ltd.iclab.lifein.net.MonthlyReportDto
 import ltd.iclab.lifein.net.TransactionDto
+import ltd.iclab.lifein.ui.theme.EmptyState
+import ltd.iclab.lifein.ui.theme.MeterBar
+import ltd.iclab.lifein.ui.theme.NoticeBanner
+import ltd.iclab.lifein.ui.theme.SectionCard
+import ltd.iclab.lifein.ui.theme.Space
+import ltd.iclab.lifein.ui.theme.StatusChip
+import ltd.iclab.lifein.ui.theme.Tone
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
 
@@ -48,6 +70,12 @@ import java.time.format.DateTimeFormatter
  * **金额从头到尾是字符串。** 服务端发的是字符串,这边显示的也是字符串 ——
  * 中间一次都不转成 Double。`38.50` 经过一次 Double 会变成 `38.499999999999996`,
  * 而账本上出现那个数字比出现一笔错账更让人不信任。
+ *
+ * ## 排版上做的一件事:金额右对齐
+ *
+ * 一屏十几笔账,人扫的是**那一列数字**,不是商户名。左对齐的金额在小数点上
+ * 对不齐,而对不齐的一列数字要一个个读 —— 右对齐之后"这个月哪笔最大"
+ * 是一眼的事。
  *
  * ## 改分类那个动作比它看起来重要
  *
@@ -62,28 +90,53 @@ import java.time.format.DateTimeFormatter
  * 现金和纸质票据那条长尾,实时通知那一路永远采不到。它和账本在同一个界面,
  * 是因为**想补一笔的时刻就是发现账本上少了一笔的时刻**。
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LedgerScreen(repo: Repository) {
     var tab by remember { mutableIntStateOf(0) }
+    val titles = listOf("账目", "报表", "预算")
 
-    Column(Modifier.fillMaxSize()) {
-        TabRow(selectedTabIndex = tab) {
-            listOf("账目", "报表", "预算").forEachIndexed { index, title ->
-                Tab(selected = tab == index, onClick = { tab = index }, text = { Text(title) })
+    Scaffold(
+        topBar = {
+            Column {
+                TopAppBar(
+                    title = { Text("账本", style = MaterialTheme.typography.titleLarge) },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                    ),
+                )
+                PrimaryTabRow(
+                    selectedTabIndex = tab,
+                    containerColor = MaterialTheme.colorScheme.background,
+                ) {
+                    titles.forEachIndexed { index, title ->
+                        Tab(
+                            selected = tab == index,
+                            onClick = { tab = index },
+                            text = { Text(title) },
+                        )
+                    }
+                }
             }
-        }
-        when (tab) {
-            0 -> TransactionsTab(repo)
-            1 -> ReportTab(repo)
-            else -> BudgetsTab(repo)
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { insets ->
+        Column(Modifier.fillMaxSize().padding(insets)) {
+            when (tab) {
+                0 -> TransactionsTab(repo)
+                1 -> ReportTab(repo)
+                else -> BudgetsTab(repo)
+            }
         }
     }
 }
 
+// ---------------------------------------------------------------- 账目
+
 @Composable
 private fun TransactionsTab(repo: Repository) {
     val scope = rememberCoroutineScope()
-    var items by remember { mutableStateOf(emptyList<TransactionDto>()) }
+    var items by remember { mutableStateOf<List<TransactionDto>?>(null) }
     var query by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf<TransactionDto?>(null) }
@@ -97,32 +150,67 @@ private fun TransactionsTab(repo: Repository) {
 
     LaunchedEffect(Unit) { reload() }
 
-    Column(Modifier.fillMaxSize().padding(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+    Scaffold(
+        floatingActionButton = {
+            FloatingActionButton(onClick = { adding = true }) {
+                Icon(Icons.Default.Add, "手动补一笔")
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { _ ->
+        Column(Modifier.fillMaxSize()) {
             OutlinedTextField(
                 value = query,
-                onValueChange = { query = it },
+                onValueChange = {
+                    query = it
+                    scope.launch { reload() }
+                },
                 label = { Text("找商户") },
-                modifier = Modifier.weight(1f),
+                leadingIcon = { Icon(Icons.Default.Search, null) },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Space.lg, vertical = Space.sm),
             )
-            TextButton(onClick = { scope.launch { reload() } }) { Text("搜") }
-        }
-        TextButton(onClick = { adding = true }) { Text("+ 手动补一笔") }
+            error?.let {
+                Row(Modifier.padding(horizontal = Space.lg, vertical = Space.xs)) {
+                    NoticeBanner("读不到账本:$it", Tone.Problem)
+                }
+            }
 
-        error?.let { Text("读不到账本:$it", color = MaterialTheme.colorScheme.error) }
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(items, key = { it.id }) { txn ->
-                TransactionRow(
-                    txn = txn,
-                    onEdit = { editing = txn },
-                    onDelete = {
-                        scope.launch {
-                            runCatching { repo.deleteTransaction(txn.id) }
-                            reload()
+            when (val list = items) {
+                null -> ltd.iclab.lifein.ui.theme.LoadingState()
+                else -> if (list.isEmpty()) {
+                    EmptyState(
+                        Icons.Default.ShoppingCart,
+                        if (query.isBlank()) "账本还是空的" else "没找到这个商户",
+                        if (query.isBlank()) {
+                            "放行了支付类通知之后,消费会自己记进来。现金和纸质小票点右下角补。"
+                        } else {
+                            "换个词试试,或者清空搜索看全部。"
+                        },
+                    )
+                } else {
+                    LazyColumn(
+                        contentPadding = PaddingValues(
+                            start = Space.lg, end = Space.lg, bottom = 88.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        items(list, key = { it.id }) { txn ->
+                            TransactionRow(
+                                txn = txn,
+                                onEdit = { editing = txn },
+                                onDelete = {
+                                    scope.launch {
+                                        runCatching { repo.deleteTransaction(txn.id) }
+                                        reload()
+                                    }
+                                },
+                            )
                         }
-                    },
-                )
+                    }
+                }
             }
         }
     }
@@ -145,8 +233,7 @@ private fun TransactionsTab(repo: Repository) {
         ManualEntryDialog(
             onSubmit = { body ->
                 scope.launch {
-                    runCatching { repo.addTransaction(body) }
-                        .onFailure { error = it.message }
+                    runCatching { repo.addTransaction(body) }.onFailure { error = it.message }
                     adding = false
                     reload()
                 }
@@ -158,37 +245,48 @@ private fun TransactionsTab(repo: Repository) {
 
 @Composable
 private fun TransactionRow(txn: TransactionDto, onEdit: () -> Unit, onDelete: () -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(10.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(txn.merchantRaw ?: "(没有商户名)", style = MaterialTheme.typography.bodyLarge)
-                // 金额原样显示,一次都不转 Double
+    SectionCard {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(Space.md),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Space.xs)) {
                 Text(
-                    if (txn.direction == "credit") "+${txn.amount}" else txn.amount,
+                    txn.merchantRaw ?: "(没有商户名)",
                     style = MaterialTheme.typography.bodyLarge,
                 )
-            }
-            Text(
-                listOfNotNull(
-                    shortDate(txn.occurredAt),
-                    txn.category ?: "未归类",
-                    kindLabel(txn.kind),
+                Row(horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+                    StatusChip(shortDate(txn.occurredAt))
+                    StatusChip(
+                        txn.category ?: "未归类",
+                        if (txn.category == null) Tone.Attention else Tone.Neutral,
+                    )
+                    if (txn.kind != "expense") StatusChip(kindLabel(txn.kind))
                     // 对账过的标出来:它意味着这一笔和银行账单核对过
-                    if (txn.stage == "reconciled") "已对账" else null,
-                ).joinToString(" · "),
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Row {
-                TextButton(onClick = onEdit) { Text("改分类") }
-                TextButton(onClick = onDelete) { Text("删掉") }
+                    if (txn.stage == "reconciled") StatusChip("已对账", Tone.Positive)
+                }
             }
+            // 金额原样显示,一次都不转 Double
+            Text(
+                if (txn.direction == "credit") "+${txn.amount}" else txn.amount,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = if (txn.direction == "credit") {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+            TextButton(onClick = onEdit) { Text("改分类") }
+            TextButton(onClick = onDelete) { Text("删掉") }
         }
     }
 }
+
+// ---------------------------------------------------------------- 报表
 
 @Composable
 private fun ReportTab(repo: Repository) {
@@ -202,41 +300,98 @@ private fun ReportTab(repo: Repository) {
     }
 
     val data = report
-    Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        error?.let { Text("读不到报表:$it", color = MaterialTheme.colorScheme.error) }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = Space.lg),
+        verticalArrangement = Arrangement.spacedBy(Space.md),
+    ) {
+        error?.let { NoticeBanner("读不到报表:$it", Tone.Problem) }
         if (data == null) {
-            Text("还没有报表")
+            EmptyState(
+                Icons.Default.ShoppingCart,
+                "还没有报表",
+                "月报是每月初那次定时任务算出来的,不是现调模型 —— 所以同一个月每次看都一样。",
+            )
             return@Column
         }
 
-        Text("${data.period} 共支出 ${data.total} 元,${data.count} 笔",
-            style = MaterialTheme.typography.titleMedium)
-        data.lastTotal?.let { Text("上个月 $it 元", style = MaterialTheme.typography.bodySmall) }
+        SectionCard(data.period) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text("¥", style = MaterialTheme.typography.titleMedium)
+                Text(data.total, style = MaterialTheme.typography.headlineMedium)
+            }
+            Text(
+                "${data.count} 笔支出" + (data.lastTotal?.let { " · 上个月 ¥$it" } ?: ""),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // 评语来自月报 job 上次跑的结果,不是现调模型(06 §6.11)
+            data.notes.forEach {
+                Text("· $it", style = MaterialTheme.typography.bodyMedium)
+            }
+        }
 
-        // 评语来自月报 job 上次跑的结果,不是现调模型(06 §6.11)
-        data.notes.forEach { Text("· $it") }
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            items(data.categories, key = { it.category }) { line ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("${line.category}(${line.count} 笔)")
-                    Text("${line.total} 元")
+        SectionCard("花在哪儿") {
+            if (data.categories.isEmpty()) {
+                Text(
+                    "这个月还没有归好类的支出。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            val top = data.categories.maxOfOrNull { amountOf(it.total) } ?: 1.0
+            data.categories.forEach { line ->
+                Column(verticalArrangement = Arrangement.spacedBy(Space.xs)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            "${line.category}(${line.count} 笔)",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text("¥${line.total}", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    // 条形按"这个月最大的那一类"归一。按总额归一的话,
+                    // 一个花得少的月份里每根条都短得看不出差别
+                    MeterBar((amountOf(line.total) / top).toFloat(), Tone.Neutral)
                 }
             }
         }
 
         if (data.uncategorized != "0" && data.uncategorized != "0.00") {
             // 单独说:混进"其他"的话,报表会声称自己看懂了这些钱
-            Text("还没归类:${data.uncategorized} 元", style = MaterialTheme.typography.bodySmall)
+            NoticeBanner(
+                "还有 ¥${data.uncategorized} 没归类。它们不在上面那几条里 —— " +
+                    "混进「其他」的话,这份报表会声称自己看懂了这些钱。",
+                tone = Tone.Attention,
+            )
         }
-        Text(coverageLine(data.reconciledRatio), style = MaterialTheme.typography.bodySmall)
+
+        SectionCard("这份报表可不可信") {
+            Text(
+                coverageLine(data.reconciledRatio),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "覆盖率低意味着有些消费根本没进账本,而报表本身看不出这一点。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Column(Modifier.padding(bottom = Space.xl)) {}
     }
 }
+
+// ---------------------------------------------------------------- 预算
 
 @Composable
 private fun BudgetsTab(repo: Repository) {
     val scope = rememberCoroutineScope()
-    var items by remember { mutableStateOf(emptyList<BudgetDto>()) }
+    var items by remember { mutableStateOf<List<BudgetDto>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(false) }
 
@@ -248,20 +403,39 @@ private fun BudgetsTab(repo: Repository) {
 
     LaunchedEffect(Unit) { reload() }
 
-    Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        error?.let { Text("读不到预算:$it", color = MaterialTheme.colorScheme.error) }
-        if (items.isEmpty()) {
-            // 没设预算就不会有超支预警 —— 说清楚,别让人以为功能坏了
-            Text("还没设预算。没有预算就不会有超支提醒。")
-        }
-        TextButton(onClick = { editing = true }) { Text("+ 设一条预算") }
+    Scaffold(
+        floatingActionButton = {
+            FloatingActionButton(onClick = { editing = true }) {
+                Icon(Icons.Default.Add, "设一条预算")
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.background,
+    ) { _ ->
+        Column(Modifier.fillMaxSize().padding(horizontal = Space.lg)) {
+            error?.let { NoticeBanner("读不到预算:$it", Tone.Problem) }
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(items, key = { it.category ?: "__total__" }) { budget ->
-                BudgetRow(budget) {
-                    scope.launch {
-                        runCatching { repo.deleteBudget(budget.category) }
-                        reload()
+            when (val list = items) {
+                null -> ltd.iclab.lifein.ui.theme.LoadingState()
+                else -> if (list.isEmpty()) {
+                    // 没设预算就不会有超支预警 —— 说清楚,别让人以为功能坏了
+                    EmptyState(
+                        Icons.Default.ShoppingCart,
+                        "还没设预算",
+                        "没有预算就不会有超支提醒。点右下角设一条,不选类目就是总预算。",
+                    )
+                } else {
+                    LazyColumn(
+                        contentPadding = PaddingValues(bottom = 88.dp),
+                        verticalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        items(list, key = { it.category ?: "__total__" }) { budget ->
+                            BudgetRow(budget) {
+                                scope.launch {
+                                    runCatching { repo.deleteBudget(budget.category) }
+                                    reload()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -285,59 +459,85 @@ private fun BudgetsTab(repo: Repository) {
 
 @Composable
 private fun BudgetRow(budget: BudgetDto, onDelete: () -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(budget.category ?: "总预算", style = MaterialTheme.typography.bodyLarge)
-                Text("${budget.spent} / ${budget.amount}")
-            }
-            LinearProgressIndicator(
-                progress = { ratio(budget) },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-            )
-            Text(
+    // 超了和快到了是两件事,颜色和措辞都分开
+    val tone = when {
+        budget.over -> Tone.Problem
+        budget.near -> Tone.Attention
+        else -> Tone.Positive
+    }
+    SectionCard(
+        title = budget.category ?: "总预算",
+        trailing = {
+            StatusChip(
                 when {
-                    // 超了和快到了是两件事,措辞也要分开
-                    budget.over -> "已超支 ${budget.remaining.removePrefix("-")} 元"
-                    budget.near -> "快到了,还剩 ${budget.remaining} 元"
-                    else -> "还剩 ${budget.remaining} 元"
+                    budget.over -> "已超支"
+                    budget.near -> "快到了"
+                    else -> "还宽裕"
                 },
-                style = MaterialTheme.typography.bodySmall,
+                tone,
             )
-            TextButton(onClick = onDelete) { Text("删掉这条") }
+        },
+    ) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("¥${budget.spent}", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "／ ¥${budget.amount}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
+        MeterBar(ratio(budget), tone)
+        Text(
+            when {
+                budget.over -> "已超支 ¥${budget.remaining.removePrefix("-")}"
+                budget.near -> "还剩 ¥${budget.remaining}"
+                else -> "还剩 ¥${budget.remaining}"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TextButton(onClick = onDelete) { Text("删掉这条") }
     }
 }
 
+// ---------------------------------------------------------------- 对话框
+
 @Composable
-private fun CategoryDialog(
-    current: String?,
-    onPick: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
+private fun CategoryDialog(current: String?, onPick: (String) -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("算了") } },
         title = { Text("归到哪一类") },
         text = {
-            Column {
-                // 封闭枚举,和服务端那份一致(枚举外的会被 422 挡回来)
-                Text("改一次以后这个商户就一直归到这一类。", style = MaterialTheme.typography.bodySmall)
-                CATEGORIES.chunked(3).forEach { row ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        row.forEach { name ->
-                            FilterChip(
-                                selected = name == current,
-                                onClick = { onPick(name) },
-                                label = { Text(name) },
-                            )
-                        }
-                    }
-                }
+            Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
+                Text(
+                    "改一次以后这个商户就一直归到这一类,而且模型改不回去。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                CategoryChips(selected = current, onPick = onPick)
             }
         },
     )
+}
+
+/** 分类选择器。**三个对话框共用** —— 各写一份的话,加一个类目要改三处。 */
+@Composable
+private fun CategoryChips(selected: String?, onPick: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(Space.xs)) {
+        CATEGORIES.chunked(4).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+                row.forEach { name ->
+                    FilterChip(
+                        selected = name == selected,
+                        onClick = { onPick(name) },
+                        label = { Text(name) },
+                    )
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -379,34 +579,40 @@ private fun ManualEntryDialog(onSubmit: (ManualTxnBody) -> Unit, onDismiss: () -
         onDismissRequest = onDismiss,
         title = { Text("手动补一笔") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                TextButton(onClick = { pickPhoto.launch("image/*") }) { Text("拍/选一张小票") }
-                scanNote?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(Space.sm),
+            ) {
+                OutlinedButton(
+                    onClick = { pickPhoto.launch("image/*") },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("拍 / 选一张小票") }
+                scanNote?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 OutlinedTextField(
                     value = amount,
                     onValueChange = { amount = it },
                     label = { Text("金额") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = merchant,
                     onValueChange = { merchant = it },
                     label = { Text("在哪花的") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
                 )
-                CATEGORIES.chunked(3).forEach { row ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        row.forEach { name ->
-                            FilterChip(
-                                selected = name == category,
-                                onClick = { category = name },
-                                label = { Text(name) },
-                            )
-                        }
-                    }
-                }
+                CategoryChips(selected = category, onPick = { category = it })
             }
         },
         confirmButton = {
-            TextButton(
+            Button(
                 enabled = amount.isNotBlank(),
                 onClick = {
                     onSubmit(
@@ -436,30 +642,30 @@ private fun BudgetDialog(onSubmit: (String?, String) -> Unit, onDismiss: () -> U
         onDismissRequest = onDismiss,
         title = { Text("每月能花多少") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
                 OutlinedTextField(
                     value = amount,
                     onValueChange = { amount = it },
                     label = { Text("金额") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
                 )
-                Text("不选类目就是总预算。", style = MaterialTheme.typography.bodySmall)
-                CATEGORIES.chunked(3).forEach { row ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        row.forEach { name ->
-                            FilterChip(
-                                selected = name == category,
-                                onClick = { category = if (category == name) null else name },
-                                label = { Text(name) },
-                            )
-                        }
-                    }
-                }
+                Text(
+                    "不选类目就是总预算。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                CategoryChips(
+                    selected = category,
+                    onPick = { category = if (category == it) null else it },
+                )
             }
         },
         confirmButton = {
-            TextButton(enabled = amount.isNotBlank(), onClick = { onSubmit(category, amount.trim()) }) {
-                Text("设好")
-            }
+            Button(
+                enabled = amount.isNotBlank(),
+                onClick = { onSubmit(category, amount.trim()) },
+            ) { Text("设好") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("算了") } },
     )
@@ -483,6 +689,9 @@ private fun ratio(budget: BudgetDto): Float =
         if (total.signum() <= 0) 0f else spent.divide(total, 4, java.math.RoundingMode.HALF_UP)
             .toFloat().coerceIn(0f, 1f)
     }.getOrDefault(0f)
+
+/** 只给条形图的长度用。**显示的金额永远走字符串那条路** —— 见文件开头。 */
+private fun amountOf(text: String): Double = text.toDoubleOrNull() ?: 0.0
 
 private fun shortDate(iso: String): String =
     runCatching { OffsetDateTime.parse(iso).format(DateTimeFormatter.ofPattern("MM-dd")) }

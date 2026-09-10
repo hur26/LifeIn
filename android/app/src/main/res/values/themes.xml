@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Compose 自己画界面,主题只要一个不带 ActionBar 的底座。
+
+  **但底座的颜色不是无关紧要的**:它是 Activity 起来、Compose 还没画出
+  第一帧之前那几十毫秒里屏幕上的颜色。用亮色底座配深色主题,
+  表现是每次打开 App 都白闪一下 —— 所以 values-night 里有另一份。
+-->
 <resources>
-    <!-- Compose 自己画界面,主题只要一个不带 ActionBar 的底座 -->
-    <style name="Theme.LifeIn" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.LifeIn" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F7F8F7</item>
+    </style>
 </resources>
