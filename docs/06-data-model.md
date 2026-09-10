@@ -545,11 +545,21 @@ CREATE TABLE users (
     display_name TEXT NOT NULL,
     wecom_userid TEXT NOT NULL,   -- 推送目标,企微自建应用里的成员 UserID
     tz           TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    is_admin     BOOLEAN NOT NULL DEFAULT false,  -- 运营者本人的那一行(迁移 0014)
     disabled_at  TIMESTAMPTZ,     -- 停用不删除:历史事件仍要能追溯到人
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (wecom_userid)
 );
 ```
+
+**`is_admin` 不是权限位,是一个指针。** 运营层控制台的口令**不在这张表里**
+(它是环境变量里的一个 scrypt 派生值,见
+[ADR-029](04-tech-decisions.md#adr-029--控制台分成用户层与运营层运营层加一个口令认证面)
+与 [07 §2.8](07-config.md)),所以把这一列改成 `true` **不会**让谁登得进运营层。
+
+它回答的是另一个问题:运营者自己也用这套东西,而运营层上那个"切回普通用户版"
+的按钮要知道该切到哪个账号。**没有这一列的话,那个答案只能从环境变量里抄一个
+uuid 进来** —— 而一个抄错了的 uuid 会安静地把运营者带进别人的数据。
 
 **为什么不给其他表加 `user_id` 外键**:`raw_events` 是只追加的事件流,量最大
 写入最频繁,每行一次外键检查不划算;而租户隔离本来就要靠数据访问层强制(铁律 1),
