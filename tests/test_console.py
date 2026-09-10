@@ -43,6 +43,26 @@ def browser(client):
     return client
 
 
+_INSERT_EVENT = text(
+    "INSERT INTO raw_events (user_id, source, external_id, occurred_at,"
+    " ingested_at, raw, trust)"
+    " VALUES (:u, 'notification', :e, :t, :t, '{}'::jsonb, 'external')"
+)
+
+
+def an_event(session, user_id: str, external_id: str = "e1") -> None:
+    """塞一条采集来的事件。**删除与停止采集那两组都要它** ——
+    没有数据的时候,"删掉了"和"什么都没做"看起来完全一样。
+    """
+    session.execute(_INSERT_EVENT, {"u": user_id, "e": external_id, "t": NOW})
+
+
+def count_events(session, user_id: str) -> int:
+    return session.execute(
+        text("SELECT count(*) FROM raw_events WHERE user_id = :u"), {"u": user_id}
+    ).scalar_one()
+
+
 def open_console(browser, token: str):
     """按人的方式进控制台:带 token 进门,换 cookie,落到干净的 URL。"""
     return browser.get(f"/console?t={token}", follow_redirects=True)
@@ -217,24 +237,50 @@ class TestThePages:
 
 
 def test_the_console_does_not_reimplement_the_app(client):
-    """**03 那句"只剩"是这一片的边界。** 账本、待办、记忆都不进来 ——
-    App 已经有了,而一份两处实现的界面会有两套 bug 和两次要改。
+    """**边界从"三样"变成了"两层",而"不重实现 App"那一条没变。**
 
-    **红了不要顺手把新路径加进去。** 先对着 03 的 P4 范围看一眼:
-    它只列了"数据导出、账号与授权管理、隐私说明页"三样。
-    加一条进来要能指到那三样里的某一样 —— `/console/devices/invite`
-    指的是"账号与授权管理",而且 P4 范围里点了名。
+    2026-09-10 按 [ADR-029] 改判之后,03 的 P4 给用户层划的范围是:
+    数据导出与删除、设备与配码、自己的采集开关与白名单、隐私说明页。
+
+    **红了不要顺手把新路径加进去。** 加一条要能指到那份范围里的某一样 ——
+    指不到就是在把 App 搬到 Web 上,而那正是下面那条测试拦的东西。
     """
     from lifein.api import console
 
     paths = {r.path for r in console.router.routes}
     assert paths == {
-        "/app/console/link",
-        "/console",
+        "/app/console/link",  # 入口:App 里点出来的一次性链接
+        "/console",  # 总览
+        "/console/devices",  # 账号与授权管理
         "/console/devices/invite",  # 账号与授权管理:添加设备
-        "/console/export",  # 数据导出
+        "/console/devices/revoke",  # 账号与授权管理:手机丢了
+        "/console/collection",  # 自己的采集开关与白名单
+        "/console/collection/sources",
+        "/console/collection/sources/toggle",
+        "/console/collection/stop",
+        "/console/data",  # 数据导出与删除
+        "/console/export",
+        "/console/data/delete",
         "/console/privacy",  # 隐私说明页
     }
+
+
+def test_the_ledger_and_todos_and_memory_stay_in_the_app(client):
+    """**这一条才是那句"只剩"真正的执行者。**
+
+    上面那条是一份清单,而清单会被人顺手加长。这一条盯的是**形状**:
+    账本、待办、记忆这三样在 App 里已经有一整套界面,
+    **而一份两处实现的界面会有两套 bug 和两次要改**(ADR-029)。
+
+    总览上可以有数字 —— 一个数字不会长出第二套确认逻辑,
+    而一份可编辑的账本列表会。
+    """
+    from lifein.api import console
+
+    paths = {r.path for r in console.router.routes}
+    forbidden = ("ledger", "todos", "memory", "pending", "facts")
+    offenders = [p for p in paths for word in forbidden if word in p]
+    assert not offenders, f"这几条把 App 搬到 Web 上来了:{offenders}"
 
 
 class TestAddingADevice:
@@ -264,14 +310,24 @@ class TestAddingADevice:
 
         browser.app.dependency_overrides[get_app_settings] = patched
 
-    def test_the_button_is_on_the_home_page(self, browser, pg_session, user_id):
+    def test_the_button_is_on_the_devices_page(self, browser, pg_session, user_id):
         """点得到才算做完 —— 藏在某个 URL 后面的功能等于没有。"""
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.get("/console/devices").text
+
+        assert "添加设备" in page
+        assert 'action="/console/devices/invite"' in page
+
+    def test_the_overview_points_at_it(self, browser, pg_session, user_id):
+        """总览上要有一条通往设备的路。**没有入口的页面等于不存在** ——
+        而这个控制台上第一件要做的事往往就是配一台设备。"""
         raw = a_link(pg_session, user_id)
 
         page = open_console(browser, raw).text
 
-        assert "添加设备" in page
-        assert 'action="/console/devices/invite"' in page
+        assert 'href="/console/devices"' in page
 
     def test_it_issues_a_code_and_shows_a_qr(self, browser, pg_session, user_id):
         from lifein.repos import enrollment
@@ -419,3 +475,267 @@ class TestAddingADevice:
             / "android/app/src/main/java/ltd/iclab/lifein/data/Enrollment.kt"
         ).read_text(encoding="utf-8")
         assert f'INVITE_VERSION = "{INVITE_VERSION}"' in kotlin
+
+
+class TestTheDevicesPage:
+    """**吊销是这一层唯一能把一台设备踢出去的动作**,而它不可撤销 ——
+    所以它要点两次,而且第一次点完什么都还没发生。
+    """
+
+    def test_it_lists_credentials_with_their_kind(self, browser, pg_session, user_id, secrets):
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.get("/console/devices").text
+
+        assert "pixel-7a" in page
+        assert "采集(只写)" in page
+        assert "查询(只读)" in page
+
+    def test_the_first_click_changes_nothing(self, browser, pg_session, user_id, secrets):
+        """**确认页是一次真正的暂停,不是一句装饰。**
+
+        第一次 POST 之后库里还一条都没吊销 —— 关掉浏览器就等于没点过。
+        """
+        from lifein.repos import credentials
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.post("/console/devices/revoke", data={"device_id": "pixel-7a"})
+
+        assert "吊销这台设备" in page.text
+        alive = [
+            d
+            for d in credentials.list_device_credentials(user_id, pg_session)
+            if d.revoked_at is None
+        ]
+        assert len(alive) == 2, "第一次点完不该动任何东西"
+
+    def test_the_second_click_revokes_both(self, browser, pg_session, user_id, secrets):
+        """**默认吊销两条而不是一条。** 触发它的场景是「手机丢了」,
+        那时只吊销其中一种,等于把另一种留在别人手里。"""
+        from lifein.repos import credentials
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        browser.post("/console/devices/revoke", data={"device_id": "pixel-7a", "confirm": "yes"})
+
+        alive = [
+            d
+            for d in credentials.list_device_credentials(user_id, pg_session)
+            if d.revoked_at is None
+        ]
+        assert alive == []
+
+    def test_a_revoked_row_stays_visible(self, browser, pg_session, user_id, secrets):
+        """**记录保留不删。** 哪台设备什么时候被吊销的,是排查「丢了之后
+        还有没有人在用」时唯一的线索。"""
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+        browser.post("/console/devices/revoke", data={"device_id": "pixel-7a", "confirm": "yes"})
+
+        page = browser.get("/console/devices").text
+
+        assert "pixel-7a" in page
+        assert "已吊销" in page
+
+    def test_it_needs_a_session(self, browser, pg_session, user_id, secrets):
+        page = browser.post(
+            "/console/devices/revoke", data={"device_id": "pixel-7a", "confirm": "yes"}
+        )
+        assert "重新点一次" in page.text
+
+    def test_it_only_touches_your_own(self, browser, pg_session, user_id, secrets):
+        """铁律 1。`user_id` 从会话里取 —— 表单里写别人的设备名也吊销不了别人。"""
+        from lifein.repos import credentials
+
+        other = "88888888-8888-8888-8888-888888888888"
+        pg_session.execute(
+            text(
+                "INSERT INTO users (id, display_name, wecom_userid)"
+                " VALUES (:i, '别人', 'other-dev')"
+            ),
+            {"i": other},
+        )
+        raw = a_link(pg_session, other)
+        open_console(browser, raw)
+
+        browser.post("/console/devices/revoke", data={"device_id": "pixel-7a", "confirm": "yes"})
+
+        alive = [
+            d
+            for d in credentials.list_device_credentials(user_id, pg_session)
+            if d.revoked_at is None
+        ]
+        assert len(alive) == 2, "别人的会话不该动得了这个用户的设备"
+
+
+class TestTheCollectionPage:
+    """R10 改判四前提之一在 Web 上的样子:**朋友要能自己关掉采集**。
+
+    App 里已经有,而一个人坐在电脑前的时候不该被要求先去掏手机。
+    """
+
+    def test_no_sources_says_so_loudly(self, browser, pg_session, user_id):
+        """**一条都没放行 = 采集器送上去的东西全会被丢掉。**
+        说不清楚的话,人会以为「配好了就在采」。"""
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.get("/console/collection").text
+
+        assert "全会被丢掉" in page
+
+    def test_allowing_a_package(self, browser, pg_session, user_id):
+        from lifein.repos import collector
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        browser.post("/console/collection/sources", data={"pattern": "com.tencent.mm"})
+
+        rules = collector.list_whitelist(user_id, pg_session)
+        assert [r.pattern for r in rules] == ["com.tencent.mm"]
+        assert rules[0].purpose == "message"
+
+    def test_the_web_cannot_open_the_transaction_lane(self, browser, pg_session, user_id):
+        """**`purpose` 写死成 `message`,页面上没有地方能选。**
+
+        银行与支付类会直接进记账链路,而那一档要在终端上做一次显式的动作,
+        好让「我知道我在打开什么」至少发生过一次。
+        """
+        from lifein.repos import collector
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        browser.post(
+            "/console/collection/sources",
+            data={"pattern": "com.icbc", "purpose": "transaction"},
+        )
+
+        assert collector.list_whitelist(user_id, pg_session)[0].purpose == "message"
+
+    def test_toggling_one_off_keeps_the_row(self, browser, pg_session, user_id):
+        """**没有删除,只有停用** —— 留着那一行才回答得了「曾经放行过谁」(06 §6.9)。"""
+        from lifein.repos import collector
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+        browser.post("/console/collection/sources", data={"pattern": "com.tencent.mm"})
+        rule_id = collector.list_whitelist(user_id, pg_session)[0].id
+
+        browser.post(
+            "/console/collection/sources/toggle", data={"rule_id": rule_id, "enabled": "0"}
+        )
+
+        rules = collector.list_whitelist(user_id, pg_session)
+        assert len(rules) == 1 and rules[0].enabled is False
+
+    def test_stopping_takes_two_clicks(self, browser, pg_session, user_id, secrets):
+        from lifein.repos import collector, data_control
+
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+        browser.post("/console/collection/sources", data={"pattern": "com.tencent.mm"})
+
+        first = browser.post("/console/collection/stop")
+        assert "关掉采集" in first.text
+        assert data_control.state(user_id, pg_session).enabled is True
+
+        browser.post("/console/collection/stop", data={"confirm": "yes"})
+        assert data_control.state(user_id, pg_session).enabled is False
+        assert collector.list_whitelist(user_id, pg_session)[0].enabled is False
+
+    def test_stopping_does_not_delete_anything(self, browser, pg_session, user_id, secrets):
+        """**两件事分开是有意的。** 合成一个的话,「我想先停下来想想」
+        就变成了「要么继续采要么全删」。"""
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+        an_event(pg_session, user_id)
+
+        browser.post("/console/collection/stop", data={"confirm": "yes"})
+
+        assert count_events(pg_session, user_id) == 1
+
+
+class TestTheDataPage:
+    def test_deleting_takes_two_clicks(self, browser, pg_session, user_id):
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+        an_event(pg_session, user_id)
+
+        first = browser.post("/console/data/delete")
+        assert "删了就找不回来了" in first.text
+        assert count_events(pg_session, user_id) == 1, "第一次点完不该删任何东西"
+
+        browser.post("/console/data/delete", data={"confirm": "yes"})
+        assert count_events(pg_session, user_id) == 0
+
+    def test_the_page_says_what_survives(self, browser, pg_session, user_id):
+        """**删不掉的那两样要写在页面上。**
+
+        审计日志和被拒绝过的待确认都留着,而一个说「全删了」却留下东西的
+        按钮,比一个说清楚的按钮更伤信任。
+        """
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        page = browser.get("/console/data").text
+
+        assert "审计日志" in page
+        assert "拒绝" in page
+
+
+class TestTheShell:
+    def test_there_are_no_external_references_anywhere(
+        self, browser, pg_session, user_id, secrets
+    ):
+        """**控制台里没有任何外部引用**,不只是配码那一页。
+
+        一个外链就多一处 Referer 会带着东西出去的地方 —— 而这些页面上
+        带着的是配码、导出、和别人的用户名。字体用系统栈、图标是内联 SVG、
+        样式在 `<style>` 里,所以这一条是做得到的。
+        """
+        raw = a_link(pg_session, user_id)
+        open_console(browser, raw)
+
+        for path in ("/console", "/console/devices", "/console/collection", "/console/data"):
+            page = browser.get(path).text
+            assert "<img" not in page, path
+            assert "src=" not in page, path
+            assert 'href="http' not in page, path
+            assert "<script" not in page, path
+
+    def test_the_operator_entrance_is_hidden_from_friends(self, browser, pg_session, user_id):
+        """**「运营台」那个入口只对运营者本人显示。**
+
+        对别人显示它没有安全问题(那边照样要口令),但它会让一个朋友以为
+        这里有一块他打不开的地方 —— 而这个控制台要给人的感觉恰恰相反。
+        """
+        raw = a_link(pg_session, user_id)
+
+        page = open_console(browser, raw).text
+
+        assert "运营台" not in page
+
+    def test_the_operator_sees_it(self, browser, pg_session, user_id):
+        from lifein.repos import users
+
+        users.set_admin(user_id, pg_session, is_admin=True)
+        raw = a_link(pg_session, user_id)
+
+        page = open_console(browser, raw).text
+
+        assert "运营台" in page
+        assert 'href="/admin"' in page
+
+    def test_every_page_survives_a_dead_session(self, browser, pg_session, user_id):
+        """**每一页都要各自认一次。** 漏掉一页的表现不是报错,
+        是那一页对着一个过期会话照常渲染 —— 而它上面有导出和删除。"""
+        browser.cookies.set("lifein_console", "not-a-real-token")
+
+        for path in ("/console", "/console/devices", "/console/collection", "/console/data"):
+            assert "重新点一次" in browser.get(path).text, path

@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
+from urllib.parse import parse_qsl
 
 from fastapi import Depends, Request
 from sqlalchemy.orm import Session
@@ -60,6 +61,23 @@ def get_session() -> Iterator[Session]:
 
 def get_app_settings() -> Settings:
     return get_settings()
+
+
+async def form_values(request: Request) -> dict[str, str]:
+    """读一张 HTML 表单。**自己解,不装 `python-multipart`。**
+
+    `request.form()` 要那个包,而装一个新依赖要先补一条 ADR(AGENTS.md §3)——
+    那条 ADR 的理由会是"少写六行",而控制台上的表单全是
+    `application/x-www-form-urlencoded`(`<form>` 的默认值),
+    它就是一串 `a=1&b=2`。
+
+    **不接受 multipart。** 控制台上没有任何一处要传文件,
+    而一个能收 multipart 的端点是一处能被喂进任意大的 body 的地方。
+    """
+    if "multipart/form-data" in request.headers.get("content-type", ""):
+        return {}
+    raw = await request.body()
+    return dict(parse_qsl(raw.decode("utf-8", "replace"), keep_blank_values=True))
 
 
 def now_utc() -> datetime:
