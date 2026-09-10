@@ -214,6 +214,7 @@ python -m lifein.admin create-user --name 你的名字 --wecom-userid YourWecomI
 python -m lifein.admin set-imap --user <uuid> --host imap.163.com --username you@163.com
 python -m lifein.admin test-imap --user <uuid>   # 真连一次,别等到早上才发现登不上
 
+python -m lifein --check      # 只自检:配置、库版本、装配,一条消息都不发
 python -m lifein --once       # 立刻跑一遍完整链路
 python -m lifein              # 起服务(默认只监听 127.0.0.1)
 ```

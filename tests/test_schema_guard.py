@@ -327,6 +327,72 @@ class TestAgainstRealDatabase:
         assert schema_guard.upgrade_to_head(scratch_engine).is_current
 
 
+@pytest.mark.integration
+class TestCheckCommand:
+    """`python -m lifein --check`。
+
+    `scripts/restore-drill.md` 第五步一直写着这条命令,而**它此前不存在** ——
+    演练走到那一步会撞上 `unrecognized arguments`。`migrations/env.py` 的注释
+    里也提到它。
+
+    起真的子进程测,不在进程内调 `_check`:这条命令的价值就在于"从命令行跑
+    起来是什么结果",而库连接、配置加载、装配在进程内都是全局的,替不干净。
+    """
+
+    def test_库是最新时退零(self, scratch_engine, scratch_url):
+        schema_guard.upgrade_to_head(scratch_engine)
+        done = _run_check(scratch_url)
+
+        assert done.returncode == 0, done.stderr
+        assert "自检通过" in done.stderr
+
+    def test_库落后时退非零而且不顺手升(self, scratch_engine, scratch_url):
+        """**演练库尤其不该被顺手改掉。**
+
+        `--check` 的语义是"告诉我现在是什么样",所以哪怕
+        `SCHEMA_AUTO_UPGRADE` 开着(默认就是开着)它也不升。
+        """
+        _upgrade_to(scratch_engine, "0007")
+        done = _run_check(scratch_url)
+
+        assert done.returncode == 1
+        assert "差 7 个版本" in done.stderr
+        assert schema_guard.inspect_schema(scratch_engine).current == "0007"
+
+
+def _run_check(database_url: str):
+    """起一个真的 `python -m lifein --check`。
+
+    配置整套从环境变量给,不依赖仓库里有没有 `.env` —— 环境变量的优先级
+    高于 `.env`,所以本机有那个文件时结果也一样。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = dict(os.environ)
+    env.update({key.upper(): str(value) for key, value in BASE.items()})
+    env["DATABASE_URL"] = database_url
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(
+        [sys.executable, "-m", "lifein", "--check"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=180,
+    )
+
+
+def _upgrade_to(engine, revision: str) -> None:
+    from alembic import command
+
+    url = engine.url.render_as_string(hide_password=False)
+    command.upgrade(schema_guard.alembic_config(url), revision)
+
+
 def _downgrade(engine, revision: str) -> None:
     from alembic import command
 
