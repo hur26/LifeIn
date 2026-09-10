@@ -44,7 +44,14 @@ class CalendarWriter(private val context: Context) {
         val values = ContentValues().apply {
             put(CalendarContract.Events.CALENDAR_ID, calendarId)
             put(CalendarContract.Events.TITLE, title)
-            put(CalendarContract.Events.DESCRIPTION, notes ?: FOOTER)
+            // **描述末尾一定要有那行标记**(见 stamped 的说明)。
+            // 原来是 `notes ?: FOOTER` —— 有 notes 的时候标记就没了,
+            // 而提取出来的日程基本都有 notes,于是那个印**几乎从不存在**
+            put(CalendarContract.Events.DESCRIPTION, stamped(notes))
+            // 这一列就是为"哪个 App 建的"设计的。它和上面那行标记
+            // **失效方式不重叠**:它在某些同步适配器和 ROM 上会被丢掉,
+            // 而描述跟着同步走
+            put(CalendarContract.Events.CUSTOM_APP_PACKAGE, context.packageName)
             put(CalendarContract.Events.DTSTART, start)
             put(CalendarContract.Events.DTEND, end)
             // 时区必填,而且要写设备的:不写的话某些 ROM 会按 UTC 摆,
@@ -67,6 +74,25 @@ class CalendarWriter(private val context: Context) {
         val id = eventId.toLongOrNull() ?: return false
         val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, id)
         return context.contentResolver.delete(uri, null, null) > 0
+    }
+
+    /**
+     * 这条事件还在不在。**删完之后才敢忘掉那条本地记录。**
+     *
+     * `delete()` 返回 false 有两种含义:用户自己删过了(目的已达成),
+     * 或者删失败了。分不清就忘掉本地记录的话,第二种情况会留下一条
+     * **对回环过滤不可见**的事件 —— 而那条会被一轮轮读回来。
+     */
+    fun exists(eventId: String): Boolean {
+        val id = eventId.toLongOrNull() ?: return false
+        val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, id)
+        return context.contentResolver.query(
+            uri,
+            arrayOf(CalendarContract.Events._ID, CalendarContract.Events.DELETED),
+            null,
+            null,
+            null,
+        )?.use { it.moveToFirst() && it.getInt(1) == 0 } ?: false
     }
 
     private fun pickCalendar(): Long? {
@@ -99,8 +125,25 @@ class CalendarWriter(private val context: Context) {
 
     private fun epoch(iso: String): Long = OffsetDateTime.parse(iso).toInstant().toEpochMilli()
 
-    private companion object {
-        const val DEFAULT_DURATION_MS = 60 * 60 * 1000L
+    companion object {
+        private const val DEFAULT_DURATION_MS = 60 * 60 * 1000L
+
+        /**
+         * 写在描述末尾的那行印。**回环过滤的第二层**(06 §6.14)。
+         *
+         * 它土,但它跟着同步走 —— `CUSTOM_APP_PACKAGE` 在某些同步适配器和
+         * ROM 上会被丢掉,而描述不会。两个印都留是因为失效方式不重叠,
+         * 而这道防线**丢一次就永久失效**:那条事件从此对过滤器不可见,
+         * 每一轮采集都会把它读回来、再提取、再写进日历。
+         */
         const val FOOTER = "由 LifeIn 写入"
+
+        /** 描述 + 那行印。`notes` 为空时只有印。 */
+        fun stamped(notes: String?): String =
+            if (notes.isNullOrBlank()) FOOTER else "$notes\n\n$FOOTER"
+
+        /** 这条事件是不是 LifeIn 自己写的。读日历时用(06 §6.14 第 2 层)。 */
+        fun looksSelfWritten(description: String?, customAppPackage: String?, ourPackage: String) =
+            customAppPackage == ourPackage || description?.trimEnd()?.endsWith(FOOTER) == true
     }
 }

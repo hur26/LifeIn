@@ -55,6 +55,7 @@ object CalendarReader {
         CalendarContract.Events.ORGANIZER,
         CalendarContract.Events.STATUS,
         CalendarContract.Events.DELETED,
+        CalendarContract.Events.CUSTOM_APP_PACKAGE,
     )
 
     /**
@@ -92,21 +93,29 @@ object CalendarReader {
             "${CalendarContract.Events.DTSTART} ASC",
         ) ?: return emptyList()
 
-        return cursor.use { rows -> collect(rows, owners, loopback) }
+        return cursor.use { rows -> collect(rows, owners, loopback, context.packageName) }
     }
 
     private fun collect(
         rows: Cursor,
         owners: Map<Long, Owner>,
         loopback: Set<String>,
+        ourPackage: String,
     ): List<CalendarEventBody> {
         val out = mutableListOf<CalendarEventBody>()
         while (rows.moveToNext() && out.size < MAX_EVENTS) {
             val localId = rows.getLong(0).toString()
 
-            // **回环:自己写进去的不能再读回来。**
-            // 漏了这一条,一条日程会指数级地繁殖(见 Loopback 的说明)
+            // **回环:自己写进去的不能再读回来。** 两层,而第二层不依赖本机状态。
+            //
+            // 第 1 层(本地表)在这些时候会丢:清除数据、恢复出厂、换手机重装、
+            // insert 成功之后写本地表之前进程被杀。而丢了的后果不是"少挡一次",
+            // 是**永久性的** —— 那条事件从此对过滤器不可见,每一轮都读回来、
+            // 再提取、再写进日历(06 §6.14)
             if (localId in loopback) continue
+            if (CalendarWriter.looksSelfWritten(rows.getString(4), rows.getString(11), ourPackage)) {
+                continue
+            }
             if (rows.getInt(10) != 0) continue // DELETED
 
             val calendarId = rows.getLong(2)

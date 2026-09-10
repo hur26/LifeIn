@@ -77,8 +77,16 @@ class CalendarSyncWorker(context: Context, params: WorkerParameters) :
 
         for (item in queue.toDelete) {
             try {
-                writer.delete(item.deviceRef)
-                links.forget(item.todoId)
+                // **删干净了才忘掉那条本地记录。**
+                // `delete()` 返回 false 有两种含义:用户自己删过了(目的已达成),
+                // 或者删失败了。不分清就 forget 的话,第二种情况会留下一条
+                // 对回环过滤不可见的事件 —— 而那条会被一轮轮读回来(06 §6.14)
+                val gone = writer.delete(item.deviceRef) || !writer.exists(item.deviceRef)
+                if (gone) {
+                    links.forget(item.todoId)
+                } else {
+                    Log.w(TAG, "日历事件删不掉,保留本地记录 todo=${item.todoId}")
+                }
                 api.reportCalendar(
                     CalendarReportBody(todoId = item.todoId, action = "deleted")
                 )
