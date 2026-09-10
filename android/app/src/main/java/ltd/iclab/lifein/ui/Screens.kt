@@ -12,6 +12,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -31,9 +32,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import ltd.iclab.lifein.LifeInApp
+import ltd.iclab.lifein.calendar.CalendarChoice
+import ltd.iclab.lifein.calendar.CalendarInfo
+import ltd.iclab.lifein.calendar.CalendarReader
 import ltd.iclab.lifein.net.CollectorStatus
 import ltd.iclab.lifein.net.PendingDto
 import ltd.iclab.lifein.net.TodoDto
+import ltd.iclab.lifein.work.Schedules
 import androidx.compose.material3.AlertDialog
 import ltd.iclab.lifein.net.CollectionStateDto
 
@@ -286,6 +292,72 @@ private fun TransactionEditor(
     }
 }
 
+/**
+ * 读哪几个日历(06 §6.14)。**默认一个都不读。**
+ *
+ * 手机上常有生日、节假日、订阅的球赛、公司全员会 —— 全读会把摘要淹掉,
+ * 而淹掉的摘要等于没有摘要。和上面那份放行来源是同一条思路(R10):
+ * 默认拒绝、用户显式放行、随时能改。
+ *
+ * **勾完立刻读一遍**,不等那两小时的周期任务:勾了却什么都不发生,
+ * 会让人以为这个开关没生效。
+ */
+@Composable
+private fun CalendarPicker() {
+    val context = LifeInApp.instance
+    var calendars by remember { mutableStateOf<List<CalendarInfo>?>(null) }
+    var chosen by remember { mutableStateOf(CalendarChoice.selected(context)) }
+
+    LaunchedEffect(Unit) {
+        calendars = runCatching { CalendarReader.list(context) }.getOrDefault(emptyList())
+    }
+
+    Text("读哪几个日历(默认一个都不读)", style = MaterialTheme.typography.titleSmall)
+
+    when {
+        calendars == null -> Text("正在看手机上有哪些日历…", style = MaterialTheme.typography.bodySmall)
+
+        calendars!!.isEmpty() -> Text(
+            "读不到任何日历 —— 多半是还没给日历权限,在上面那个按钮里给一下",
+            style = MaterialTheme.typography.bodySmall,
+        )
+
+        else -> {
+            if (chosen.isEmpty()) {
+                Text(
+                    "一个都没勾 —— 日程不会进摘要,也不会被提取成待办",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            calendars!!.forEach { calendar ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = calendar.id in chosen,
+                        onCheckedChange = { on ->
+                            chosen = if (on) chosen + calendar.id else chosen - calendar.id
+                            CalendarChoice.choose(context, chosen)
+                            // 勾完立刻读一遍 —— 见这个函数的说明
+                            Schedules.collectCalendarNow(context)
+                        },
+                    )
+                    Column {
+                        Text(calendar.name.ifBlank { "(没有名字)" })
+                        if (calendar.account.isNotBlank()) {
+                            Text(calendar.account, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+            Text(
+                "只读,不改。App 自己写进日历的那些日程不会被读回来 —— " +
+                    "否则一条日程会变成两条、四条。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+
 @Composable
 fun StatusScreen(
     repo: Repository,
@@ -330,6 +402,9 @@ fun StatusScreen(
                 Text("服务端认为这台已经掉线", color = MaterialTheme.colorScheme.error)
             }
         }
+
+        HorizontalDivider()
+        CalendarPicker()
 
         HorizontalDivider()
         Text("放行的来源(默认拒绝)", style = MaterialTheme.typography.titleSmall)

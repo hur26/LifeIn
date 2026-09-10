@@ -42,6 +42,19 @@ class LifeInApi(
         return json.decodeFromString(IngestResult.serializer(), text)
     }
 
+    /**
+     * 上报一批日程(06 §6.14)。**走采集凭据** —— 它和通知上报是同一条
+     * 「只能写」的路(铁律 12),日历里的东西同样不该用查询密钥去写。
+     */
+    fun uploadCalendar(events: List<CalendarEventBody>): CalendarUploadResult {
+        val body = json.encodeToString(
+            CalendarBatchBody.serializer(),
+            CalendarBatchBody(deviceId = enrollment.deviceId, events = events),
+        )
+        val text = signedPost(PATH_INGEST_CALENDAR, body, enrollment.collectorSecret)
+        return json.decodeFromString(CalendarUploadResult.serializer(), text)
+    }
+
     fun heartbeat(body: HeartbeatBody): HeartbeatResult {
         val payload = json.encodeToString(HeartbeatBody.serializer(), body)
         val text = signedPost(PATH_HEARTBEAT, payload, enrollment.collectorSecret)
@@ -349,6 +362,7 @@ class LifeInApi(
 
     companion object {
         const val PATH_INGEST = "/ingest/events"
+        const val PATH_INGEST_CALENDAR = "/ingest/calendar"
         const val PATH_HEARTBEAT = "/ingest/heartbeat"
         const val PATH_TOKEN = "/app/token"
         const val PATH_TODOS = "/app/todos"

@@ -103,6 +103,40 @@ data class NewTodoBody(
 @Serializable
 data class StatusBody(val status: String)
 
+/**
+ * 一条上报的日程(06 §6.14)。
+ *
+ * `selfOrganized` 由**这台手机**判:organizer 和日历的 OWNER_ACCOUNT 比,
+ * 而服务端不知道这台手机上哪个账户是本人 —— 它照用不重算。
+ */
+@Serializable
+data class CalendarEventBody(
+    @SerialName("event_id") val eventId: String,
+    val calendar: String? = null,
+    val title: String,
+    val description: String? = null,
+    val location: String? = null,
+    @SerialName("starts_at") val startsAt: String,
+    @SerialName("ends_at") val endsAt: String? = null,
+    val organizer: String? = null,
+    @SerialName("self_organized") val selfOrganized: Boolean = false,
+    val cancelled: Boolean = false,
+)
+
+@Serializable
+data class CalendarBatchBody(
+    @SerialName("device_id") val deviceId: String,
+    val events: List<CalendarEventBody>,
+)
+
+/** 服务端回的三个数。**unusable 不是丢弃** —— 那些照样入库,能修好重跑。 */
+@Serializable
+data class CalendarUploadResult(
+    val accepted: Int = 0,
+    val duplicates: Int = 0,
+    val unusable: Int = 0,
+)
+
 @Serializable
 data class PendingDto(
     val id: Long,

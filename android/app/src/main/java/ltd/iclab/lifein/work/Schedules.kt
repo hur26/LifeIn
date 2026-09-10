@@ -27,6 +27,7 @@ object Schedules {
     private const val HEARTBEAT = "lifein.heartbeat"
     private const val UPLOAD_SWEEP = "lifein.upload.sweep"
     private const val CALENDAR = "lifein.calendar.sync"
+    private const val CALENDAR_COLLECT = "lifein.calendar.collect"
 
     private val onNetwork = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -62,6 +63,29 @@ object Schedules {
             CALENDAR,
             ExistingPeriodicWorkPolicy.KEEP,
             PeriodicWorkRequestBuilder<CalendarSyncWorker>(30, TimeUnit.MINUTES)
+                .setConstraints(onNetwork)
+                .build(),
+        )
+
+        // 日历采集:把系统日历里的日程读出来报上去(06 §6.14,企微日程的替代)。
+        // **两小时一次,比别的都稀**:日程不像通知那样转瞬即逝 ——
+        // 它在日历里一直躺着,晚两小时读到不丢任何东西。
+        // 而每次读的是全窗口的几十条,频率高只会让服务端的去重键空转
+        manager.enqueueUniquePeriodicWork(
+            CALENDAR_COLLECT,
+            ExistingPeriodicWorkPolicy.KEEP,
+            PeriodicWorkRequestBuilder<CalendarCollectWorker>(2, TimeUnit.HOURS)
+                .setConstraints(onNetwork)
+                .build(),
+        )
+    }
+
+    /** 刚勾了日历 —— 别等两小时,现在就读一遍。 */
+    fun collectCalendarNow(context: Context) {
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            "lifein.calendar.collect.now",
+            ExistingWorkPolicy.REPLACE,
+            OneTimeWorkRequestBuilder<CalendarCollectWorker>()
                 .setConstraints(onNetwork)
                 .build(),
         )

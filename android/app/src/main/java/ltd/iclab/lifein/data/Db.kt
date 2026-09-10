@@ -141,6 +141,15 @@ interface CalendarLinkDao {
 
     @Query("DELETE FROM calendar_links WHERE todoId = :todoId")
     suspend fun forget(todoId: String)
+
+    /**
+     * App 自己写进系统日历的那些事件 id。**日历采集靠它挡回环**(06 §6.14)。
+     *
+     * 漏了这一条,一条日程会指数级地繁殖:提取 → todo → 写进日历 →
+     * 被读回来 → 再提取 → …… 而每一轮都长得像真的。
+     */
+    @Query("SELECT eventId FROM calendar_links")
+    suspend fun writtenEventIds(): List<String>
 }
 
 @Database(
