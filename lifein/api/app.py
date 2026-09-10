@@ -6,6 +6,11 @@
 | --- | --- | --- |
 | `/ingest/*` | 手机上的采集器 | 设备密钥签名,**只能写** |
 | `/app/*` | 手机上的界面 | 长期设备凭据换来的短期 token |
+| `/console/*` | 浏览器里的本人 | App 发出的一次性链接换来的 cookie |
+| `/admin/*` | 浏览器里的运营者 | 口令换来的签名 cookie(ADR-029) |
+
+**后两组的错误响应是页面,不是 401。** 前两组对着的是程序,不告诉探测者
+他哪一步错了;后两组对着的是人,而一张白屏会让他以为自己做错了什么。
 
 **错误响应一律不带原因。** 企微回调回 400、App 那两组回 401,
 里面写的是空的 —— 具体是签名不对还是时间戳过期只进日志。
@@ -23,7 +28,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, status
 
-from lifein.api import console, enroll, ingest, query
+from lifein.api import admin_console, console, enroll, ingest, query
 from lifein.api.deps import AuthRejected
 from lifein.bootstrap import Services, build_services
 from lifein.db import session_scope
@@ -76,6 +81,7 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     )
     app.state.services = resolved
     app.include_router(console.router)
+    app.include_router(admin_console.router)
     app.include_router(enroll.router)
     app.include_router(ingest.router)
     app.include_router(query.router)

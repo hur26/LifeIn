@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -79,6 +80,30 @@ STALE_RUNNING_AFTER = timedelta(hours=6)
 **这台是单进程自托管**(ADR-016),不存在"另一个副本还在跑"的情况;
 真有并发时重跑也只是撞上下游的幂等键。
 """
+
+@dataclass(frozen=True)
+class Run:
+    """一次运行的元信息。**不带 `stats`** —— 那一列里是当次的产物
+    (摘要评语、月报数字),而运维页要回答的是"跑没跑成、跑了几次"。
+
+    把 `stats` 一起读出来的代价是运维页每翻一次就把几十份 JSON 拖进内存,
+    而它们一个字都不会被显示。
+    """
+
+    id: int
+    job_name: str
+    window_start: datetime
+    window_end: datetime
+    status: str
+    started_at: datetime
+    finished_at: datetime | None
+    error: str | None
+    attempts: int
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
 
 _CLAIM = text("""
     INSERT INTO job_runs
@@ -254,6 +279,38 @@ def stats_for(
         _STATS_FOR, {"user_id": user_id, "job_name": job_name, "period": period}
     ).first()
     return dict(row.stats) if row and row.stats else None
+
+
+def recent(user_id: str, session: Session, *, limit: int = 20) -> list[Run]:
+    """最近几次运行,不管成没成。**运营台的运维页读它。**
+
+    按 `started_at` 倒序而不是按窗口倒序:要回答的是"刚才那一轮怎么样",
+    而补跑一个三天前的窗口正是最该被看见的那种运行 —— 按窗口排的话
+    它会沉到列表底下去。
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, job_name, window_start, window_end, status, started_at,"
+            " finished_at, error, attempts"
+            "  FROM job_runs WHERE user_id = :user_id"
+            " ORDER BY started_at DESC LIMIT :limit"
+        ),
+        {"user_id": user_id, "limit": limit},
+    ).all()
+    return [
+        Run(
+            id=row.id,
+            job_name=row.job_name,
+            window_start=row.window_start,
+            window_end=row.window_end,
+            status=row.status,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            error=row.error,
+            attempts=row.attempts,
+        )
+        for row in rows
+    ]
 
 
 def last_successful_window_end(user_id: str, session: Session, *, job_name: str) -> datetime | None:
