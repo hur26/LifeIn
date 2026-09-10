@@ -190,3 +190,47 @@ def test_repeated_failures_give_up_and_alert(pg_session, configured_user):
     )
     assert poller.calls == weixin_inbox.MAX_CONSECUTIVE_FAILURES
     assert alerter.alerts[0][0] == "微信入站连续失败"
+
+
+def test_a_second_poller_exits_instead_of_stealing_messages(pg_session, configured_user):
+    """**一个 iLink token 同时只能有一个长轮询。**
+
+    两个客户端一起拉会互相抢消息 —— 表现是"消息一会儿到一会儿不到",
+    而两边的日志各自看起来都正常。在这条租约之前,那个危险只写在
+    `weixin_inbound.py` 的注释里:写着,但没挡着。
+
+    这里让别人先占住租约,再启动这一个 —— 它该立刻退出,一次都不拉。
+    """
+    from datetime import timedelta
+
+    from lifein.jobs.weixin_inbox import LEASE_KEY
+    from lifein.repos import channel_state
+
+    user_id, settings = configured_user
+    channel_state.claim_lease(
+        user_id,
+        pg_session,
+        channel="weixin",
+        key=LEASE_KEY,
+        owner="另一个进程",
+        ttl=timedelta(minutes=3),
+    )
+
+    alerter, poller = run(pg_session, user_id, settings, [])
+
+    assert poller.calls == 0, "租约在别人手上时一次都不该拉"
+    # **不告警。** 这不是故障 —— 多半是刚重启,旧进程还没退干净,
+    # 而一条会自己好的告警只会让人慢慢学会忽略告警
+    assert alerter.alerts == []
+
+
+def test_the_holder_keeps_polling_across_rounds(pg_session, configured_user):
+    """**每一轮都要续租。** 不续的话租约会过期,而那时另一个进程会
+    合法地接手 —— 于是两个一起拉。"""
+    user_id, settings = configured_user
+
+    rounds = [PollResult(messages=[], sync_buf=f"buf-{i}", context_tokens={}) for i in range(3)]
+    _alerter, poller = run(pg_session, user_id, settings, rounds)
+
+    # 三轮脚本 + 最后一轮空转(它负责置停止位)
+    assert poller.calls == 4

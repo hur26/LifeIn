@@ -18,11 +18,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -36,6 +39,19 @@ log = logging.getLogger(__name__)
 
 BACKOFF_S = 5.0
 MAX_CONSECUTIVE_FAILURES = 5
+
+LEASE_KEY = "inbox_lease"
+LEASE_TTL_S = 180.0
+"""租约多久算死。
+
+**一个 iLink token 同时只能有一个长轮询** —— 两个客户端一起拉会互相抢消息,
+表现是"消息一会儿到一会儿不到",而两边的日志各自看起来都正常。这在一台
+机器上同时跑着开发进程和正式服务时会真发生,而**那时你会以为是 iLink 在丢消息**。
+
+三分钟不是拍的:一轮长轮询最多挂 35 秒,加上处理消息的时间,正常的一轮
+远短于三分钟。而进程被 kill 之后,下一个实例最多等三分钟就能接手 ——
+那三分钟里消息不会丢,长轮询的游标记着位置。
+"""
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
@@ -66,11 +82,27 @@ def run_inbox(
     token = stored["token"]
     active = poller or weixin_inbound.WeixinPoller()
     failures = 0
+    # 这一轮循环的身份。**每次启动都是新的** —— 进程重启之后它拿不回旧租约,
+    # 只能等那条过期,而那正是要的:旧进程可能还活着
+    owner = f"{socket.gethostname()}/{os.getpid()}/{uuid.uuid4().hex[:8]}"
 
-    log.info("微信入站循环已启动,user=%s", user_id)
+    log.info("微信入站循环已启动,user=%s owner=%s", user_id, owner)
 
     while not stop.is_set():
         with session_factory() as session:
+            # **每一轮都续一次租约。** 抢不到就退出 —— 另一个进程正拿着它,
+            # 而两个一起拉会互相抢消息(见 LEASE_TTL_S)
+            if not channel_state.claim_lease(
+                user_id,
+                session,
+                channel=weixin_inbound.CHANNEL,
+                key=LEASE_KEY,
+                owner=owner,
+                ttl=timedelta(seconds=LEASE_TTL_S),
+            ):
+                log.warning("微信入站租约被别人拿着,退出。user=%s owner=%s", user_id, owner)
+                return
+
             sync_buf = (
                 channel_state.get_state(
                     user_id,
@@ -87,7 +119,7 @@ def run_inbox(
             # 停下来。继续轮询一个死掉的会话看起来和"一切正常"没有区别
             services.alerter.alert(
                 "微信会话已过期",
-                f"入站已停止,推送会降级到企微。重新扫码:"
+                f"入站已停止,推送会降级到邮件。重新扫码:"
                 f"python -m lifein.admin login-weixin --user {user_id}({exc})",
             )
             return

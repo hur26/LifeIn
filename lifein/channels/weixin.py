@@ -19,6 +19,7 @@ import base64
 import json
 import logging
 import secrets
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,7 +45,25 @@ SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2
 
 MAX_TEXT_CHARS = 4000
-"""单条消息上限。超了截断 —— 每天一条摘要,丢一条就是那天什么都没有。"""
+"""iLink 单条消息的上限。**这是协议给的,不是我们挑的。**"""
+
+MAX_CHUNKS = 5
+"""超长的最多切成几条。
+
+**切而不是截断**是后补的:原来超过 4000 字直接砍掉后半段,而砍掉的
+恰恰是月度报告里按类目列的那些数字 —— 报告的开头是套话,结尾才是内容。
+
+但也不能无限切:一条卡片变成二十条消息,在聊天窗口里就是刷屏,
+而**刷屏比截断更让人想关掉推送**。五条之后仍然放不下的,那条截断提示
+就是诚实的说法。
+"""
+
+CHUNK_GAP_S = 0.3
+"""两条之间隔多久。
+
+连着发会撞 iLink 的限频(`errcode=-2`),而限频丢掉的是**后面那几条** ——
+表现是"摘要只发了一半",和截断长得一模一样却更难查。
+"""
 
 TRUNCATION_NOTE = "\n\n…(内容过长已截断)"
 
@@ -81,17 +100,38 @@ class WeixinChannel:
         *,
         load_session: Callable[[str], WeixinSession | None],
         client: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         # 会话按用户取:P0 只有一个人,但通道不该知道这件事
         self._load_session = load_session
         self._http = client or httpx.Client(timeout=15.0)
+        # 注入是为了测:分块之间要等 0.3 秒,而没有人愿意为了跑一次用例真等
+        self._sleep = sleep
 
     def send(self, user_id: str, card: Card) -> Delivery:
         session = self._load_session(user_id)
         if session is None:
             raise WeixinError(f"用户 {user_id} 没有可用的微信会话,先跑 admin set-weixin")
 
-        text, truncated = render_text(card)
+        chunks = split(render_text(card))
+
+        # **中途失败就抛。** 前几条已经出去了,而调用方会降级到邮件重发整份 ——
+        # 于是用户在微信里看到半份、在邮箱里看到整份。那是有意的:
+        # 半份加整份仍然是"收到了",而吞掉异常只会让他收到半份还以为是全部
+        delivery: Delivery | None = None
+        for index, chunk in enumerate(chunks):
+            if index:
+                self._sleep(CHUNK_GAP_S)
+            delivery = self._send_one(session, chunk)
+
+        assert delivery is not None  # split 至少返回一条
+        return Delivery(
+            channel=delivery.channel,
+            delivery_id=delivery.delivery_id,
+            truncated=chunks[-1].endswith(TRUNCATION_NOTE),
+        )
+
+    def _send_one(self, session: WeixinSession, text: str) -> Delivery:
         payload = self._build_payload(session, text)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -114,7 +154,6 @@ class WeixinChannel:
         return Delivery(
             channel=self.name,
             delivery_id=str(data.get("msgid") or payload["msg"]["client_id"]),
-            truncated=truncated,
         )
 
     @staticmethod
@@ -133,8 +172,8 @@ class WeixinChannel:
         return {"msg": message, "base_info": {"channel_version": CHANNEL_VERSION}}
 
 
-def render_text(card: Card) -> tuple[str, bool]:
-    """把通道中立的 Card 渲染成纯文本。返回(内容, 是否截断)。
+def render_text(card: Card) -> str:
+    """把通道中立的 Card 渲染成纯文本。**不切,不截断** —— 那是 `split` 的事。
 
     **不用 markdown。** 微信聊天窗口不渲染它,写 `**加粗**` 就是原样显示两个
     星号 —— 这是它和企微通道最大的区别,两边渲染各写各的正是 `Card` 中立的意义。
@@ -156,10 +195,60 @@ def render_text(card: Card) -> tuple[str, bool]:
     if card.footer:
         blocks.append(f"—— {card.footer}")
 
-    text = "\n\n".join(blocks).strip() or "(空)"
-    if len(text) <= MAX_TEXT_CHARS:
-        return text, False
-    return text[: MAX_TEXT_CHARS - len(TRUNCATION_NOTE)] + TRUNCATION_NOTE, True
+    return "\n\n".join(blocks).strip() or "(空)"
+
+
+def split(text: str, *, limit: int = MAX_TEXT_CHARS, max_chunks: int = MAX_CHUNKS) -> list[str]:
+    """把一段文本切成能发出去的几条。**在语义边界上切。**
+
+    三级边界,一级切不开才往下走:段(`\n\n`)→ 行(`\n`)→ 硬切。
+    直接按字数硬切的话,一句话会断在半路,而一张按类目列数字的报告
+    会被切得两边都读不懂。
+
+    切到 `max_chunks` 还放不下的,最后一条末尾挂截断提示 ——
+    **那时它是诚实的**:确实放不下了,而不是"懒得切"。
+
+    多于一条时每条前面加 `(i/n)`:三条消息接连进来,不标的话看起来像
+    推了三次,而**"它今天推了三次"是最容易让人关掉推送的印象**。
+    """
+    if len(text) <= limit:
+        return [text]
+
+    # 预留编号的位置。`(10/10)\n` 是最长的那种,按它算
+    marker = len("(10/10)\n")
+    room = limit - marker
+
+    chunks: list[str] = []
+    for piece in _pieces(text, room):
+        if chunks and len(chunks[-1]) + 2 + len(piece) <= room:
+            chunks[-1] = f"{chunks[-1]}\n\n{piece}"
+        else:
+            chunks.append(piece)
+
+    if len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks]
+        tail = chunks[-1][: room - len(TRUNCATION_NOTE)]
+        chunks[-1] = tail + TRUNCATION_NOTE
+
+    if len(chunks) == 1:
+        return chunks
+    return [f"({i}/{len(chunks)})\n{chunk}" for i, chunk in enumerate(chunks, start=1)]
+
+
+def _pieces(text: str, room: int) -> list[str]:
+    """按段拆,放不下的按行拆,还放不下的硬切。"""
+    out: list[str] = []
+    for block in text.split("\n\n"):
+        if len(block) <= room:
+            out.append(block)
+            continue
+        for line in block.split("\n"):
+            if len(line) <= room:
+                out.append(line)
+                continue
+            # 一行就超了(比如一段没有换行的长正文)。**只有这里才硬切**
+            out.extend(line[i : i + room] for i in range(0, len(line), room))
+    return [piece for piece in out if piece]
 
 
 def build_headers(token: str, body: str) -> dict[str, str]:
