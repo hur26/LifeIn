@@ -53,6 +53,10 @@ import ltd.iclab.lifein.ui.theme.LifeInTheme
  * 配好之后五个页签,对应五个问题:今天要干什么、有什么等我点头、
  * 钱花到哪儿了、它记住了什么(以及记错了没有)、这套东西还活着吗。
  *
+ * 最后一页叫「状态」而不是「我的」:**docs 里九处都叫它状态页**
+ * (08 §部署验收、09 §5 那张表),而一个在文档里叫 A、在界面上叫 B 的东西,
+ * 会让照着文档做的人以为自己找错了地方。
+ *
  * ## 底部导航,不是顶部页签
  *
  * 原来是 `TabRow`。换掉它的理由有两条,第二条是决定性的:
@@ -139,7 +143,7 @@ private enum class Section(val label: String, val icon: ImageVector) {
     Pending("待确认", Icons.Default.Notifications),
     Ledger("账本", Icons.Default.ShoppingCart),
     Memory("记忆", Icons.Default.Star),
-    Status("我的", Icons.Default.Settings),
+    Status("状态", Icons.Default.Settings),
 }
 
 @Composable

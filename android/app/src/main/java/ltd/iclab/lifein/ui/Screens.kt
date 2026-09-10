@@ -70,7 +70,7 @@ import ltd.iclab.lifein.ui.theme.Tone
 import ltd.iclab.lifein.work.Schedules
 
 /**
- * 三个页面:今天、待确认、我的。
+ * 三个页面:今天、待确认、状态。
  *
  * 界面要回答三个问题:**今天要干什么、有什么等我点头、这套东西还活着吗**。
  * 每一页的顶栏上都有一个刷新键 —— 这个 App 不接收推送(ADR-014),
@@ -516,7 +516,13 @@ fun StatusScreen(
     LaunchedEffect(Unit) { refresh() }
 
     Scaffold(
-        topBar = { ScreenBar("我的", onRefresh = { scope.launch { refresh() } }) },
+        topBar = {
+            ScreenBar(
+                title = "状态",
+                subtitle = "这套东西还活着吗,以及你想少采一点的时候",
+                onRefresh = { scope.launch { refresh() } },
+            )
+        },
         containerColor = MaterialTheme.colorScheme.background,
     ) { insets ->
         Column(
