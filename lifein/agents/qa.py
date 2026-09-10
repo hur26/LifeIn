@@ -336,8 +336,9 @@ def plan_action(question: str, *, llm: LLMClient) -> ActionResult:
         # 触发 —— 接口全在,没有调用方(ADR-025)。
         # 提议由 `plan_action` 产生,那次调用看不到任何外部素材
         "message.send",
-        # 账本(P2)。**只读** —— 对话式的改账要多一次点头,走待确认那条路,
-        # 因为"把昨天星巴克那笔改成餐饮"多了一次可能理解错的机会
+        # 账本(P2)。**只读,改账在 App 里做**(ADR-028)。
+        # 决定性的那条理由是指代不准:"昨天那笔""刚才星巴克那笔"在同额同商户时
+        # 是歧义的,而消歧要来回问两轮 —— 那时候不如打开 App 点一下
         "ledger.query",
         "ledger.spending",
     ],

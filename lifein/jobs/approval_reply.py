@@ -13,7 +13,11 @@
 - 平时收到的是微信里一段文字,上面没有按钮
 - 要批准得先切到企微去找那张卡片
 
-而回一句"同意 12"在**每一条通道上都成立** —— 微信、企微、甚至邮件回信。
+而回一句"同意 12"在**每一条通道上都成立** —— 微信、邮件回信都行。
+
+**这不再是一个取舍,是唯一解**(ADR-027):企微整个退出了(ADR-026),
+而 iLink 协议里根本没有交互卡片 —— `item_type` 只有文本、图片、语音、
+文件、视频五种,不存在"点一下产生一个结构化事件"这种东西。
 按钮那条路以后要加也加得上(卡片的 `EventKey` 里放同一个 id),
 但它不该是唯一的一条。
 
@@ -111,8 +115,16 @@ def _decide(
             card=Card(title="没有这一条", summary=f"#{approval_id} 找不到,或者已经不在了"),
         )
 
-    action = approvals.approve if approve else approvals.reject
-    after = action(user_id, session, approval_id=approval_id, now=now)
+    if approve:
+        after = approvals.approve(user_id, session, approval_id=approval_id, now=now)
+        cancelled = False
+    else:
+        after = approvals.reject(user_id, session, approval_id=approval_id, now=now)
+        # 还没点过同意的走上面那条;**已经同意过的在这里撤回**(ADR-027)——
+        # 打错数字之后这是唯一的补救,而它只在执行还没认领时有效
+        cancelled = after is None
+        if cancelled:
+            after = approvals.cancel(user_id, session, approval_id=approval_id, now=now)
 
     if after is None:
         # 没改动。两种原因,**说错了会让人以为自己点漏了**:
@@ -157,8 +169,13 @@ def _decide(
     return ApprovalReply(
         handled=True,
         approval_id=approval_id,
-        action="rejected",
-        card=Card(title="那就算了", summary=after.preview_text),
+        action="cancelled" if cancelled else "rejected",
+        card=Card(
+            # 两句话要分开:"撤回了"隐含着"刚才差点发出去",
+            # 而那正是他需要知道的 —— 他多半是打错了数字
+            title="撤回了,没发出去" if cancelled else "那就算了",
+            summary=after.preview_text,
+        ),
     )
 
 
@@ -169,11 +186,16 @@ def _already(item: Approval) -> str:
 def _already_text(status: str) -> str:
     return {
         "approved": "已经同意过了,正在做",
+        # **这一档最要紧的是"撤不回来了"。** 执行已经认领,消息可能在路上,
+        # 而"以为撤回了、其实发出去了"比"撤不回来"糟得多(ADR-027)
+        "executing": "正在做,已经撤不回来了 —— 做完会再说一声",
         "executed": "已经做完了",
         "rejected": "之前拒绝过",
         "expired": "过期了 —— 超过 24 小时的审批不再生效,免得发出去的东西不合时宜",
         "failed": "做的时候出错了,没有重试",
     }.get(status, f"当前状态:{status}")
+    # 兜底那句会露出状态机的内部名字。**留着是有意的** —— 它只在有人加了
+    # 新状态却忘了写人话时出现,而那时"看起来像 bug"正是要的效果
 
 
 def _queue_card(session: Session, user_id: str, *, now: datetime) -> Card:

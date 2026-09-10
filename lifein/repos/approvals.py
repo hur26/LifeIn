@@ -298,6 +298,31 @@ def reject(user_id: str, session: Session, *, approval_id: int, now: datetime) -
     )
 
 
+def cancel(user_id: str, session: Session, *, approval_id: int, now: datetime) -> Approval | None:
+    """同意完又反悔。**只要执行还没认领,就还撤得回来。**
+
+    这是文字审批那条路上唯一的补救(ADR-027):`同意 12` 敲成 `同意 21` 会
+    同意另外一条,而确认卡片会把内容原样回显 —— 他那一刻就看得见。
+    在这个函数之前,看得见也停不下来:`rejected` 只能从 `pending` 来,
+    他只会收到一句"已经同意过了,正在做"。
+
+    **和执行认领争同一行。** 两条都带 `WHERE status = 'approved'`,
+    所以恰好一个会赢:要么执行开始了(返回 None,如实告诉他撤不回来了),
+    要么撤回成功(那时一个字都没发出去)。
+
+    **认领之后不给撤。** 那时消息可能已经在路上,而"以为撤回了、其实发出去了"
+    比"撤不回来"糟得多 —— 后者他还知道要去补救。
+    """
+    return _transition(
+        user_id,
+        session,
+        approval_id=approval_id,
+        from_status=ApprovalStatus.APPROVED,
+        to_status=ApprovalStatus.REJECTED,
+        now=now,
+    )
+
+
 def mark_executed(
     user_id: str,
     session: Session,

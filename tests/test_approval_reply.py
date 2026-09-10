@@ -61,17 +61,55 @@ class TestOnlyOnce:
             user_id, pg_session, approval_id=item.id
         ).status is ApprovalStatus.APPROVED
 
-    def test_rejecting_after_approving_does_nothing(self, pg_session, user_id):
-        """改主意要在点之前 —— 点完再说"算了"改不动,而**这一点要说出来**,
-        否则用户会以为拒绝生效了。"""
+    def test_rejecting_after_approving_takes_it_back(self, pg_session, user_id):
+        """**同意完又反悔,只要执行还没认领就撤得回来**(ADR-027)。
+
+        这一条原来是反的:`rejected` 只能从 `pending` 来,于是他收到的是
+        "已经同意过了,正在做"。而文字审批最真实的风险恰恰是**打错数字** ——
+        "同意 12" 敲成 "同意 21" 会同意另外一条,确认卡片会把内容原样回显,
+        他那一刻就看得见,却停不下来。
+        """
         item = a_pending(pg_session, user_id)
         reply(pg_session, user_id, f"同意 {item.id}")
 
         after = reply(pg_session, user_id, f"拒绝 {item.id}")
-        assert "已经同意过了" in after.card.summary
+
+        assert after.action == "cancelled"
+        # **"撤回了"和"那就算了"是两句话。** 前者隐含"刚才差点发出去",
+        # 而那正是他需要知道的 —— 他多半是打错了数字
+        assert "撤回" in after.card.title
         assert approvals.get(
             user_id, pg_session, approval_id=item.id
-        ).status is ApprovalStatus.APPROVED
+        ).status is ApprovalStatus.REJECTED
+
+    def test_it_cannot_be_taken_back_once_execution_claimed_it(self, pg_session, user_id):
+        """**认领之后不给撤。**
+
+        那时消息可能已经在路上,而"以为撤回了、其实发出去了"比"撤不回来"
+        糟得多 —— 后者他还知道要去补救。
+        """
+        item = a_pending(pg_session, user_id)
+        reply(pg_session, user_id, f"同意 {item.id}")
+        approvals.claim_for_execution(user_id, pg_session, approval_id=item.id, now=NOW)
+
+        after = reply(pg_session, user_id, f"拒绝 {item.id}")
+
+        assert after.action is None
+        assert "正在做" in after.card.summary
+        assert approvals.get(
+            user_id, pg_session, approval_id=item.id
+        ).status is ApprovalStatus.EXECUTING
+
+    def test_cancelling_twice_is_not_an_error(self, pg_session, user_id):
+        """撤回之后再说一次"算了"。**两个入口同时点是正常的用户行为。**"""
+        item = a_pending(pg_session, user_id)
+        reply(pg_session, user_id, f"同意 {item.id}")
+        reply(pg_session, user_id, f"拒绝 {item.id}")
+
+        again = reply(pg_session, user_id, f"拒绝 {item.id}")
+
+        assert again.action is None
+        assert "之前拒绝过" in again.card.summary
 
     def test_approving_does_not_execute(self, pg_session, user_id):
         """**回调里不执行。** 回调有超时,而超时重投会再执行一次。
