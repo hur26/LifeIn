@@ -80,13 +80,11 @@ class NotificationCollector : NotificationListenerService() {
         if (title.isBlank() && text.isBlank()) return null
 
         val sender = smsSenderOf(sbn, title)
-        if (sender != null) {
-            // **一次性诊断,答完就删**(SenderProbe 的注释里写着要回答什么)。
-            // 只对默认短信应用、只打形状不打内容、只在 debug 包里跑
-            SenderProbe.report(this, notification)
-        }
+        // **签名在正文里,而银行按它匹配**(ADR-034)。算出来只用于这一次判断,
+        // 不进队列也不上报 —— 服务端会从它收到的正文里自己再抠一次
+        val signature = SmsSignature.of(text)
 
-        if (!Whitelist.load(applicationContext).allows(sbn.packageName, sender)) {
+        if (!Whitelist.load(applicationContext).allows(sbn.packageName, sender, signature)) {
             return null
         }
 

@@ -25,17 +25,24 @@ data class WhitelistRule(
     val purpose: String,
     val enabled: Boolean = true,
 ) {
-    fun matches(packageName: String?, sender: String?): Boolean = when (matchType) {
-        // 包名全等:前缀匹配会让 com.tencent.mm 顺带放行 com.tencent.mm.fake
-        MATCH_PACKAGE -> !packageName.isNullOrBlank() && packageName == pattern
-        // 短信发件人前缀:银行短信的号码是号段,写死全等每换一个通道就漏一批
-        MATCH_SMS_SENDER -> !sender.isNullOrBlank() && sender.startsWith(pattern)
-        else -> false
-    }
+    fun matches(packageName: String?, sender: String?, signature: String?): Boolean =
+        when (matchType) {
+            // 包名全等:前缀匹配会让 com.tencent.mm 顺带放行 com.tencent.mm.fake
+            MATCH_PACKAGE -> !packageName.isNullOrBlank() && packageName == pattern
+            // 签名前缀:同一家机构有多个签名(招商银行 / 招商银行信用卡),
+            // 而预设给的是完整机构名。少放一个是那家银行整月不入账,
+            // 而账本上看不出少了什么(ADR-034)
+            MATCH_SMS_SIGNATURE -> !signature.isNullOrBlank() && signature.startsWith(pattern)
+            // **不推荐**:它匹配的是通知上显示的发件人,而那个值有时是号码
+            // 有时是显示名。留着只为历史行(ADR-034)
+            MATCH_SMS_SENDER -> !sender.isNullOrBlank() && sender.startsWith(pattern)
+            else -> false
+        }
 
     companion object {
         const val MATCH_PACKAGE = "package_name"
         const val MATCH_SMS_SENDER = "sms_sender"
+        const val MATCH_SMS_SIGNATURE = "sms_signature"
         const val PURPOSE_MESSAGE = "message"
         const val PURPOSE_TRANSACTION = "transaction"
     }
@@ -57,11 +64,11 @@ class Whitelist(private val rules: List<WhitelistRule>) {
      * **关闸门仍然只在服务端一处。** 03 的退出条件("出现错记就停下来")
      * 要的是立刻停,而改这里要重新发版。
      */
-    fun allows(packageName: String?, sender: String?): Boolean =
+    fun allows(packageName: String?, sender: String?, signature: String?): Boolean =
         rules.any {
             it.enabled &&
                 it.purpose in OPEN_PURPOSES &&
-                it.matches(packageName, sender)
+                it.matches(packageName, sender, signature)
         }
 
     companion object {
