@@ -196,18 +196,46 @@ class TestVerificationCodePattern:
 class TestTheP2Presets:
     """P2 建议放行的那些来源。**它们只是建议,加了才生效** —— 默认拒绝不变。"""
 
-    def test_bank_numbers_are_prefixes(self):
-        """**95555 是主号,银行实际发短信用的是 955550、9555501……**
-        全等匹配会漏掉绝大多数,而这种漏是静默的。"""
-        from lifein.repos.collector import MATCH_SMS_SENDER
+    def test_banks_are_matched_by_signature(self):
+        """**银行按短信签名匹配,不按号码**(ADR-034)。
+
+        这条用例以前断言的是号段前缀,而 2026-09-11 的三条真实短信把那个
+        设计整个证伪了 —— 下面 `TestTheRealSms` 里放着那三条的形状。
+        """
+        from lifein.repos.collector import MATCH_SMS_SIGNATURE
         from lifein.sources import bank_sources
 
-        assert all(item.match_type == MATCH_SMS_SENDER for item in bank_sources.BANK_SMS)
+        assert all(item.match_type == MATCH_SMS_SIGNATURE for item in bank_sources.BANK_SMS)
+
+    def test_signature_prefix_covers_the_variants(self):
+        """同一家机构有多个签名(`招商银行` / `招商银行信用卡`)。
+
+        这里的不对称照抄 `bank_sources.py`:多放一个最多是几条营销短信,
+        **少放一个是那家银行整月不入账,而账本上看不出少了什么**。
+        """
+        from lifein.repos.collector import MATCH_SMS_SIGNATURE
+
         result = screen(
-            [item(sender="9555501", text="消费人民币38.50元", source_app=None)],
-            rules=[rule("95555", match_type=MATCH_SMS_SENDER, purpose="transaction")],
+            [
+                item(
+                    sender="10693495555",
+                    text="【招商银行信用卡】消费人民币38.50元",
+                    source_app=None,
+                )
+            ],
+            rules=[rule("招商银行", match_type=MATCH_SMS_SIGNATURE, purpose="transaction")],
         )
         assert len(result.events) == 1
+
+    def test_a_different_bank_is_not_let_through(self):
+        """前缀匹配的是完整机构名,不该顺带放行别人。"""
+        from lifein.repos.collector import MATCH_SMS_SIGNATURE
+
+        result = screen(
+            [item(sender="10690000", text="【建设银行】消费人民币38.50元", source_app=None)],
+            rules=[rule("招商银行", match_type=MATCH_SMS_SIGNATURE, purpose="transaction")],
+        )
+        assert result.events == []
 
     def test_package_names_are_exact(self):
         """包名是精确的。前缀会误伤 —— `com.icbc` 会连上 `com.icbcxxx`,
@@ -224,9 +252,10 @@ class TestTheP2Presets:
         assert all(item.purpose == PURPOSE_TRANSACTION for item in bank_sources.ALL)
         assert all(item.phase == "P2" for item in bank_sources.ALL)
 
-    def test_presets_are_findable_by_name_or_number(self):
+    def test_presets_are_findable_by_name(self):
         from lifein.sources import bank_sources
 
-        assert [i.pattern for i in bank_sources.by_label("招商")] == ["95555", "cmb.pb"]
-        assert [i.label for i in bank_sources.by_label("95533")] == ["建设银行"]
+        # 一次找到短信那条和 App 那条 —— `allow-source --preset 招商` 要的就是这个
+        assert [i.pattern for i in bank_sources.by_label("招商")] == ["招商银行", "cmb.pb"]
+        assert [i.label for i in bank_sources.by_label("建设银行")] == ["建设银行", "建设银行 App"]
         assert bank_sources.by_label("没有这家") == []

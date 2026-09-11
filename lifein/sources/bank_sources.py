@@ -9,10 +9,20 @@
 多放一个进来最多是几条营销短信(会被第 3 层判成 marketing 丢掉);
 少放一个则是那家银行的消费一整个月都不入账,而账本上看不出少了什么。
 
-## 银行短信是号段前缀匹配,不是全等
+## 银行短信按**短信签名**匹配,不按号码
 
-95555、95588 这些是主号,但银行实际发短信用的是它们的扩展号
-(955550、9555501……)。全等匹配会漏掉绝大多数,而这种漏是**静默的**。
+原来这里是 14 条号段(95555、95588……),按发件号码前缀匹配。
+**2026-09-11 的三条真实短信证明那条路根本走不通**(ADR-034):
+
+- 通知标题有时是显示名(`招商银行`)有时是网关号码(`10693495555`)
+- 真实号码走 1069 的 SP 网关,**`95555` 在里面是子串不是前缀**
+
+所以就算每次都拿得到号码,前缀这个假设本身也是错的。现在按正文开头
+`【机构名】` 那个签名匹配 —— 它由发信方写进内容,两件事都不影响它。
+
+**下面这些签名里,只有「招商银行」是对着真实短信验过的。** 其余是按惯例
+写的,收到那家银行的第一条真实短信时要回来核一遍 ——
+这份清单的价值全在于它对得上真实世界,而不在于它看起来完整。
 
 ## 这里没有微信和支付宝的"消息"
 
@@ -33,7 +43,7 @@ from dataclasses import dataclass
 
 from lifein.repos.collector import (
     MATCH_PACKAGE,
-    MATCH_SMS_SENDER,
+    MATCH_SMS_SIGNATURE,
     PURPOSE_TRANSACTION,
 )
 
@@ -50,22 +60,23 @@ class Suggested:
 
 
 BANK_SMS: tuple[Suggested, ...] = (
-    Suggested(MATCH_SMS_SENDER, "95555", "招商银行"),
-    Suggested(MATCH_SMS_SENDER, "95533", "建设银行"),
-    Suggested(MATCH_SMS_SENDER, "95588", "工商银行"),
-    Suggested(MATCH_SMS_SENDER, "95599", "农业银行"),
-    Suggested(MATCH_SMS_SENDER, "95566", "中国银行"),
-    Suggested(MATCH_SMS_SENDER, "95561", "兴业银行"),
-    Suggested(MATCH_SMS_SENDER, "95558", "中信银行"),
-    Suggested(MATCH_SMS_SENDER, "95568", "民生银行"),
-    Suggested(MATCH_SMS_SENDER, "95528", "浦发银行"),
-    Suggested(MATCH_SMS_SENDER, "95508", "广发银行"),
-    Suggested(MATCH_SMS_SENDER, "95595", "光大银行"),
-    Suggested(MATCH_SMS_SENDER, "95577", "华夏银行"),
-    Suggested(MATCH_SMS_SENDER, "95580", "邮储银行"),
-    Suggested(MATCH_SMS_SENDER, "95516", "银联"),
+    Suggested(MATCH_SMS_SIGNATURE, "招商银行", "招商银行"),  # 已对真实短信验过
+    Suggested(MATCH_SMS_SIGNATURE, "建设银行", "建设银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "工商银行", "工商银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "农业银行", "农业银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "中国银行", "中国银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "兴业银行", "兴业银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "中信银行", "中信银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "民生银行", "民生银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "浦发银行", "浦发银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "广发银行", "广发银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "光大银行", "光大银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "华夏银行", "华夏银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "邮储银行", "邮储银行"),
+    Suggested(MATCH_SMS_SIGNATURE, "中国银联", "中国银联"),
 )
-"""银行短信号段。**前缀匹配** —— 见模块开头那条。"""
+"""银行短信签名。**前缀匹配** —— 同一家机构有多个签名
+(`招商银行` / `招商银行信用卡`),而这里给的是完整机构名。"""
 
 PAYMENT_APPS: tuple[Suggested, ...] = (
     Suggested(MATCH_PACKAGE, "com.eg.android.AlipayGphone", "支付宝"),

@@ -16,6 +16,10 @@
 而四层防误判里第 1、2、4 层都不拦它 —— 第 4 层查的是"金额能不能逐字找到"、
 "分类在不在枚举内"、"置信度够不够",这三条它全过。
 
+**2026-09-11 又来了三条,而这三条推翻的是一个设计,不是一个 bug**
+(ADR-034)。它们证明"按发件号码匹配银行"这条路根本走不通 ——
+细节在下面 `TestTheSenderIsNotAnIdentity` 里。
+
 **下次再拿到一条真实短信,加进这里。** 这个文件的价值随条数增长,
 而每一条的成本是三行。
 """
@@ -25,6 +29,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from lifein.repos.transactions import Direction
+from lifein.sources.sms_signature import signature_of
 from lifein.sources.transaction_text import looks_unpaid_yet, parse, redact_for_model
 from lifein.sources.verification_code import looks_like_verification_code
 
@@ -146,3 +151,62 @@ class TestAVerificationCode:
         """**闸门排在解析前面。** 排在后面的话,`932525` 会被某条规则
         当成别的东西 —— 而验证码短信里全是数字。"""
         assert looks_like_verification_code(*ALI_CODE) is True
+
+
+# ---------- 2026-09-11 的三条:同一台手机,同一个短信应用 ----------
+#
+# 只记通知上显示的发件人与正文开头的签名 —— 正文本身不再抄一遍,
+# 这三条要验的是"发件人这个字段到底是什么",和内容无关。
+
+REAL_SENDERS = [
+    # (通知标题里的发件人, 正文开头的签名, 这条其实是谁发的)
+    ("招商银行", "【招商银行】您的招商银行储蓄卡0361于09月11日10:22...", "招商银行"),
+    ("游戏中心", "【游戏中心】...", "游戏中心"),
+    ("10693495555", "【招商银行】您的招商银行储蓄卡0361于09月11日10:22...", "招商银行"),
+]
+
+
+class TestTheSenderIsNotAnIdentity:
+    """**"发件号码"这个东西在通知监听这条路上不存在**(ADR-034)。
+
+    App 没有 `READ_SMS`,看到的是系统渲染给人看的标题。同一个
+    `com.android.mms`,同一台手机,三条短信给出了两种完全不同的东西。
+    """
+
+    def test_the_notification_title_is_sometimes_a_name_and_sometimes_a_number(self):
+        shown = [sender for sender, _body, _who in REAL_SENDERS]
+        assert [value.isdigit() for value in shown] == [False, False, True]
+
+    def test_the_real_number_does_not_start_with_the_bank_number(self):
+        """**这一条是那 14 条号段预设失败的真正原因,和显示名无关。**
+
+        招行走 1069 的 SP 网关下发,`95555` 在里面是**子串不是前缀** ——
+        也就是说就算每次都拿得到号码,前缀这个假设本身也是错的。
+        """
+        real = "10693495555"
+        assert not real.startswith("95555")
+        assert "95555" in real
+
+    def test_the_signature_is_stable_across_both_shapes(self):
+        """签名由发信方写进内容,三条里三条都指向正确的机构 ——
+        **包括标题是网关号码那条**。"""
+        for _sender, body, who in REAL_SENDERS:
+            assert signature_of(body) == who
+
+    def test_a_signature_rule_matches_regardless_of_what_the_title_showed(self):
+        from lifein.repos.collector import MATCH_SMS_SIGNATURE, WhitelistRule
+
+        cmb = WhitelistRule(
+            id=1,
+            match_type=MATCH_SMS_SIGNATURE,
+            pattern="招商银行",
+            purpose="transaction",
+            enabled=True,
+            phase="P2",
+        )
+        hits = [
+            cmb.matches(package_name="com.android.mms", sender=sender, signature=signature_of(body))
+            for sender, body, _who in REAL_SENDERS
+        ]
+        # 招行那两条都命中,游戏中心那条不命中 —— 而它们的标题长得毫无规律
+        assert hits == [True, False, True]

@@ -582,7 +582,11 @@ def collector_presets(_caller: AppCaller) -> dict[str, Any]:
 
 @router.post("/collector/whitelist")
 def add_whitelist(caller: AppCaller, session: SessionDep, body: WhitelistIn) -> dict[str, Any]:
-    if body.match_type not in (collector.MATCH_PACKAGE, collector.MATCH_SMS_SENDER):
+    if body.match_type not in (
+        collector.MATCH_PACKAGE,
+        collector.MATCH_SMS_SIGNATURE,
+        collector.MATCH_SMS_SENDER,
+    ):
         raise HTTPException(status_code=422, detail="match_type 不认识")
     if body.purpose not in (collector.PURPOSE_MESSAGE, collector.PURPOSE_TRANSACTION):
         raise HTTPException(status_code=422, detail="purpose 不认识")

@@ -28,6 +28,16 @@ log = logging.getLogger(__name__)
 
 MATCH_PACKAGE = "package_name"
 MATCH_SMS_SENDER = "sms_sender"
+"""**不推荐使用**(ADR-034)。它匹配的是"通知上显示的发件人",而那个值
+有时是号码、有时是厂商识别出来的显示名 —— 不是一个稳定的身份。
+银行用 `MATCH_SMS_SIGNATURE`。留着它是因为表里的历史行要能回答
+"曾经放行过谁"(06 §6.9 那条"没有删除")。"""
+
+MATCH_SMS_SIGNATURE = "sms_signature"
+"""短信签名:正文开头 `【…】` 里的机构名,**前缀匹配**(ADR-034)。
+
+它由发信方写进内容,不受厂商显示逻辑影响,也不受 SP 网关号码影响 ——
+2026-09-11 的三条真实短信里,这是唯一三条都指向正确机构的信号。"""
 
 PURPOSE_MESSAGE = "message"
 PURPOSE_TRANSACTION = "transaction"
@@ -44,16 +54,30 @@ class WhitelistRule:
     enabled: bool
     phase: str
 
-    def matches(self, *, package_name: str | None, sender: str | None) -> bool:
+    def matches(
+        self,
+        *,
+        package_name: str | None,
+        sender: str | None,
+        signature: str | None = None,
+    ) -> bool:
         """这条规则放不放行某条上报。
 
-        包名**全等**,短信发件人**前缀**:银行短信的号码是号段(95588、
-        1069xxxx),写死全等等于每换一个下发通道就漏一批。包名没有这个问题,
-        全等更安全 —— 前缀匹配会让 `com.tencent.mm` 顺带放行
-        `com.tencent.mm.fake`。
+        **包名全等,签名与发件人前缀。** 两种匹配方式的理由是相反的:
+
+        - 包名是精确标识符,前缀会让 `com.tencent.mm` 顺带放行
+          `com.tencent.mm.fake`
+        - 签名同一家机构有多个变体(`招商银行` / `招商银行信用卡`),
+          而预设给的是完整机构名。这里照抄 `bank_sources.py` 那条不对称:
+          多放一个最多是几条营销短信,**少放一个是那家银行整月不入账,
+          而账本上看不出少了什么**
+
+        `sms_sender` 那一条留着只为历史行,新的配置不该再用它(ADR-034)。
         """
         if self.match_type == MATCH_PACKAGE:
             return bool(package_name) and package_name == self.pattern
+        if self.match_type == MATCH_SMS_SIGNATURE:
+            return bool(signature) and signature.startswith(self.pattern)
         if self.match_type == MATCH_SMS_SENDER:
             return bool(sender) and sender.startswith(self.pattern)
         return False

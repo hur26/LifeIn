@@ -607,8 +607,10 @@ class TestCollectorPanel:
 
         labels = {item["label"]: item for item in body["presets"]}
         assert "招商银行" in labels
-        assert labels["招商银行"]["pattern"] == "95555"
-        assert labels["招商银行"]["match_type"] == "sms_sender"
+        # **按短信签名,不按号码**(ADR-034):号码在通知里拿不到,
+        # 而且真实号码走 1069 网关,95555 是子串不是前缀
+        assert labels["招商银行"]["pattern"] == "招商银行"
+        assert labels["招商银行"]["match_type"] == "sms_signature"
         # 支付类是按包名全等匹配的,两种都要在目录里 —— 银行号段不是应用,
         # 选择器里选不出来,而这正是预设存在的理由
         assert labels["支付宝"]["match_type"] == "package_name"

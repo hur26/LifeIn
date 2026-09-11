@@ -650,11 +650,18 @@ def cmd_allow_source(args: argparse.Namespace) -> int:
             print(f"没有叫 {args.preset} 的预设。看看有哪些:list-presets", file=sys.stderr)
             return 1
     else:
-        match_type = collector.MATCH_PACKAGE if args.package else collector.MATCH_SMS_SENDER
+        if args.package:
+            match_type = collector.MATCH_PACKAGE
+        elif args.sms_signature:
+            match_type = collector.MATCH_SMS_SIGNATURE
+        else:
+            # **不推荐**(ADR-034):它匹配的是通知上显示的发件人,
+            # 而那个值有时是号码有时是显示名。留着只为配历史行
+            match_type = collector.MATCH_SMS_SENDER
         wanted = [
             bank_sources.Suggested(
                 match_type=match_type,
-                pattern=args.package or args.sms_sender,
+                pattern=args.package or args.sms_signature or args.sms_sender,
                 label="",
                 purpose=args.purpose,
                 phase=args.phase,
@@ -692,9 +699,9 @@ def cmd_list_presets(_args: argparse.Namespace) -> int:
     """列出 P2 建议放行的来源。**只是建议,加了才生效**(默认拒绝不变)。"""
     from lifein.sources import bank_sources
 
-    print("银行短信(号段前缀匹配):")
+    print("银行短信(按短信签名前缀匹配,签名是正文开头【】里那几个字):")
     for item in bank_sources.BANK_SMS:
-        print(f"  {item.pattern:<8} {item.label}")
+        print(f"  {item.label}")
     print()
     print("支付与银行 App(包名全等匹配):")
     for item in bank_sources.PAYMENT_APPS:
@@ -1484,7 +1491,14 @@ def build_parser() -> argparse.ArgumentParser:
     allow.add_argument("--user", required=True)
     source = allow.add_mutually_exclusive_group(required=True)
     source.add_argument("--package", help="安卓包名,全等匹配,如 com.tencent.mm")
-    source.add_argument("--sms-sender", help="短信发件号,前缀匹配(号段)")
+    source.add_argument(
+        "--sms-signature",
+        help="短信签名,前缀匹配。签名是正文开头【】里那几个字,如 招商银行",
+    )
+    source.add_argument(
+        "--sms-sender",
+        help="[不推荐] 通知上显示的发件人。那个值有时是号码有时是显示名,见 ADR-034",
+    )
     source.add_argument(
         "--preset",
         help="按名字加一组预设,如 招商 / 支付宝。看有哪些:list-presets",

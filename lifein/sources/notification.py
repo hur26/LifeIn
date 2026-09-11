@@ -40,10 +40,18 @@ from lifein.models.normalized import (
     PartyRole,
     Trust,
 )
-from lifein.repos.collector import PURPOSE_MESSAGE, PURPOSE_TRANSACTION, WhitelistRule
+from lifein.repos.collector import (
+    MATCH_PACKAGE,
+    MATCH_SMS_SENDER,
+    MATCH_SMS_SIGNATURE,
+    PURPOSE_MESSAGE,
+    PURPOSE_TRANSACTION,
+    WhitelistRule,
+)
 from lifein.repos.transactions import Direction as TxnDirection
 from lifein.sources import transaction_text
 from lifein.sources.base import IngestedEvent
+from lifein.sources.sms_signature import signature_of
 from lifein.sources.verification_code import looks_like_verification_code
 
 log = logging.getLogger(__name__)
@@ -135,8 +143,13 @@ class NotificationAdapter:
     def _screen_one(self, item: dict[str, Any], result: Screened) -> None:
         package_name = _text(item.get("source_app"))
         sender = _text(item.get("sender"))
+        title = _text(item.get("title"))
+        body = _text(item.get("text"))
+        # **正文要在白名单之前读出来**:银行按短信签名匹配,而签名在正文开头
+        # (ADR-034)。读出来只用于这一次判断,没放行的一个字都不入库
+        signature = signature_of(body)
 
-        rule = self._match(package_name=package_name, sender=sender)
+        rule = self._match(package_name=package_name, sender=sender, signature=signature)
         if rule is None:
             # 默认拒绝。手机端已经过滤过一次,这里不假设那次是对的
             result.drop(DropReason.NOT_WHITELISTED)
@@ -147,8 +160,6 @@ class NotificationAdapter:
             result.drop(DropReason.PHASE_NOT_OPEN)
             return
 
-        title = _text(item.get("title"))
-        body = _text(item.get("text"))
         if looks_like_verification_code(title, body):
             # 整条丢弃。日志只记条数不记原文 —— 记下来等于把刚拦住的东西
             # 写进另一个更少人看管的地方
@@ -256,10 +267,28 @@ class NotificationAdapter:
             normalized=normalized,
         )
 
-    def _match(self, *, package_name: str, sender: str) -> WhitelistRule | None:
-        for rule in self._rules:
-            if rule.matches(package_name=package_name or None, sender=sender or None):
-                return rule
+    def _match(
+        self, *, package_name: str, sender: str, signature: str | None = None
+    ) -> WhitelistRule | None:
+        """命中哪一条规则。**越具体的越先** —— 不是"谁先加的谁赢"。
+
+        按加入顺序找的话,一条"放行整个短信应用"会把所有更精确的规则永久
+        吞掉:用户没法表达"全部短信当消息,但招行那些当交易",而他配出来的
+        东西看起来是对的(两条规则都在、都启用着)。2026-09-11 真踩了这个。
+
+        顺序就是具体程度:签名(一家机构)> 发件人 > 包名(一整个应用)。
+        同一档之内仍然按加入顺序,那时先来的确实更该赢。
+        """
+        for match_type in (MATCH_SMS_SIGNATURE, MATCH_SMS_SENDER, MATCH_PACKAGE):
+            for rule in self._rules:
+                if rule.match_type != match_type:
+                    continue
+                if rule.matches(
+                    package_name=package_name or None,
+                    sender=sender or None,
+                    signature=signature,
+                ):
+                    return rule
         return None
 
     def _to_event(

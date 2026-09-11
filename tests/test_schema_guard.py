@@ -250,9 +250,11 @@ class TestAgainstRealDatabase:
         found = schema_guard.inspect_schema(scratch_engine)
         assert found.current == "0007"
         assert not found.unknown
-        # 事故当天差的正是这些
-        assert set(found.pending) == {"0008", "0009", "0010", "0011", "0012", "0013", "0014"}
-        assert "差 7 个版本" in found.describe()
+        # **是包含不是相等。** 事故当天差的是这七条,而以后每加一条迁移都会
+        # 多一条 —— 写死整个集合的话,下一个人加迁移时会红在这里,
+        # 然后他会以为自己改坏了什么
+        assert {"0008", "0009", "0010", "0011", "0012", "0013", "0014"} <= set(found.pending)
+        assert f"差 {len(found.pending)} 个版本" in found.describe()
 
         assert schema_guard.upgrade_to_head(scratch_engine).is_current
 
@@ -356,7 +358,8 @@ class TestCheckCommand:
         done = _run_check(scratch_url)
 
         assert done.returncode == 1
-        assert "差 7 个版本" in done.stderr
+        # 同样不写死数字:要的是"它说得出差多少",不是"差的正好是七个"
+        assert "0007" in done.stderr and "个版本" in done.stderr
         assert schema_guard.inspect_schema(scratch_engine).current == "0007"
 
 
