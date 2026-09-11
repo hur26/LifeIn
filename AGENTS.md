@@ -107,6 +107,23 @@ export TEST_DATABASE_URL=postgresql+psycopg://lifein:lifein@127.0.0.1:55432/life
 pytest -m integration        # 夹具每次从 base 重建到 head,顺带测迁移本身
 ```
 
+**还有一组用真实短信跑的**(可选,默认跳过):
+
+```bash
+adb shell content query --uri content://sms/inbox --projection 'address:body:date' > dump.txt
+python scripts/sms-corpus.py dump.txt      # 产物 evals/sms_corpus.jsonl,不进版本库
+pytest tests/test_sms_corpus.py
+```
+
+**它断言的是不变量,不是逐条答案** —— "抠出来的金额后面不能紧跟数字"这类,
+不需要给五千条短信标答案。没有语料文件时整组跳过,仓库里只有几条编出来的
+示例(`evals/sms_corpus.example.jsonl`),所以日常 `pytest` 和 CI 不依赖它。
+
+**2026-09-11 第一次跑它,一次打出三个洞**,而三个都活过了当时那 1349 条用例:
+金额上四位就被截断(这批语料里 69 条会被记错)、进账被记成支出、
+"账户"后面的卡号没打码就送去了外部模型。三个洞的共同点是**用例挑的样本
+太规整**:金额都在三位以内、方向都是消费、卡号都写作"储蓄卡"。
+
 **为什么不能省**:第一次接上真库就抓出三个单元测试永远发现不了的问题 ——
 `array_length` 对空数组返回 NULL 导致 CHECK 形同虚设、审计写失败把整个事务
 拖成 aborted、`alembic.ini` 里的中文让 configparser 在中文 Windows 上直接炸。
