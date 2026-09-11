@@ -17,6 +17,7 @@ import ltd.iclab.lifein.net.FactsResponse
 import ltd.iclab.lifein.net.LifeInApi
 import ltd.iclab.lifein.net.ManualTxnBody
 import ltd.iclab.lifein.net.MonthlyReportDto
+import ltd.iclab.lifein.net.PresetDto
 import ltd.iclab.lifein.net.StopCollectionResult
 import ltd.iclab.lifein.net.NewTodoBody
 import ltd.iclab.lifein.net.PendingDto
@@ -132,15 +133,37 @@ class Repository(private val context: Context) {
 
     // ---------- 采集器 ----------
 
-    suspend fun allowSource(packageName: String) = withContext(Dispatchers.IO) {
+    /**
+     * 放行一个来源。默认是"按包名、消息类" —— 从应用选择器里选出来的那种。
+     *
+     * **银行与支付类现在也能从手机上加了**(ADR-033)。这里原来写着"不该从
+     * 手机上顺手打开",那句话在 P2 的闸门开之前是对的:那时加一条交易类规则
+     * 只会得到一条永远被 `phase_not_open` 丢掉的记录。现在两道闸门都开了,
+     * 再留着它撞的是 R10 四前提里"朋友自己能管理采集"那一条。
+     *
+     * 兜底的从来不是"手机上加不了",是**默认拒绝**加上**服务端那道
+     * `OPEN_PURPOSES`** —— 后者让"停下来"在服务端一处就能做到。
+     */
+    suspend fun allowSource(
+        pattern: String,
+        matchType: String = WhitelistRule.MATCH_PACKAGE,
+        purpose: String = WhitelistRule.PURPOSE_MESSAGE,
+    ) = withContext(Dispatchers.IO) {
         api().addWhitelist(
             WhitelistBody(
-                matchType = WhitelistRule.MATCH_PACKAGE,
-                pattern = packageName.trim(),
-                // P1 只放消息。加银行与支付类是 P2 的动作,不该从手机上顺手打开
-                purpose = WhitelistRule.PURPOSE_MESSAGE,
+                matchType = matchType,
+                pattern = pattern.trim(),
+                purpose = purpose,
             )
         )
+    }
+
+    /**
+     * 建议放行的来源目录(ADR-033)。**拿到它不等于放行了什么** ——
+     * 用户选完之后还要走一次 [allowSource]。
+     */
+    suspend fun sourcePresets(): List<PresetDto> = withContext(Dispatchers.IO) {
+        api().collectorPresets().presets
     }
 
     suspend fun toggleSource(ruleId: Int, enabled: Boolean) = withContext(Dispatchers.IO) {

@@ -274,6 +274,24 @@ data class CollectorStatus(
     val whitelist: List<ltd.iclab.lifein.collect.WhitelistRule> = emptyList(),
 )
 
+/**
+ * 建议放行的一条来源(06 §6.9 的 `presets`)。
+ *
+ * **它是目录里的一项,不是白名单里的一行。** 选中之后要再走一次
+ * `POST /app/collector/whitelist` 才真的放行(ADR-033)。
+ */
+@Serializable
+data class PresetDto(
+    @SerialName("match_type") val matchType: String,
+    val pattern: String,
+    val label: String,
+    val purpose: String,
+    val phase: String = "",
+)
+
+@Serializable
+data class PresetsResponse(val presets: List<PresetDto> = emptyList())
+
 @Serializable
 data class DeviceStatus(
     @SerialName("device_id") val deviceId: String,

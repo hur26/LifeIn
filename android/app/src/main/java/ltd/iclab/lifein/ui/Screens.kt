@@ -58,6 +58,7 @@ import ltd.iclab.lifein.calendar.CalendarReader
 import ltd.iclab.lifein.net.CollectionStateDto
 import ltd.iclab.lifein.net.CollectorStatus
 import ltd.iclab.lifein.net.PendingDto
+import ltd.iclab.lifein.net.PresetDto
 import ltd.iclab.lifein.net.TodoDto
 import ltd.iclab.lifein.ui.theme.EmptyState
 import ltd.iclab.lifein.ui.theme.LoadingState
@@ -501,6 +502,11 @@ fun StatusScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var newSource by remember { mutableStateOf("") }
     var note by remember { mutableStateOf<String?>(null) }
+    // 放行来源的两个入口(ADR-033)。包名输入框降级成高级入口,留给那些
+    // 装了但没有启动图标、在选择器里露不出来的应用
+    var showAppPicker by remember { mutableStateOf(false) }
+    var showPresets by remember { mutableStateOf(false) }
+    var presets by remember { mutableStateOf<List<PresetDto>>(emptyList()) }
     // 点完"授权"之后加一,好让下面那句重新问一次系统
     var permissionTick by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
@@ -636,13 +642,40 @@ fun StatusScreen(
                     }
                 }
                 Row(
+                    horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Button(
+                        onClick = { showAppPicker = true },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("从应用里选") }
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                runCatching { repo.sourcePresets() }
+                                    .onSuccess { presets = it; showPresets = true }
+                                    .onFailure { error = it.message }
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("常用来源") }
+                }
+                Text(
+                    "选应用放的是消息类;银行短信按号段走「常用来源」,现在也能" +
+                        "直接在这儿加了。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // **包名输入框留着,但降级成高级入口。** 有些厂商的短信应用
+                // 没有启动图标,选择器里露不出来 —— 那时只剩手输这一条路
+                Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(Space.sm),
                 ) {
                     OutlinedTextField(
                         value = newSource,
                         onValueChange = { newSource = it },
-                        label = { Text("加一个包名") },
+                        label = { Text("直接填包名(高级)") },
                         placeholder = { Text("com.tencent.mm") },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
@@ -659,10 +692,37 @@ fun StatusScreen(
                         },
                     ) { Text("放行") }
                 }
-                Text(
-                    "只放消息类。银行与支付类要在服务器上单独开。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+            }
+
+            if (showAppPicker) {
+                AppPickerDialog(
+                    onPick = { app ->
+                        showAppPicker = false
+                        scope.launch {
+                            runCatching { repo.allowSource(app.packageName) }
+                                .onFailure { error = it.message }
+                            refresh()
+                        }
+                    },
+                    onDismiss = { showAppPicker = false },
+                )
+            }
+
+            if (showPresets) {
+                PresetPickerDialog(
+                    presets = presets,
+                    onPick = { preset ->
+                        showPresets = false
+                        scope.launch {
+                            // 目录里那一条自己带着 match_type 与 purpose ——
+                            // 银行是 sms_sender + transaction,支付类是 package_name
+                            runCatching {
+                                repo.allowSource(preset.pattern, preset.matchType, preset.purpose)
+                            }.onFailure { error = it.message }
+                            refresh()
+                        }
+                    },
+                    onDismiss = { showPresets = false },
                 )
             }
 

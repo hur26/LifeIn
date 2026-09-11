@@ -23,6 +23,20 @@
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
+    <!--
+        列出"能从桌面启动的应用",给放行来源那一格的应用选择器用(ADR-033)。
+
+        Android 11 起包可见性默认是隔离的:不声明这一段,queryIntentActivities
+        只看得到自己。**用 <queries> 而不是 QUERY_ALL_PACKAGES** —— 后者是
+        敏感权限,而这里要的只是"有启动图标的应用"这一类,不是全部。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".LifeInApp"
         android:allowBackup="false"

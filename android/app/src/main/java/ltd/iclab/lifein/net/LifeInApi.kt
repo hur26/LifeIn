@@ -223,6 +223,14 @@ class LifeInApi(
         authed { json.decodeFromString(CollectorStatus.serializer(), bearerGet(PATH_STATUS, it)) }
 
     /**
+     * 建议放行的来源目录,带中文名(ADR-033)。
+     *
+     * 从服务端拿而不是在这里内置一份:**号段会变,而 App 改一次要重新发版**。
+     */
+    fun collectorPresets(): PresetsResponse =
+        authed { json.decodeFromString(PresetsResponse.serializer(), bearerGet(PATH_PRESETS, it)) }
+
+    /**
      * 换一条能在浏览器里打开的控制台链接。**十五分钟,短命的多次可用。**
      *
      * 这是那个控制台唯一的入口 —— 它没有登录页,因为**浏览器打开一个链接时
@@ -382,6 +390,7 @@ class LifeInApi(
         const val PATH_CAL_REPORT = "/app/calendar/report"
         const val PATH_STATUS = "/app/collector/status"
         const val PATH_WHITELIST = "/app/collector/whitelist"
+        const val PATH_PRESETS = "/app/collector/presets"
         const val PATH_FACTS = "/app/memory/facts"
         const val PATH_ENTITIES = "/app/memory/entities"
         const val PATH_TXNS = "/app/ledger/transactions"
