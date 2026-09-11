@@ -80,6 +80,11 @@ class NotificationCollector : NotificationListenerService() {
         if (title.isBlank() && text.isBlank()) return null
 
         val sender = smsSenderOf(sbn, title)
+        if (sender != null) {
+            // **一次性诊断,答完就删**(SenderProbe 的注释里写着要回答什么)。
+            // 只对默认短信应用、只打形状不打内容、只在 debug 包里跑
+            SenderProbe.report(this, notification)
+        }
 
         if (!Whitelist.load(applicationContext).allows(sbn.packageName, sender)) {
             return null
