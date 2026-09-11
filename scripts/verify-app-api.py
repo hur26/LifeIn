@@ -131,11 +131,17 @@ def main() -> int:
     head = {"Authorization": f"Bearer {token}"}
 
     for path in ("/app/todos", "/app/pending", "/app/calendar/queue",
-                 "/app/collector/status", "/app/memory/facts", "/app/memory/entities"):
+                 "/app/collector/status", "/app/collector/presets",
+                 "/app/memory/facts", "/app/memory/entities"):
         check(path, httpx.get(BASE + path, headers=head, timeout=10).status_code, 200)
 
     status = httpx.get(BASE + "/app/collector/status", headers=head, timeout=10).json()
     check("  心跳已经记上了", any(d["device_id"] == DEVICE for d in status["devices"]), True)
+
+    # 加来源那一格靠它显示"招商银行"而不是要求人知道 95555(ADR-033)
+    presets = httpx.get(BASE + "/app/collector/presets", headers=head, timeout=10).json()
+    labels = {item["label"] for item in presets["presets"]}
+    check("  建议目录带中文名", "招商银行" in labels and "支付宝" in labels, True)
 
     print("\n手机丢了(单点吊销):")
     with session_scope() as s:
