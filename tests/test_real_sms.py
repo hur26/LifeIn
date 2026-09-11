@@ -49,6 +49,16 @@ FUND_PLAN = (
     "退订短信回复QXDT",
 )
 
+CMB_SALARY = (
+    "【招商银行】",
+    "您账户0361于09月10日16:34入账工资，人民币4321.00。",
+)
+"""2026-09-11 从一批历史短信里捞出来的形状。**一条进账被记成了支出。**
+
+**只有金额是改过的**(原文是一笔工资,数额不该进版本库),其余一字未动 ——
+而那三个 bug 和数额无关,只和"四位以上"有关。
+"""
+
 ALI_CODE = (
     "【阿里巴巴】",
     "验证码:932525，操作：您正在短信登录，5分钟内有效。"
@@ -210,3 +220,57 @@ class TestTheSenderIsNotAnIdentity:
         ]
         # 招行那两条都命中,游戏中心那条不命中 —— 而它们的标题长得毫无规律
         assert hits == [True, False, True]
+
+
+class TestAnIncomingSalary:
+    """**这一条同时打出三个洞**,而它们全都活过了 1349 条用例。
+
+    共同原因是那些用例都是照着规则写的:金额挑的是 70.00、38.50、10.00,
+    没有一笔上四位;方向测的是消费,没测过进账;卡号写的是"储蓄卡",
+    没写过"账户"。规则漏掉什么,用例也就漏掉什么。
+    """
+
+    def test_four_digit_amounts_are_not_truncated(self):
+        r"""**`人民币5000.00` 曾经解出 500,`人民币12345.67` 解出 123。**
+
+        千分位那一支写的是 `\d{1,3}(?:,\d{3})*`,`*` 不要求真的有逗号,
+        于是它吃掉前三位就收工。带 `元` 后缀的那一支因为要回溯匹配 `元`
+        侥幸躲过 —— 而货币前缀那一支后面没有锚。
+        """
+        got = parse(*CMB_SALARY)
+        assert got is not None
+        assert got.amount == Decimal("4321.00")
+
+    def test_a_thousands_separator_still_works(self):
+        """改成 `+` 之后真带逗号的那种不能跟着坏掉。"""
+        got = parse(None, "【招商银行】消费人民币1,234.56元")
+        assert got is not None
+        assert got.amount == Decimal("1234.56")
+
+    def test_money_coming_in_is_not_an_expense(self):
+        """`入账` 原来两个词表都不在,于是落到"认不出来按流出"那条默认。
+
+        那条默认是给"真认不出来"的,不是给"词表漏了一个常用词"的。
+        """
+        got = parse(*CMB_SALARY)
+        assert got is not None
+        assert got.direction is Direction.CREDIT
+
+    def test_the_card_number_is_found_when_the_bank_says_account(self):
+        got = parse(*CMB_SALARY)
+        assert got is not None
+        assert got.account_hint == "0361"
+
+    def test_that_card_number_never_reaches_the_model(self):
+        """**这是三个里最要紧的一个。**
+
+        `_MASK_ACCOUNT` 和 `account_hint` 用的是同一份词表,所以词表漏了
+        "账户",那个卡号既抠不出来、也**不会被打码** —— 它原样进了送给
+        外部模型的那一份(R12)。一个词表两处用是刻意的:补一个词,
+        抽取和脱敏同时跟上,不会只修一半。
+        """
+        redacted = redact_for_model(CMB_SALARY[1])
+        assert "0361" not in redacted
+        assert "****" in redacted
+        # 金额要留着 —— 模型判断类型需要它
+        assert "4321.00" in redacted
