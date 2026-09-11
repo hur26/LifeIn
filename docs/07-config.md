@@ -296,7 +296,7 @@ python -m lifein.admin console-password
 CREATE TABLE collector_whitelist (
     id         BIGSERIAL PRIMARY KEY,
     user_id    UUID NOT NULL,
-    match_type TEXT NOT NULL CHECK (match_type IN ('sms_sender','package_name')),
+    match_type TEXT NOT NULL CHECK (match_type IN ('sms_sender','package_name','sms_signature')),
     pattern    TEXT NOT NULL,
     purpose    TEXT NOT NULL CHECK (purpose IN ('transaction','message')),
     enabled    BOOLEAN NOT NULL DEFAULT true,
@@ -333,17 +333,34 @@ P2 第 12 片把 `transaction` 加了进去,而**那一片排在那期的倒数�
 > **设备端那道一直停在 P1,直到 2026-09-11 才补上**
 > ([ADR-032](04-tech-decisions.md#adr-032--设备端补上-p2-那两道闸门purpose-与-sender))。
 > 在那之前 `purpose=transaction` 的规则在手机上就被丢掉,而且短信通知的
-> `sender` 恒为 `null` —— 也就是说**下面那些号段预设一条都匹配不上**,
-> 尽管 `list-sources` 会把它们列出来。第一次把 App 装上真机才发现。
+> `sender` 恒为 `null` —— 而 `list-sources` 照样把规则列出来。
+> 第一次把 App 装上真机才发现。
+>
+> **补上之后又发现了第二层**:`sender` 有值也没用,因为号段匹配这件事
+> 本身就是错的([ADR-034](04-tech-decisions.md#adr-034--银行短信按短信签名匹配不按发件人),见下)。
+> 一次改动只修掉一层,是因为**第二层要真实短信才看得见**。
 
-**号段匹配依赖通知标题。** 短信只能以"短信应用的一条通知"的形式被看到
-(App 没有、也不会要 `READ_SMS` 权限,[ADR-010](04-tech-decisions.md#adr-010--微信只做只读接入走官方通知监听)),
-所以发件人取的是**系统默认短信应用**那条通知的标题。
+**银行短信按 `sms_signature` 匹配,不按发件人**
+([ADR-034](04-tech-decisions.md#adr-034--银行短信按短信签名匹配不按发件人))。
+它取的是正文开头 `【…】` 里的机构名,**前缀匹配**。
 
-> **它什么时候不准**:有些系统在标题里显示的是联系人名或银行名
-> (号码存进了通讯录、或者厂商做了号码识别),那时号段前缀匹配不上,
-> **而表现是静默的**。退路是按应用放行整个短信应用 —— 代价是私人短信
-> 也会上报,要自己权衡。
+> **原来那 14 条号段预设一条都命中不了,而且不只是因为显示名。**
+> 2026-09-11 的三条真实短信证明了两件事:通知标题有时是显示名(`招商银行`)
+> 有时是网关号码(`10693495555`);而真实号码走 1069 的 SP 网关 ——
+> **`95555` 在里面是子串,不是前缀**。也就是说就算每次都拿得到号码,
+> 前缀这个假设本身也是错的。
+>
+> 签名由发信方写进内容,不受这两件事影响:那三条里三条都指向正确的机构。
+> **两端各自从正文里提取,不作为字段上报**(铁律 11 要的是两道独立过滤)。
+
+**`sms_sender` 留着,但不推荐用。** 它匹配的是"通知上显示的发件人",
+一个不稳定的值。表里已有的行不删(要能回答"曾经放行过谁"),
+迁移 `0015` 把库里那些号段规则**停用**了;预设目录不再产出这种规则。
+
+> **签名可以伪造** —— 谁都能发一条以 `【招商银行】` 开头的短信。
+> 白名单是**范围控制**不是真伪控制(进来的一律 `trust=external`),
+> 真伪归四层防误判管;但它确实是一个新的注入面,
+> [03 那条"出现错记就停下来"](03-roadmap.md)从此多一个要盯的方向。
 
 建议放行哪些号段和包名,存在 `lifein/sources/bank_sources.py`,
 `admin list-presets` 能看;`allow-source --preset 招商` 一次加一组。
