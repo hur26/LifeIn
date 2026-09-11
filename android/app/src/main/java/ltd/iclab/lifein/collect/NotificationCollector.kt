@@ -1,6 +1,7 @@
 package ltd.iclab.lifein.collect
 
 import android.app.Notification
+import android.provider.Telephony
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -26,6 +27,10 @@ import ltd.iclab.lifein.work.UploadTrigger
  * 过滤的顺序和服务端那边一模一样,而且**两边都做**:
  *
  *     自己发的 → 分组汇总/常驻 → 白名单(默认拒绝) → 验证码 → 进队列
+ *
+ * **标题要在白名单之前读出来**,因为短信的发件人就在标题里,而白名单要按
+ * 它匹配号段(ADR-032)。读出来只在内存里用于这次判断 —— 没放行的那些
+ * 不进队列、不落库、不上报,和以前一样。
  *
  * 验证码那道在这里就丢,连本地库都不进([铁律 11](../../../../../../../AGENTS.md))。
  *
@@ -63,10 +68,6 @@ class NotificationCollector : NotificationListenerService() {
             return null
         }
 
-        if (!Whitelist.load(applicationContext).allows(sbn.packageName, sender = null)) {
-            return null
-        }
-
         val extras = notification.extras
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         // 优先取 BIG_TEXT:折叠状态下的 EXTRA_TEXT 常常只有一行,
@@ -78,6 +79,12 @@ class NotificationCollector : NotificationListenerService() {
 
         if (title.isBlank() && text.isBlank()) return null
 
+        val sender = smsSenderOf(sbn, title)
+
+        if (!Whitelist.load(applicationContext).allows(sbn.packageName, sender)) {
+            return null
+        }
+
         if (VerificationCode.matches(title, text)) {
             // 只记一行,不记内容:记下来等于把刚拦住的东西写进另一个地方
             Log.i(TAG, "丢弃一条疑似验证码的通知,来源 ${sbn.packageName}")
@@ -87,7 +94,7 @@ class NotificationCollector : NotificationListenerService() {
         return QueuedEvent(
             channel = CHANNEL_NOTIFICATION,
             sourceApp = sbn.packageName,
-            sender = null,
+            sender = sender,
             postedAt = iso(sbn.postTime),
             title = title,
             text = text,
@@ -95,6 +102,32 @@ class NotificationCollector : NotificationListenerService() {
             // 同一条通知被更新时算新的一条,而重复 post 同一份不会
             externalId = "${sbn.key}#${sbn.postTime}",
         )
+    }
+
+    /**
+     * 这条通知的发件人。**只有系统默认短信应用才有**(ADR-032)。
+     *
+     * 短信这个 App 看不到 —— 它没有、也不会要 `READ_SMS` 权限
+     * (ADR-010 只走官方通知监听**读取**)。所以一条银行短信到这里的形状是
+     * "短信应用发的一条通知",而**发件号码就是那条通知的标题**。
+     *
+     * **只认默认短信应用,不是所有通知的标题都当发件人。** 微信的标题是
+     * 聊天名,把它当发件人会让 `95555` 这种号段前缀撞上一个群名 ——
+     * 白名单是安全机制,"罕见"不是放过它的理由。
+     *
+     * 用 [Telephony.Sms.getDefaultSmsPackage] 而不是自己维护一张 OEM 短信
+     * 应用包名表:那是**系统自己的答案**,而那种表一定会漏一个牌子,
+     * 漏掉的表现是那台手机静默不采。
+     *
+     * **它什么时候不准**:有些系统在标题里显示的是联系人名或银行名
+     * (号码存进了通讯录、或者厂商做了号码识别),那时号段前缀匹配不上,
+     * 而表现同样是静默的。退路是按应用放行整个短信应用(07 §4 写着)。
+     */
+    private fun smsSenderOf(sbn: StatusBarNotification, title: String): String? {
+        if (title.isBlank()) return null
+        // 取不到就当不是短信:宁可少匹配一条,不要把聊天名当成发件号码
+        val smsApp = runCatching { Telephony.Sms.getDefaultSmsPackage(this) }.getOrNull()
+        return if (smsApp != null && sbn.packageName == smsApp) title.trim() else null
     }
 
     override fun onListenerConnected() {

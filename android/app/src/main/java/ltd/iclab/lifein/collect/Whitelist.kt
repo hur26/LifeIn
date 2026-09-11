@@ -37,24 +37,40 @@ data class WhitelistRule(
         const val MATCH_PACKAGE = "package_name"
         const val MATCH_SMS_SENDER = "sms_sender"
         const val PURPOSE_MESSAGE = "message"
+        const val PURPOSE_TRANSACTION = "transaction"
     }
 }
 
 class Whitelist(private val rules: List<WhitelistRule>) {
 
     /**
-     * 放不放行。**purpose 闸门在这里也有一道**:P1 只放消息,
-     * 银行与支付类是 P2 的事。服务端那边同样会挡,两边一致不是重复 ——
-     * 手机端挡住的那些根本不会离开这台设备。
+     * 放不放行。**purpose 闸门在这里也有一道,但它和服务端那道方向不一样**:
+     * 这一道决定什么**离开这台手机**,服务端那道决定什么**入库**。
+     * 两道各写各的,不共用配置([铁律 11](../../../../../../../AGENTS.md))。
+     *
+     * **这里曾经硬编码成只放 `message`,而 P2 打开记账闸门时没有回来改它**
+     * (ADR-032)。后果是 `purpose=transaction` 的规则在手机上就被丢掉,
+     * 而服务端、`list-sources`、状态页都显示它放行着 —— 看起来配好了,
+     * 实际上一条都收不到。所以这里现在写成集合,和服务端那份
+     * (`lifein/sources/notification.py` 的 `OPEN_PURPOSES`)对齐。
+     *
+     * **关闸门仍然只在服务端一处。** 03 的退出条件("出现错记就停下来")
+     * 要的是立刻停,而改这里要重新发版。
      */
     fun allows(packageName: String?, sender: String?): Boolean =
         rules.any {
             it.enabled &&
-                it.purpose == WhitelistRule.PURPOSE_MESSAGE &&
+                it.purpose in OPEN_PURPOSES &&
                 it.matches(packageName, sender)
         }
 
     companion object {
+        /** 哪些 `purpose` 真的放行。和服务端那份同名常量对齐(ADR-032)。 */
+        val OPEN_PURPOSES = setOf(
+            WhitelistRule.PURPOSE_MESSAGE,
+            WhitelistRule.PURPOSE_TRANSACTION,
+        )
+
         private const val FILE = "lifein.whitelist"
         private const val KEY = "rules"
         private val json = Json { ignoreUnknownKeys = true }

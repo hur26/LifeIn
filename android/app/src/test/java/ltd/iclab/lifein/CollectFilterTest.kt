@@ -51,9 +51,37 @@ class CollectFilterTest {
     }
 
     @Test
-    fun `transaction purpose is not open on the device either`() {
-        // 记账链路 P2 才打开。手机端挡住的那些根本不会离开这台设备
-        assertFalse(Whitelist(listOf(wechat(purpose = "transaction"))).allows("com.tencent.mm", null))
+    fun `transaction purpose is open now that P2 is on`() {
+        // **这条用例以前断言的是反面。** 手机端的 purpose 闸门一直硬编码成
+        // 只放 message,而 P2 打开记账闸门时没有回来改它(ADR-032)——
+        // 后果是 purpose=transaction 的规则在手机上就被丢掉,而服务端、
+        // list-sources、状态页都显示它放行着。看起来配好了,一条都收不到。
+        assertTrue(Whitelist(listOf(wechat(purpose = "transaction"))).allows("com.tencent.mm", null))
+    }
+
+    @Test
+    fun `an unknown purpose is still refused`() {
+        // 闸门放开的是"两种已知的 purpose",不是"什么都放"。
+        // 服务端将来加第三种时,旧版本 App 不该自作主张先放行
+        assertFalse(Whitelist(listOf(wechat(purpose = "whatever"))).allows("com.tencent.mm", null))
+    }
+
+    @Test
+    fun `a bank sms preset matches the way it is actually shipped`() {
+        // 号段预设在服务端是 sms_sender + transaction(bank_sources.py)。
+        // 两处闸门里任何一处关着,这条都过不去 —— 这就是为什么 ADR-032
+        // 说那两条必须一起改
+        val zhaoshang = WhitelistRule(
+            matchType = WhitelistRule.MATCH_SMS_SENDER,
+            pattern = "95555",
+            purpose = "transaction",
+        )
+        val list = Whitelist(listOf(zhaoshang))
+        // 银行用的是扩展号,所以是前缀匹配
+        assertTrue(list.allows("com.android.mms", "955550"))
+        assertFalse(list.allows("com.android.mms", "10086"))
+        // 发件人取不到时(不是默认短信应用的通知)照样不放行
+        assertFalse(list.allows("com.android.mms", null))
     }
 
     @Test
