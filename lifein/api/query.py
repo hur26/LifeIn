@@ -48,6 +48,7 @@ from lifein.repos import (
     users,
 )
 from lifein.repos.tool_calls import PostgresAuditSink
+from lifein.sources import bank_sources
 
 log = logging.getLogger(__name__)
 
@@ -547,6 +548,35 @@ def collector_status(
         "whitelist": [
             _rule_json(rule) for rule in collector.list_whitelist(caller.user_id, session)
         ],
+    }
+
+
+@router.get("/collector/presets")
+def collector_presets(_caller: AppCaller) -> dict[str, Any]:
+    """建议放行的来源目录,带中文名(ADR-033)。
+
+    **它是一份目录,不是判断。** 决定的是 App 的"加来源"界面上列出哪几个
+    选项,决定不了任何一条通知的去留 —— 用户选完之后走的仍然是
+    `POST /collector/whitelist`,过滤仍然是两端各自那份 `matches()`。
+    所以它不算铁律 11 说的那种"两端共用配置"。
+
+    放服务端而不是在 App 里内置一份,是因为**号段会变,而 App 改一次要
+    重新发版**(06 §6)。服务端改一行,所有设备下次打开就看见。
+
+    不读库,所以不要 `session` —— 但仍然要 `AppCaller`:这份目录里有哪些
+    银行和支付应用值得放行,本身就是一点信息,没必要对没登录的人开着。
+    """
+    return {
+        "presets": [
+            {
+                "match_type": item.match_type,
+                "pattern": item.pattern,
+                "label": item.label,
+                "purpose": item.purpose,
+                "phase": item.phase,
+            }
+            for item in bank_sources.ALL
+        ]
     }
 
 

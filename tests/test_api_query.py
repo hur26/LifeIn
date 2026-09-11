@@ -44,7 +44,8 @@ class TestTheIngestCredentialCannotRead:
 
     def test_every_query_route_needs_a_token(self, client):
         for path in ("/app/todos", "/app/pending", "/app/calendar/queue",
-                     "/app/collector/status", "/app/memory/facts", "/app/memory/entities"):
+                     "/app/collector/status", "/app/collector/presets",
+                     "/app/memory/facts", "/app/memory/entities"):
             assert client.get(path).status_code == 401
 
 
@@ -598,6 +599,28 @@ class TestCollectorPanel:
         # 停用之后不再放行,但那一行还在 —— 能回答"曾经放行过谁"
         assert collector.list_whitelist(user_id, pg_session, enabled_only=True) == []
         assert len(collector.list_whitelist(user_id, pg_session)) == 1
+
+
+    def test_presets_are_a_catalogue_with_chinese_labels(self, client, token):
+        """加来源那一格要能显示"招商银行",而不是要求用户知道 95555(ADR-033)。"""
+        body = client.get("/app/collector/presets", headers=bearer(token)).json()
+
+        labels = {item["label"]: item for item in body["presets"]}
+        assert "招商银行" in labels
+        assert labels["招商银行"]["pattern"] == "95555"
+        assert labels["招商银行"]["match_type"] == "sms_sender"
+        # 支付类是按包名全等匹配的,两种都要在目录里 —— 银行号段不是应用,
+        # 选择器里选不出来,而这正是预设存在的理由
+        assert labels["支付宝"]["match_type"] == "package_name"
+
+    def test_presets_do_not_let_anything_through_by_themselves(
+        self, client, pg_session, user_id, token
+    ):
+        """**目录不是白名单。** 拿到目录不等于放行了什么 ——
+        真正放行要再走一次 POST /collector/whitelist。"""
+        client.get("/app/collector/presets", headers=bearer(token))
+
+        assert collector.list_whitelist(user_id, pg_session) == []
 
 
 def _count(session, table: str, user_id: str) -> int:
