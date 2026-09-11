@@ -1190,6 +1190,7 @@ App 里用户自己点的"新建 / 完成 / 撤销"不属于编排层 ——
 | GET | `/app/collector/status` | 每台设备的心跳 + 当前白名单 |
 | POST | `/app/collector/whitelist` | 加一条来源 |
 | POST | `/app/collector/whitelist/{id}/enabled` | `{"enabled": false}` 停用 |
+| GET | `/app/collector/presets` | 建议放行的来源目录(带中文名),给 App 的"加来源"用 |
 
 **没有删除。** 停用即不放行,而留着那一行能回答"曾经放行过谁" ——
 排查 [R10](05-risks.md#r10--手机端采集器的越权读取) 那类问题时,那是唯一的线索。
@@ -1197,6 +1198,16 @@ App 里用户自己点的"新建 / 完成 / 撤销"不属于编排层 ——
 白名单在**查询端**读写,不在采集端 —— 采集端只能写。
 App 打开时把它同步到本地,采集器按本地那份过滤;
 **服务端入库前照样再过一次**,两道是独立的(架构 §8.3)。
+
+**`presets` 只是一份目录,不是判断**([ADR-033](04-tech-decisions.md#adr-033--放行来源改成选应用预设从服务端拿))。
+它决定 App 的"加来源"界面上列出哪几个选项,决定不了任何一条通知的去留 ——
+用户选完之后走的仍然是 `POST /app/collector/whitelist`,过滤仍然是两端各自
+那份 `matches()`。所以它**不算**[铁律 11](../AGENTS.md#1-铁律) 说的那种
+"两端共用配置":那条管的是过滤判断。
+
+放服务端而不是在 App 里内置一份,是因为**号段会变而 App 改一次要重新发版**。
+每条形如 `{"match_type": "sms_sender", "pattern": "95555", "label": "招商银行",
+"purpose": "transaction", "phase": "P2"}`。
 
 ### 6.10 记忆与实体浏览 `/app/memory`
 
