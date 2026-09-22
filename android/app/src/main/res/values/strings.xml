@@ -3,4 +3,12 @@
     <string name="app_name">LifeIn</string>
     <string name="collector_label">LifeIn 通知采集</string>
     <string name="widget_label">LifeIn 今天</string>
+
+    <!--
+      系统设置的无障碍列表里显示的名字和说明。**类名是伪装的,这两句不是**
+      (ADR-035)：伪装是为了让微信不屏蔽节点，不是为了让用户看不出来这是谁。
+      09 §1 那条告知义务在系统设置这一页上同样成立。
+    -->
+    <string name="copilot_a11y_label">LifeIn 副驾</string>
+    <string name="copilot_a11y_description">读你当前打开的那个聊天窗，给三条回复候选填进输入框。发送键始终由你自己按。默认不读任何 App，要在 LifeIn 里逐个放行。</string>
 </resources>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  副驾读屏服务的配置(ADR-035 / ADR-036)。
+
+  **accessibilityEventTypes 没有写 typeAllMask。** 这个服务只需要三类事件:
+  窗口切了、窗口内容变了、列表滚了。收全部事件意味着连按键、焦点变化、
+  通知到达都会回调进来,而那些回调每一次都要走一遍包名判断 ——
+  收窄这一项既省电,也让"它到底在监听什么"这个问题有个具体答案。
+
+  canTakeScreenshot 是给 OCR 兜底用的(P5 第三片):树里读不到正文时
+  截当前窗口,本机离线识别,**图片不出手机**。
+
+  canPerformGestures 没有写,也不会写:副驾唯一的写动作是往输入框里
+  ACTION_SET_TEXT。**手势能力等于能点屏幕上任何一个位置,包括发送键。**
+
+  isAccessibilityTool="true" 是如实声明 —— 这个服务确实要读别的 App 的界面。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:isAccessibilityTool="true"
+    android:notificationTimeout="100"
+    android:description="@string/copilot_a11y_description" />

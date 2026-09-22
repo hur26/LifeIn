@@ -24,6 +24,21 @@
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
 
     <!--
+      以下三条全部只为副驾(P5,ADR-035 / ADR-036)。**装了不等于在用** ——
+      无障碍和悬浮窗都要用户自己去系统设置里开,App 里还有总开关和逐 App 放行,
+      一共四道,每一道默认都是关的(07 §2.9)。
+
+      悬浮窗:副驾的展示面。选它而不是输入法,是因为输入法会看见你在**每个 App**
+      里敲的**每一个键**,而副驾只该看见你主动打开的那个聊天窗(ADR-036)。
+
+      前台服务:无障碍服务被 ROM 冻结之后不会自己回来 —— 通知监听有系统重绑,
+      它没有。两者的容忍度差三个数量级,所以结论不同(ADR-021 的 2026-09-22 追加)。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!--
         列出"能从桌面启动的应用",给放行来源那一格的应用选择器用(ADR-033)。
 
         Android 11 起包可见性默认是隔离的:不声明这一段,queryIntentActivities
@@ -70,6 +85,43 @@
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
+        </service>
+        <!--
+          副驾的读屏服务(ADR-035)。**注册的类名是伪装的** ——
+          微信 8.0.52 起对普通命名的无障碍服务隐藏节点文本,而这个名字读得到。
+          逻辑全在 .copilot.ChatCaptureService,这个类只是个空壳子。
+
+          **不要改这个名字,但也不要在它失效之后去找下一个。**
+          ADR-035 写了这条承诺:微信如果把它堵了,这个项目不追。
+
+          android:label 和配置里的 description **没有伪装** ——
+          伪装是为了让微信不屏蔽节点,不是为了让用户看不出这是谁(09 §1)。
+        -->
+        <service
+            android:name="com.google.android.accessibility.selecttospeak.SelectToSpeakService"
+            android:exported="true"
+            android:label="@string/copilot_a11y_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/copilot_accessibility" />
+        </service>
+        <!--
+          只为把进程钉在前台优先级,好让上面那个服务不被省电策略冻掉。
+          specialUse 是如实归类:它不放音乐、不导航、不传文件 ——
+          没有一个现成的类型说得清它在干什么,而硬套一个说得通的类型
+          才是真正会被商店打回来的做法。
+        -->
+        <service
+            android:name=".copilot.CopilotKeepAlive"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the copilot accessibility reader alive under OEM power management" />
         </service>
         <!--
           桌面小组件。AppWidgetProvider + WorkManager **定时去拉**,

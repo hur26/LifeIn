@@ -15,7 +15,18 @@ android {
         // minSdk 26 的理由不是覆盖率:NotificationListenerService 在 8.0 之后
         // 才有稳定的重连行为,而 ADR-012 的硬前提是"装在日常主力机上",
         // 那种机器不会停在 7.x(ADR-021)
-        minSdk = 26
+        //
+        // **2026-09-22 抬到 30。** 副驾的 OCR 兜底要
+        // `AccessibilityService.takeScreenshot()`,那是 API 30 才有的
+        // (ADR-021 的 2026-09-22 追加)。退路只有 MediaProjection,而那个
+        // 每次都要弹一次系统授权框 —— 副驾是"打开聊天窗就该有反应"的东西,
+        // 一个每次都要点确认的截屏权限等于把这个功能废掉。
+        //
+        // 代价是 8.0/9.0 那批机器装不上。这个代价是明知道并接受的:
+        // 抬 minSdk 影响的是整个 App,而副驾只是它的一部分 ——
+        // 但一个 App 只能有一个 minSdk,而 ADR-012 那条"日常主力机"的前提
+        // 本来就已经排除了那批机器
+        minSdk = 30
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
