@@ -59,7 +59,7 @@ def claim(body: ClaimIn, session: SessionDep, settings: SettingsDep, now: NowDep
         session, code=body.code, device_id=body.device_id, now=now
     )
     if code is None:
-        # 三种原因不区分,响应体是空的 —— 和 06 §6.16 那条 401 同一条规矩
+        # 三种原因不区分,响应体是空的 —— 和 06 §6.17 那条 401 同一条规矩
         return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
     user = users.get_user(code.user_id, session)
