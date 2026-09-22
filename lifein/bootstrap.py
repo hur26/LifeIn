@@ -52,6 +52,7 @@ def register_tools() -> None:
     """
     from lifein.agents import (  # noqa: F401
         bookkeeper,
+        copilot,
         digest,
         memory,
         monthly_report,
