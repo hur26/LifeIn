@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, status
 
-from lifein.api import admin_console, console, enroll, ingest, query
+from lifein.api import admin_console, console, copilot, enroll, ingest, query
 from lifein.api.deps import AuthRejected
 from lifein.bootstrap import Services, build_services
 from lifein.db import session_scope
@@ -85,6 +85,9 @@ def create_app(services: Services | None = None, *, with_scheduler: bool = False
     app.include_router(enroll.router)
     app.include_router(ingest.router)
     app.include_router(query.router)
+    # 副驾和查询端同一个 /app 前缀,但单独一个路由器:它的性质不一样 ——
+    # 一次请求打三次外部模型,而且素材由第三方现场构造(06 §6.16)
+    app.include_router(copilot.router)
 
     @app.exception_handler(AuthRejected)
     def _auth_rejected(_request: Request, exc: AuthRejected) -> Response:

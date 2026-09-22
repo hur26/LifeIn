@@ -114,6 +114,31 @@ class Settings(BaseSettings):
     console_admin_max_attempts: int = 5
     console_admin_lockout_m: int = 15
 
+    # ---------- 副驾(P5) ----------
+    # 候选限长 40 字**故意不在这里**:它是 R3 的防线不是性能旋钮,
+    # 写死在 `agents/copilot.CANDIDATE_MAX_CHARS`。理由见 07 §2.9
+    copilot_enabled: bool = False
+    """副驾的服务端总开关。**默认关。**
+
+    和运营层留空是同一种选择:ADR-035 带进来的是这个系统里风险最高的一条通道,
+    **不开它的人不该为它承担任何东西**。关着的时候那个接口直接 404,
+    不是"返回空结果" —— 后者会让手机端以为服务端支持,只是这次没读到。
+
+    手机端还要再开三道(无障碍权限、悬浮窗权限、逐个放行聊天 App)。
+    一共四道,每一道默认都是关的。
+    """
+
+    copilot_model: str | None = None
+    """起草那一路用的模型。**留空 = 继承 `llm_model`。**
+
+    分开是因为三次调用要的东西不一样:判断和排序要的是稳定的结构化输出,
+    起草要的是口语。真到了要换的时候,换的多半只有起草这一路。
+    """
+
+    copilot_max_messages: int = 40
+    copilot_max_history: int = 30
+    copilot_max_facts: int = 5
+
     # ---------- 采集入口(P1) ----------
     # 采集与查询的密钥**不在环境变量里**:它们按设备签发,加密存 credentials 表
     # (06 §6.1)。一把全局密钥做不到按设备单点吊销,也做不到 P4 的用户隔离(R11)
