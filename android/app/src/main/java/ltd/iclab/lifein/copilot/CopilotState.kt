@@ -1,6 +1,7 @@
 package ltd.iclab.lifein.copilot
 
 import android.content.Context
+import android.provider.Settings
 
 /**
  * 副驾自己的状态 —— **App 里那一页和悬浮窗的错误提示都读它。**
@@ -36,6 +37,40 @@ object CopilotState {
 
     /** 有适配器,但用户没在设置里放行它(默认拒绝)。 */
     const val NOT_ALLOWED = "not_allowed"
+
+    /**
+     * 系统设置里有没有勾上这个无障碍服务。**问系统,不问自己。**
+     *
+     * 和 [serviceConnected] 是两个不同的问题,而**它们不一致的那种情况
+     * 恰好是最需要被看见的**:系统里勾着、服务却没在跑 = 被 ROM 的省电策略
+     * 冻住了(ADR-021 的 2026-09-22 追加)。那时候用户去系统设置里看,
+     * 开关是开着的,于是他会以为一切正常。
+     *
+     * [serviceConnected] 自己还有一个毛病:进程被杀时 `onDestroy` 不一定跑得到,
+     * 那个 true 就留在那儿了。所以"权限给没给"这个问题只能由系统回答。
+     */
+    fun accessibilityEnabled(context: Context): Boolean {
+        val enabled = runCatching {
+            Settings.Secure.getString(
+                context.contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            )
+        }.getOrNull().orEmpty()
+        val component = "${context.packageName}/$SERVICE_CLASS"
+        // 冒号分隔的一串。**按整段比,不用 contains** ——
+        // 子串匹配会让一个包名以我们为前缀的服务顺带算数
+        return enabled.split(':').any { it.trim() == component }
+    }
+
+    /**
+     * 注册在清单里的那个类名。**是伪装过的那个**(ADR-035)。
+     *
+     * 写死在这里而不是 `SelectToSpeakService::class.java.name`:引用那个类
+     * 会把它从伪装包里拖进这个文件的依赖里,而这里只需要一个字符串。
+     * 改清单注册名时这里要跟着改 —— 不过 ADR-035 说了不要改。
+     */
+    private const val SERVICE_CLASS =
+        "com.google.android.accessibility.selecttospeak.SelectToSpeakService"
 
     fun setServiceConnected(context: Context, connected: Boolean) =
         prefs(context).edit().putBoolean(KEY_CONNECTED, connected).apply()

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ShoppingCart
@@ -40,6 +41,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import ltd.iclab.lifein.LifeInApp
 import ltd.iclab.lifein.calendar.CalendarWriter
 import ltd.iclab.lifein.collect.CollectorState
+import ltd.iclab.lifein.copilot.CopilotState
 import ltd.iclab.lifein.data.Enrollment
 import ltd.iclab.lifein.data.LifeInDatabase
 import ltd.iclab.lifein.ui.theme.LifeInTheme
@@ -50,8 +52,14 @@ import ltd.iclab.lifein.ui.theme.LifeInTheme
  * 没配码之前只有一张引导页:**这个 App 在配好之前什么都不该做** ——
  * 没有凭据的采集器只会攒一堆送不出去的东西。
  *
- * 配好之后五个页签,对应五个问题:今天要干什么、有什么等我点头、
- * 钱花到哪儿了、它记住了什么(以及记错了没有)、这套东西还活着吗。
+ * 配好之后六个页签,对应六个问题:今天要干什么、有什么等我点头、
+ * 钱花到哪儿了、它记住了什么(以及记错了没有)、这套东西还活着吗、
+ * 以及副驾有没有在帮我。
+ *
+ * **第六个是加上去的,而五个本来就是上限。** 权衡过放在状态页里当子页 ——
+ * 那样底部还是五格,但副驾的四道门就藏在两层之下了,而**用户找不到那四道门
+ * 的表现是"副驾没反应",他不会知道该往哪找**。
+ * 中文标签两三个字,六格在窄屏上排得下,所以这里选了看得见。
  *
  * 最后一页叫「状态」而不是「我的」:**docs 里九处都叫它状态页**
  * (08 §部署验收、09 §5 那张表),而一个在文档里叫 A、在界面上叫 B 的东西,
@@ -78,6 +86,22 @@ class MainActivity : ComponentActivity() {
     private val calendarPermission =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
+    /**
+     * 每次回到前台加一。
+     *
+     * **无障碍和悬浮窗都是去系统设置里开的,回来时没有任何回调** ——
+     * 没有这个的话副驾页会一直显示"还没开",而用户刚刚才开过。
+     * 他接下来会再去开一次,而系统那一下什么都不会发生。
+     *
+     * 日历那个权限不需要它(有授权对话框的回调),所以这里是新加的一条路。
+     */
+    private var resumeTick by mutableIntStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick++
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 内容铺到状态栏和手势条底下,由 Scaffold 把 inset 还回来。
@@ -99,7 +123,10 @@ class MainActivity : ComponentActivity() {
                     } else {
                         Home(
                             repo = repo,
+                            resumeTick = resumeTick,
                             onOpenListenerSettings = { openListenerSettings() },
+                            onOpenAccessibilitySettings = { openAccessibilitySettings() },
+                            onOpenOverlaySettings = { openOverlaySettings() },
                             onRequestCalendar = {
                                 calendarPermission.launch(
                                     arrayOf(
@@ -126,6 +153,26 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * 无障碍设置。**只能送到这一页,送不到具体那一项** ——
+     * 没有任何公开 API 能直接定位到某个服务,所以副驾页上要写清楚要找哪个名字。
+     */
+    private fun openAccessibilitySettings() {
+        runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+    }
+
+    /** 悬浮窗权限。这个能带包名,系统会直接停在本应用那一项上。 */
+    private fun openOverlaySettings() {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+        }
+    }
+
+    /**
      * 把控制台链接交给浏览器。
      *
      * **不用 WebView。** 那条链接十五分钟内有效,而 WebView 里的 cookie 存在
@@ -143,13 +190,17 @@ private enum class Section(val label: String, val icon: ImageVector) {
     Pending("待确认", Icons.Default.Notifications),
     Ledger("账本", Icons.Default.ShoppingCart),
     Memory("记忆", Icons.Default.Star),
+    Copilot("副驾", Icons.Default.Face),
     Status("状态", Icons.Default.Settings),
 }
 
 @Composable
 private fun Home(
     repo: Repository,
+    resumeTick: Int,
     onOpenListenerSettings: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit,
+    onOpenOverlaySettings: () -> Unit,
     onRequestCalendar: () -> Unit,
     onOpenUrl: (String) -> Unit,
     onUnenroll: () -> Unit,
@@ -185,7 +236,10 @@ private fun Home(
                                 Icon(section.icon, null)
                             }
                         },
-                        label = { Text(section.label) },
+                        // **一行,不许折。** 六格本来就比五格窄,而系统字体
+                        // 调到 130% 的手机上标签会折成两行 —— 导航栏高度是固定的,
+                        // 折了之后下半行直接被切掉,看起来像个坏掉的界面
+                        label = { Text(section.label, maxLines = 1) },
                     )
                 }
             }
@@ -197,6 +251,19 @@ private fun Home(
                 Section.Pending -> PendingScreen(repo, onCount = { pendingCount = it })
                 Section.Ledger -> LedgerScreen(repo)
                 Section.Memory -> MemoryScreen(repo)
+                Section.Copilot -> CopilotScreen(
+                    // 和日历那条同一条规矩:**传函数不传布尔值**。
+                    // 这两个权限还更进一步 —— 用户是离开这个 App 去开的,
+                    // 回来时没有任何回调,所以还要 `resumeTick` 逼它重问一次
+                    permissionTick = resumeTick,
+                    // 权限给没给**只能问系统**:自己那个标志在进程被杀时
+                    // 翻不回去,会留下一个过期的 true
+                    checkAccessibility = { CopilotState.accessibilityEnabled(context) },
+                    checkOverlay = { Settings.canDrawOverlays(context) },
+                    onOpenAccessibilitySettings = onOpenAccessibilitySettings,
+                    onOpenOverlaySettings = onOpenOverlaySettings,
+                )
+
                 Section.Status -> StatusScreen(
                     repo = repo,
                     localListenerEnabled = CollectorState.listenerEnabled(context),

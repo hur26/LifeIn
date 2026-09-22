@@ -81,7 +81,7 @@ import ltd.iclab.lifein.work.Schedules
 /** 每一页共用的顶栏。标题左对齐、动作在右,五页一个样子。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ScreenBar(
+internal fun ScreenBar(
     title: String,
     subtitle: String? = null,
     onRefresh: (() -> Unit)? = null,
@@ -114,7 +114,7 @@ private fun ScreenBar(
 
 /** 连不上服务端那一条。**措辞统一在这里** —— 五个页面各写一句会有五种说法。 */
 @Composable
-private fun OfflineNotice(message: String, onRetry: () -> Unit) {
+internal fun OfflineNotice(message: String, onRetry: () -> Unit) {
     NoticeBanner(
         "连不上服务端:$message",
         tone = Tone.Problem,
