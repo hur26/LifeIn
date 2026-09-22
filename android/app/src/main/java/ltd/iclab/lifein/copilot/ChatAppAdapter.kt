@@ -44,6 +44,15 @@ internal class TreeScan {
     /** 见到过气泡容器 —— **哪怕它的文字是空的**。这是"在不在聊天窗"的答案。 */
     var sawBubble = false
 
+    /**
+     * 有位置、但读不出文字的气泡。**截屏 OCR 兜底逐个识别的就是它们。**
+     *
+     * 位置本身已经够判断谁说的了(贴左边还是贴右边),所以这条路**不会丢掉
+     * 谁说的这件事** —— 这一点很要紧,05 那条"整屏 OCR 只在手动时跑"
+     * 正是因为整屏读法分不出边,而按矩形读分得出来。
+     */
+    val blankBubbles = ArrayList<Rect>()
+
     /** 见到过输入框。QQ 全程一个 Activity,只能靠这个判断在不在聊天窗。 */
     var sawInput = false
 
@@ -82,11 +91,14 @@ internal fun scanTree(
             // 隐藏节点文本,那时树里只剩下空气泡 —— 那正是 OCR 兜底存在的理由,
             // 而把它当成"不在聊天窗"的话,兜底永远不会被触发
             scan.sawBubble = true
+            val b = Rect()
+            node.getBoundsInScreen(b)
             if (!text.isNullOrBlank()) {
-                val b = Rect()
-                node.getBoundsInScreen(b)
                 scan.bubbles.add(ChatShaping.RawBubble(b.top, b.left, b.right, text))
                 if (b.top < scan.firstBubbleTop) scan.firstBubbleTop = b.top
+            } else if (b.width() > 0 && b.height() > 0) {
+                // 读不出字但有位置 —— OCR 兜底要按这些矩形逐个识别
+                scan.blankBubbles.add(Rect(b))
             }
         }
         if (inputId != null && !scan.sawInput && id == inputId) scan.sawInput = true
@@ -146,12 +158,24 @@ class WeChatAdapter : ChatAppAdapter {
             screenWidth = width,
             screenHeight = height,
         )
-        // 在聊天窗但一句都读不出来 → 空快照,那是 OCR 兜底的信号,不是失败
+        // 在聊天窗但一句都读不出来 → 空快照 + 气泡矩形,那是 OCR 兜底的信号,不是失败
         val messages = ChatShaping.toMessages(scan.bubbles) {
             ChatShaping.sideByCenter(it, width)
         }
-        return ChatSnapshot(title, messages)
+        return ChatSnapshot(title, messages, rectsOf(scan, width))
     }
+
+    /** 读不出字的那些气泡,连同位置判出来的谁说的。 */
+    private fun rectsOf(scan: TreeScan, width: Int): List<BubbleRect> =
+        scan.blankBubbles
+            .sortedBy { it.top }
+            .map { rect ->
+                val side = ChatShaping.sideByCenter(
+                    ChatShaping.RawBubble(rect.top, rect.left, rect.right, ""),
+                    width,
+                )
+                BubbleRect(rect, side)
+            }
 
     private companion object {
         const val BUBBLE_ID = "com.tencent.mm:id/bkl"
@@ -200,7 +224,16 @@ class QQAdapter : ChatAppAdapter {
         val messages = ChatShaping.toMessages(scan.bubbles) {
             ChatShaping.sideByAvatarColumn(it, width)
         }
-        return ChatSnapshot(title, messages)
+        val rects = scan.blankBubbles
+            .sortedBy { it.top }
+            .map { rect ->
+                val side = ChatShaping.sideByAvatarColumn(
+                    ChatShaping.RawBubble(rect.top, rect.left, rect.right, ""),
+                    width,
+                )
+                BubbleRect(rect, side)
+            }
+        return ChatSnapshot(title, messages, rects)
     }
 
     private companion object {

@@ -1,6 +1,7 @@
 package ltd.iclab.lifein.copilot
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -89,6 +90,26 @@ open class ChatCaptureService : AccessibilityService() {
 
     private var overlay: CopilotOverlay? = null
     private val filler by lazy { CopilotFill(this) }
+    private val history by lazy { CopilotHistory(this) }
+
+    /**
+     * 截屏器。**藏悬浮窗的回调交给它** —— 悬浮窗也在屏幕上,
+     * 不藏起来会被拍进图里然后被认成聊天内容。
+     */
+    private val screenshot by lazy {
+        CopilotScreenshot(
+            this,
+            hideOverlay = { overlay?.setHiddenForShot(true) },
+            restoreOverlay = { overlay?.setHiddenForShot(false) },
+        )
+    }
+    private val ocr = CopilotOcr()
+
+    /** 一次只认一屏。截屏和识别都不便宜,而事件是一秒好几个。 */
+    private var ocrBusy = false
+
+    /** 上一次截过的那屏气泡长什么样。见 [ocrFallback]:这是 OCR 那条路的刹车。 */
+    private var lastOcrFingerprint = ""
 
     /** 正在分析。连点悬浮球不该变成连打三次模型。 */
     @Volatile
@@ -113,6 +134,9 @@ open class ChatCaptureService : AccessibilityService() {
         // 无障碍服务被 ROM 冻结之后不会自己回来(ADR-021 的 2026-09-22 追加)。
         // 起不来不算错 —— 只是少了一层保护,不该让整个服务连不上
         if (prefs.enabled) runCatching { CopilotKeepAlive.start(this) }
+        // 第一次识别要付模型加载的钱,而那一次是在截屏回调里跑的 ——
+        // 那个回调在主线程上。挪到这里,挪到没人等的时候
+        submit { CopilotOcr.warmUp() }
         Log.i(TAG, "副驾读屏服务已连接,放行 ${prefs.allowedApps.size} 个 App")
     }
 
@@ -178,16 +202,28 @@ open class ChatCaptureService : AccessibilityService() {
 
         if (snapshot.messages.isEmpty()) {
             // 在聊天窗,但树里一句正文都没有。**这是 ADR-035 的重评触发条件** ——
-            // 微信可能又改了混淆方式。截屏 OCR 兜底是 P5 第三片。
+            // 微信可能又改了混淆方式。
             // 悬浮球留着:点它能看到那句"多半是这个 App 改了防护",
             // 而那句话是这个触发条件唯一会被人看见的地方
             noteDiagnosis(CopilotState.EMPTY_TREE, 0)
             currentSnapshot = null
             pendingSnapshot = null
             main.post { overlay?.showIdle(null) }
+            if (prefs.ocrFallback) ocrFallback(pkg, adapter, snapshot)
             return
         }
 
+        onSnapshotReady(pkg, snapshot)
+    }
+
+    /**
+     * 两条路(读树、截屏 OCR)的共同下半段:去重、决定要不要自动分析。
+     *
+     * 合在一起而不是各写一遍,是因为去重那几行的**错法是静默的** ——
+     * 一边漏了的表现只是"这条路偶尔多打一次模型",在账单上看得见,
+     * 在代码里看不见。
+     */
+    private fun onSnapshotReady(pkg: String, snapshot: ChatSnapshot) {
         // 换到另一个放行的 App 要把指纹清掉:两个 App 最后几条恰好一样时
         // (比如同一个人在微信和 QQ 上发了同一句话),不清的那一边会被当成
         // "没变化"而整个吞掉
@@ -248,6 +284,123 @@ open class ChatCaptureService : AccessibilityService() {
         return snapshot
     }
 
+    // ---------- 截屏 OCR 兜底 ----------
+
+    /**
+     * 树里读不到正文时,截一张图逐个气泡认字。
+     *
+     * **只认气泡矩形,不整屏识别。** 这是 05 那条缓解措施的原话:
+     * 整屏识别会把屏幕上任何东西都读进来,包括顶上飘过的通知横幅和根本不是
+     * 聊天的部分。按矩形读还顺带保住了"谁说的" —— 位置本身就是答案。
+     *
+     * 一个气泡都没定位到的话这条路走不通:没有矩形就只剩整屏,而那条不走。
+     */
+    private fun ocrFallback(pkg: String, adapter: ChatAppAdapter, snapshot: ChatSnapshot) {
+        if (ocrBusy) return
+        if (snapshot.bubbleRects.isEmpty()) return
+
+        // **在按快门之前挡住重复。** 少了这一层,一个树永远读不到字的聊天窗
+        // 会在每个 content-changed 事件上截一张图 —— 而光标闪一下就是一个事件。
+        // 气泡矩形只在列表滚动或者来了新消息时才会变,那正是要measure的东西
+        val fingerprint = snapshot.bubbleRects.joinToString(";") {
+            "${it.rect.left},${it.rect.top},${it.rect.right},${it.rect.bottom},${it.side}"
+        }
+        if (fingerprint == lastOcrFingerprint && overlay?.isShowing() == true) return
+        lastOcrFingerprint = fingerprint
+
+        ocrBusy = true
+        screenshot.capture { result ->
+            when (result) {
+                is CopilotScreenshot.Result.Failed -> {
+                    ocrBusy = false
+                    // 什么都没读到,所以这个指纹不能算"处理过了" ——
+                    // 否则下一个事件会被上面那道挡掉,而这一屏永远不会被再试一次
+                    lastOcrFingerprint = ""
+                    Log.i(TAG, "截屏失败:码=${result.code}")
+                    // 时机类的码会一直出现,说出来只会变成噪音
+                    if (!CopilotScreenshot.isTransient(result.code)) {
+                        overlay?.showMessage(result.message)
+                    }
+                }
+
+                is CopilotScreenshot.Result.Ok -> {
+                    // **回调里重新量一次矩形。** 交进来那份是在藏悬浮窗那 120 毫秒
+                    // 和快门之前读的,中间滚一格就会裁到隔壁几行
+                    val fresh = rootInActiveWindow
+                        ?.let { adapter.extract(it, resources) }
+                        ?.bubbleRects
+                    ocrByRects(
+                        result,
+                        if (fresh.isNullOrEmpty()) snapshot.bubbleRects else fresh,
+                        snapshot.title,
+                        pkg,
+                    )
+                }
+            }
+        }
+    }
+
+    /** 一个矩形一次识别,一个矩形一条消息。**全部认完才往下走。** */
+    private fun ocrByRects(
+        shot: CopilotScreenshot.Result.Ok,
+        rects: List<BubbleRect>,
+        title: String?,
+        pkg: String,
+    ) {
+        val texts = arrayOfNulls<String>(rects.size)
+        var remaining = rects.size
+        rects.forEachIndexed { index, bubble ->
+            // 屏幕坐标 → 位图坐标。**先减掉窗口原点再缩放** ——
+            // 窗口截图不是从 (0,0) 开始的(分屏、或者窗口不含状态栏)
+            val region = Rect(
+                ((bubble.rect.left - shot.originX) * shot.scaleX).toInt(),
+                ((bubble.rect.top - shot.originY) * shot.scaleY).toInt(),
+                ((bubble.rect.right - shot.originX) * shot.scaleX).toInt(),
+                ((bubble.rect.bottom - shot.originY) * shot.scaleY).toInt(),
+            )
+            ocr.recognize(shot.bitmap, region) { lines ->
+                texts[index] = lines.joinToString(" ") { it.text }
+                remaining--
+                if (remaining == 0) {
+                    runCatching { shot.bitmap.recycle() }
+                    finishOcr(rects, texts, title, pkg)
+                }
+            }
+        }
+    }
+
+    private fun finishOcr(
+        rects: List<BubbleRect>,
+        texts: Array<String?>,
+        title: String?,
+        pkg: String,
+    ) {
+        ocrBusy = false
+        // **走 ChatShaping 那个共用函数**,不是自己拼一遍:
+        // 验证码过滤、时间戳过滤、已读标记清理都在那里,
+        // 而这条路上的文字在这几点上和读树出来的没有任何区别
+        val messages = ChatShaping.toMessages(
+            rects.mapIndexed { index, bubble ->
+                ChatShaping.SidedBubble(
+                    ChatShaping.RawBubble(
+                        top = bubble.rect.top,
+                        left = bubble.rect.left,
+                        right = bubble.rect.right,
+                        text = texts[index].orEmpty(),
+                    ),
+                    side = bubble.side,
+                )
+            }
+        )
+        // 只记条数,不记内容
+        Log.i(TAG, "OCR 认出 ${messages.size} 条,来自 ${rects.size} 个气泡")
+        if (messages.isEmpty()) {
+            noteDiagnosis(CopilotState.EMPTY_TREE, 0)
+            return
+        }
+        onSnapshotReady(pkg, ChatSnapshot(title, messages, note = CAPTURE_NOTE_OCR))
+    }
+
     /** 离开聊天窗:把悬浮窗收走,并且忘掉手上这份快照。
      *
      *  **忘掉这一步不能省。** 留着的话,用户在别处点一下悬浮球,
@@ -278,12 +431,16 @@ open class ChatCaptureService : AccessibilityService() {
             val message = runCatching {
                 val enrollment = LifeInApp.instance.secrets.load()
                     ?: return@runCatching "还没配码。先在 LifeIn 里扫一次配置二维码"
+                // **先读历史再记这一屏。** 反过来的话,刚记进去的这一屏
+                // 会作为"历史"再送一遍,模型会看见每句话说了两遍
+                val past = recallHistory(snapshot)
                 val result = LifeInApi(enrollment).copilotAnalyze(
                     CopilotAnalyzeBody(
                         deviceId = enrollment.deviceId,
                         app = app,
                         title = snapshot.title.orEmpty(),
                         messages = snapshot.messages.map { CopilotMsgBody(it.side, it.text) },
+                        history = past.map { CopilotMsgBody(it.side, it.text) },
                         captureNote = snapshot.note.orEmpty(),
                     )
                 )
@@ -299,6 +456,20 @@ open class ChatCaptureService : AccessibilityService() {
             analyzing = false
             if (message != null) main.post { overlay?.showMessage(message) }
         }
+    }
+
+    /**
+     * 把这一屏并进本地历史,并取出排在它之前的那一段(ADR-038)。
+     *
+     * **阻塞,在工作线程上跑** —— 它读写 Room。
+     *
+     * 关掉记历史、或者这个会话没有标题时,返回空:没有长上下文只是回复质量
+     * 差一点,而**把两个人的历史搅在一起**会让副驾拿着张三的话去回李四。
+     */
+    private fun recallHistory(snapshot: ChatSnapshot): List<Msg> {
+        if (!prefs.keepHistory) return emptyList()
+        val key = history.conversationKey(activePkg.orEmpty(), snapshot.title) ?: return emptyList()
+        return history.mergeAndRead(key, snapshot.messages, HISTORY_TO_SEND)
     }
 
     /**
@@ -355,5 +526,17 @@ open class ChatCaptureService : AccessibilityService() {
 
         /** 去抖窗口。太短会为一条消息打三次模型,太长会让用户觉得它没反应。 */
         const val DEBOUNCE_MS = 800L
+
+        /**
+         * 一次最多带多少条本地历史上路。
+         *
+         * **权威的窗口在服务端**(`COPILOT_MAX_HISTORY`,默认 30),它还会再切一次。
+         * 这里这个数只是"别让请求体白白变大",所以宽一点没关系 ——
+         * 两边写成同一个数才是麻烦:那种重复迟早会漂,而漂了没有人会发现。
+         */
+        const val HISTORY_TO_SEND = 60
+
+        /** 这一屏是截屏认出来的。原样送给服务端,再原样回到面板上。 */
+        const val CAPTURE_NOTE_OCR = "ocr"
     }
 }

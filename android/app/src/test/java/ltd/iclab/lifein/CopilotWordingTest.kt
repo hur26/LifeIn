@@ -71,11 +71,13 @@ class CopilotWordingTest {
     }
 
     @Test
-    fun `an OCR capture admits it cannot tell who said what`() {
-        // OCR 分不出边,全按对方算。**这件事必须让用户看见** ——
-        // 悄悄当成对方说的话,他会拿到一条回自己的候选而不知道为什么
+    fun `an OCR capture admits it may have misread, but not that it lost the sides`() {
+        // 自动那条 OCR 是按气泡矩形逐个识别的,**位置本身就回答了谁说的** ——
+        // 所以这句话要认的是"可能认错字",不是"分不清谁说的"。
+        // 承认一个其实没犯的错,只会让用户白白不信任结果
         val text = CopilotWording.captureNote("ocr")
-        assertTrue(text, text!!.contains("分不清谁说的"))
+        assertTrue(text, text!!.contains("认错"))
+        assertTrue(text, !text.contains("分不清"))
         // 正常读树的时候不用说话:每一条都说等于没有一条被读
         assertNull(CopilotWording.captureNote(""))
         assertNull(CopilotWording.captureNote("tree"))

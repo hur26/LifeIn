@@ -128,18 +128,64 @@ object ChatShaping {
      * 命中的**整条不要**,不上传也不写本地历史。
      */
     fun toMessages(bubbles: List<RawBubble>, side: (RawBubble) -> String): List<Msg> =
-        bubbles
-            .sortedBy { it.top }
-            .mapNotNull { bubble ->
-                val text = bubble.text.trim()
+        toMessages(bubbles.map { SidedBubble(it, side(it)) })
+
+    /** 已经判好边的气泡。截屏 OCR 那条路走这个 —— 边是从矩形位置算的,不是从文字。 */
+    data class SidedBubble(val bubble: RawBubble, val side: String)
+
+    /**
+     * **两条路(读树、截屏 OCR)都从这里过。**
+     *
+     * 共用一个函数不是为了省代码,是为了让验证码过滤没有第二条绕过去的路:
+     * 05 那条缓解措施写的是"验证码那两道过滤在这条通道上照样要有",
+     * 而 OCR 出来的文字和读树出来的文字在这一点上没有任何区别。
+     */
+    fun toMessages(sided: List<SidedBubble>): List<Msg> =
+        sided
+            .sortedBy { it.bubble.top }
+            .mapNotNull { entry ->
+                val text = cleanBubbleText(entry.bubble.text)
                 when {
                     text.isEmpty() -> null
                     isPureTimestamp(text) -> null
                     VerificationCode.matches(text) -> null
-                    else -> Msg(side(bubble), text)
+                    else -> Msg(entry.side, text)
                 }
             }
             .takeLast(MAX_BUBBLES)
+
+    /**
+     * 去掉气泡尾巴上粘着的已读标记和时间戳。
+     *
+     * 读树那条路上很少见,**截屏 OCR 那条路上几乎每条都有** ——
+     * 一个矩形里认出来的字会把角落里那个"14:05"和"已读"一起收进来,
+     * 而它们会被模型当成对方说的话的一部分。
+     *
+     * 反复剥,因为它们会叠着出现("……好的 14:05 已读")。
+     */
+    fun cleanBubbleText(raw: String): String {
+        var text = raw.trim()
+        var changed = true
+        while (changed && text.isNotEmpty()) {
+            changed = false
+            for (tail in READ_MARKS) {
+                if (text.endsWith(tail)) {
+                    text = text.removeSuffix(tail).trim()
+                    changed = true
+                }
+            }
+            TAIL_TIME.find(text)?.let {
+                text = text.substring(0, it.range.first).trim()
+                changed = true
+            }
+        }
+        return text
+    }
+
+    private val READ_MARKS = listOf("已读", "未读")
+
+    /** 只认**结尾**那个钟点。句子中间的"15:00 开会"不能动。 */
+    private val TAIL_TIME = Regex("""\s*\d{1,2}[:：]\d{2}$""")
 
     /**
      * 动作栏里的会话标题:第一条气泡上方、大致居中、最靠上的那个短文字。

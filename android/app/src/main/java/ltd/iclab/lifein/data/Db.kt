@@ -152,9 +152,90 @@ interface CalendarLinkDao {
     suspend fun writtenEventIds(): List<String>
 }
 
+/**
+ * 副驾读到的一条消息(P5,[ADR-038](../../../../../../../docs/04-tech-decisions.md))。
+ *
+ * **这张表是这个库里唯一一张"服务端没有副本"的表。** 别的表要么是还没送出去的
+ * 队列,要么是服务端那份的缓存;这一张是**唯一的一份** —— 删了就真没了。
+ *
+ * 那正是 ADR-038 想要的:副驾读记忆,不写记忆。对话留在你自己手机上,
+ * 服务器上没有它的影子,换手机也带不走。这个代价是明知道并接受的。
+ *
+ * [conversation] 是 `包名|会话标题`。**标题为空的对话不记** ——
+ * 分不清是谁的对话时,把两个人的历史搅在一起比没有历史糟得多。
+ */
+@Entity(
+    tableName = "copilot_messages",
+    // 按会话取最近 N 条是唯一的读法,而它每次分析都要跑一遍
+    indices = [Index(value = ["conversation", "id"])],
+)
+data class CopilotMessage(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val conversation: String,
+    /** 只有 `me` / `other`。和接口那边同一条规矩(06 §6.16)。 */
+    val side: String,
+    val text: String,
+    val at: Long,
+)
+
+@Dao
+interface CopilotMessageDao {
+
+    /**
+     * 最近 n 条,**按时间正序返回**。
+     *
+     * SQL 里要倒着取再翻过来:正着取会从最老的开始,而上限一满
+     * 拿到的就全是几天前的话。
+     */
+    @Query(
+        "SELECT * FROM (SELECT * FROM copilot_messages WHERE conversation = :conversation " +
+            "ORDER BY id DESC LIMIT :limit) ORDER BY id ASC"
+    )
+    fun recent(conversation: String, limit: Int): List<CopilotMessage>
+
+    @Insert
+    fun append(messages: List<CopilotMessage>)
+
+    /**
+     * 砍到只剩最新的 [keep] 条。**按会话砍,不是按整张表** ——
+     * 按整张表砍会让一个聊得多的群把别人的历史挤没。
+     */
+    @Query(
+        "DELETE FROM copilot_messages WHERE conversation = :conversation AND id NOT IN " +
+            "(SELECT id FROM copilot_messages WHERE conversation = :conversation " +
+            "ORDER BY id DESC LIMIT :keep)"
+    )
+    fun trim(conversation: String, keep: Int)
+
+    /** 09 §5 承诺的那个"一键清空副驾历史"。 */
+    @Query("DELETE FROM copilot_messages")
+    fun clear()
+
+    @Query("SELECT count(*) FROM copilot_messages")
+    fun total(): Int
+
+    /**
+     * 追加并砍到上限,**在一个事务里**。
+     *
+     * 分成两次的话,中间被杀会留下一张超过上限的表,
+     * 而那张表下次被读到时会多带几条进 prompt —— 一个不会报错的超支。
+     */
+    @Transaction
+    fun appendAndTrim(messages: List<CopilotMessage>, keep: Int) {
+        if (messages.isEmpty()) return
+        append(messages)
+        trim(messages.first().conversation, keep)
+    }
+}
+
 @Database(
-    entities = [QueuedEvent::class, CachedTodo::class, CalendarLink::class],
-    version = 3,
+    entities = [
+        QueuedEvent::class,
+        CachedTodo::class,
+        CalendarLink::class,
+        CopilotMessage::class,
+    ],
+    version = 4,
     exportSchema = true,
 )
 abstract class LifeInDatabase : RoomDatabase() {
@@ -164,6 +245,8 @@ abstract class LifeInDatabase : RoomDatabase() {
     abstract fun cachedTodos(): CachedTodoDao
 
     abstract fun calendarLinks(): CalendarLinkDao
+
+    abstract fun copilotMessages(): CopilotMessageDao
 
     companion object {
         @Volatile
@@ -200,13 +283,38 @@ abstract class LifeInDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * 加副驾的本地对话表(P5,ADR-038)。同样是真迁移。
+         *
+         * **这张表尤其不能靠破坏性重建**:别的表丢了最多是重拉一次或者
+         * 少一条待上报,而这张表**没有第二份** —— 服务端从来没有过它的副本。
+         */
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS copilot_messages (" +
+                        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, " +
+                        "conversation TEXT NOT NULL, " +
+                        "side TEXT NOT NULL, " +
+                        "text TEXT NOT NULL, " +
+                        "at INTEGER NOT NULL)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_copilot_messages_conversation_id " +
+                        "ON copilot_messages (conversation, id)"
+                )
+            }
+        }
+
         fun get(context: Context): LifeInDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
                     context.applicationContext,
                     LifeInDatabase::class.java,
                     "lifein.db",
-                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build().also { instance = it }
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .build()
+                    .also { instance = it }
             }
     }
 }

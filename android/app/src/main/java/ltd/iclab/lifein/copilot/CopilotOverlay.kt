@@ -191,6 +191,16 @@ class CopilotOverlay(
         panel?.visibility = View.GONE
     }
 
+    /**
+     * 截屏的时候先躲一下。**是设成 INVISIBLE,不是把窗口拆了。**
+     *
+     * 拆了再建会闪一下,而且面板上那三条候选会连着判断一起没掉 ——
+     * 用户看到的是"刚出来的东西自己消失了"。
+     */
+    fun setHiddenForShot(hidden: Boolean) {
+        root?.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
+    }
+
     private fun expand() {
         panel?.visibility = View.VISIBLE
     }
