@@ -5,6 +5,12 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import ltd.iclab.lifein.LifeInApp
+import ltd.iclab.lifein.net.CopilotAnalyzeBody
+import ltd.iclab.lifein.net.CopilotMsgBody
+import ltd.iclab.lifein.net.LifeInApi
 
 /**
  * 副驾的读屏服务 —— **这条通道的入口**(ADR-035,架构 §8.7)。
@@ -66,21 +72,64 @@ open class ChatCaptureService : AccessibilityService() {
      */
     private val lastGoodTitle = HashMap<String, String>()
 
+    /** 去抖窗口里等着被分析的那一份。 */
     private var pendingSnapshot: ChatSnapshot? = null
-    private val debounce = Runnable { pendingSnapshot?.let { deliver(it) } }
+
+    /** 屏幕上现在是什么。自动触发没开时,点悬浮球分析的就是它。 */
+    private var currentSnapshot: ChatSnapshot? = null
+
+    private val debounce = Runnable { pendingSnapshot?.let { analyze(it) } }
+
+    /**
+     * 网络和填入都跑在这上面。**单线程,不是线程池** ——
+     * 两次分析并发跑没有意义(后一次的结果会盖掉前一次),
+     * 而排队还顺带给了一层"用户连点也只打一次模型"的保护。
+     */
+    private val worker = Executors.newSingleThreadExecutor()
+
+    private var overlay: CopilotOverlay? = null
+    private val filler by lazy { CopilotFill(this) }
+
+    /** 正在分析。连点悬浮球不该变成连打三次模型。 */
+    @Volatile
+    private var analyzing = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         CopilotState.setServiceConnected(this, true)
+        overlay = CopilotOverlay(this, prefs).apply {
+            onTapAnalyze = {
+                // 手动点:有快照就分析,没有就把"为什么没有"当场说出来。
+                // **这是架构 §8.7 那条"悬浮窗当场说明原因"的落点**
+                val snapshot = pendingSnapshot ?: currentSnapshot
+                if (snapshot == null) {
+                    showMessage(CopilotWording.diagnosis(lastDiagnosis))
+                } else {
+                    analyze(snapshot)
+                }
+            }
+            onFill = { text -> fill(text) }
+        }
         // 无障碍服务被 ROM 冻结之后不会自己回来(ADR-021 的 2026-09-22 追加)。
         // 起不来不算错 —— 只是少了一层保护,不该让整个服务连不上
         if (prefs.enabled) runCatching { CopilotKeepAlive.start(this) }
         Log.i(TAG, "副驾读屏服务已连接,放行 ${prefs.allowedApps.size} 个 App")
     }
 
+    private fun submit(task: () -> Unit) {
+        // 服务已经被拆掉之后,一个迟到的悬浮窗回调不该把进程带崩
+        runCatching { worker.execute(task) }
+            .onFailure { if (it !is RejectedExecutionException) throw it }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (!prefs.enabled) return
+        if (!prefs.enabled) {
+            // 用户在 App 里把副驾关掉了,而这个服务还绑着。
+            // 悬浮窗要跟着收走,否则它会一直挂在那里说自己在工作
+            leaveChat()
+            return
+        }
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
@@ -97,6 +146,10 @@ open class ChatCaptureService : AccessibilityService() {
      * 而聊天 App 仍然在前台。按事件包名判断的表现是悬浮窗在打字时不停闪。
      */
     private fun maybeCapture() {
+        // 悬浮窗权限没给的时候一个字都不读。读到了也没地方显示,
+        // 而那意味着一次白花钱的模型调用
+        if (overlay?.hasPermission() != true) return
+
         val root = rootInActiveWindow ?: return
         val pkg = root.packageName?.toString() ?: return
 
@@ -105,22 +158,33 @@ open class ChatCaptureService : AccessibilityService() {
             // 没适配器不是"坏了",只是没写。**这两件事要显示成两句不同的话**
             // (架构 §8.7),所以诊断码也必须是两个
             noteDiagnosis(CopilotState.NO_ADAPTER, 0)
+            leaveChat()
             return
         }
         if (!prefs.allows(pkg)) {
             noteDiagnosis(CopilotState.NOT_ALLOWED, 0)
+            leaveChat()
             return
         }
 
-        // 不在聊天窗(会话列表、朋友圈、设置页)→ 什么都不做,连状态都不记:
+        // 不在聊天窗(会话列表、朋友圈、设置页)→ 收起悬浮窗,但**不记状态**:
         // 这一条每秒会走很多次,记下来只会把真正有用的那条诊断冲掉
-        val raw = adapter.extract(root, resources) ?: return
+        val raw = adapter.extract(root, resources)
+        if (raw == null) {
+            leaveChat()
+            return
+        }
         val snapshot = stabilizeTitle(pkg, raw)
 
         if (snapshot.messages.isEmpty()) {
             // 在聊天窗,但树里一句正文都没有。**这是 ADR-035 的重评触发条件** ——
-            // 微信可能又改了混淆方式。截屏 OCR 兜底是 P5 第三片
+            // 微信可能又改了混淆方式。截屏 OCR 兜底是 P5 第三片。
+            // 悬浮球留着:点它能看到那句"多半是这个 App 改了防护",
+            // 而那句话是这个触发条件唯一会被人看见的地方
             noteDiagnosis(CopilotState.EMPTY_TREE, 0)
+            currentSnapshot = null
+            pendingSnapshot = null
+            main.post { overlay?.showIdle(null) }
             return
         }
 
@@ -132,8 +196,14 @@ open class ChatCaptureService : AccessibilityService() {
             lastSignature = ""
         }
 
+        currentSnapshot = snapshot
         val signature = snapshot.signature()
-        if (signature == lastSignature) return
+        if (signature == lastSignature) {
+            // 内容没变,但悬浮窗可能被 ROM 干掉了(或者切走又切回来)。
+            // **只把球放回去,不重新分析** —— 那是一次花钱的调用
+            if (overlay?.isShowing() != true) main.post { overlay?.showIdle(snapshot.title) }
+            return
+        }
         lastSignature = signature
         // **只记条数和谁说的,不记一个字。** 这行日志会进 logcat,
         // 而 logcat 是这台手机上最不受控的一个地方
@@ -144,9 +214,17 @@ open class ChatCaptureService : AccessibilityService() {
         )
         noteDiagnosis(CopilotState.OK, snapshot.messages.size)
 
+        // 换了一段对话,先把上一段的判断和候选清掉 ——
+        // 留着的话,用户会在新对话上看到一条为旧对话起草的句子,
+        // 而那条句子看起来完全正常
+        main.post { overlay?.collapse() }
+
         // **自动触发只在最后一条是对方说的时候。** 自己刚发完一句话,
         // 没有什么需要回的 —— 那时候弹出三条候选只会挡住屏幕
-        if (snapshot.latestFrom != ChatShaping.SIDE_OTHER || !prefs.autoAnalyze) return
+        if (snapshot.latestFrom != ChatShaping.SIDE_OTHER || !prefs.autoAnalyze) {
+            main.post { overlay?.showIdle(snapshot.title) }
+            return
+        }
 
         pendingSnapshot = snapshot
         // 一条消息到达会连着触发好几个 content-changed 事件(气泡动画、
@@ -170,16 +248,77 @@ open class ChatCaptureService : AccessibilityService() {
         return snapshot
     }
 
-    /**
-     * 这一屏读完了,该去分析了。
+    /** 离开聊天窗:把悬浮窗收走,并且忘掉手上这份快照。
      *
-     * **目前只落状态。** 悬浮窗和 `POST /app/copilot/analyze` 是 P5 的第二片,
-     * 本地历史和 OCR 兜底是第三片 —— 它们都挂在这个方法上。
-     * 先把读屏这一段跑通再往上接,是因为读屏是唯一一段**只能在真机上验**的:
-     * 节点 id 对不对、谁说的判得准不准,单元测试答不了。
+     *  **忘掉这一步不能省。** 留着的话,用户在别处点一下悬浮球,
+     *  会拿到一份为上一个聊天窗起草的候选 —— 而那三条句子看起来完全正常。 */
+    private fun leaveChat() {
+        currentSnapshot = null
+        pendingSnapshot = null
+        main.post { overlay?.hide() }
+    }
+
+    /**
+     * 拿这一屏去换判断和三条候选。
+     *
+     * **一次请求在服务端要打三次模型**,所以这里有两道闸:[analyzing] 挡连点,
+     * 上面的去抖挡一条消息引发的连串事件。漏掉任何一道的表现都是账单上看得见、
+     * 代码里看不见。
      */
-    private fun deliver(snapshot: ChatSnapshot) {
-        Log.i(TAG, "待分析:${snapshot.messages.size} 条,最后一条来自 ${snapshot.latestFrom}")
+    private fun analyze(snapshot: ChatSnapshot) {
+        if (analyzing) return
+        analyzing = true
+        val app = adapters[activePkg]?.serverApp
+        if (app == null) {
+            analyzing = false
+            return
+        }
+        overlay?.showLoading()
+        submit {
+            val message = runCatching {
+                val enrollment = LifeInApp.instance.secrets.load()
+                    ?: return@runCatching "还没配码。先在 LifeIn 里扫一次配置二维码"
+                val result = LifeInApi(enrollment).copilotAnalyze(
+                    CopilotAnalyzeBody(
+                        deviceId = enrollment.deviceId,
+                        app = app,
+                        title = snapshot.title.orEmpty(),
+                        messages = snapshot.messages.map { CopilotMsgBody(it.side, it.text) },
+                        captureNote = snapshot.note.orEmpty(),
+                    )
+                )
+                main.post { overlay?.showResult(result) }
+                null
+            }.getOrElse { error ->
+                // 状态码不能糊成一句"失败":404 是服务端没开副驾,
+                // 401 是凭据被吊销了,而这两个再点一百次也不会变
+                val code = (error as? LifeInApi.HttpError)?.code
+                Log.w(TAG, "副驾分析失败:code=$code ${error::class.simpleName}")
+                CopilotWording.failure(code)
+            }
+            analyzing = false
+            if (message != null) main.post { overlay?.showMessage(message) }
+        }
+    }
+
+    /**
+     * 把一条候选填进输入框。**动节点的活全在 [CopilotFill] 里**,
+     * 这里只负责挪到工作线程、把结果说给用户听。
+     *
+     * 填完不发。这一条不在这个方法里,在这个功能的定义里(01 §8)。
+     */
+    private fun fill(text: String) {
+        submit {
+            val outcome = runCatching { filler.fill(text) }
+                .getOrElse { CopilotFill.Outcome.Copied(it::class.simpleName ?: "填不进去") }
+            main.post {
+                when (outcome) {
+                    is CopilotFill.Outcome.Filled -> overlay?.toast("已填入,确认之后自己发送")
+                    is CopilotFill.Outcome.Copied ->
+                        overlay?.toast("${outcome.why},已复制,长按输入框粘贴")
+                }
+            }
+        }
     }
 
     private fun noteDiagnosis(diagnosis: String, messageCount: Int) {
@@ -199,6 +338,13 @@ open class ChatCaptureService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         main.removeCallbacks(debounce)
+        // 先切回调再拆窗口:一个迟到的按钮点击不该回到一个已经死掉的实例上,
+        // 而那个实例手里还攥着 rootInActiveWindow
+        overlay?.onTapAnalyze = null
+        overlay?.onFill = null
+        overlay?.hide()
+        overlay = null
+        worker.shutdownNow()
         // 服务没了就是读不到了。**默认 false 那一条在这里闭环**:
         // 状态页显示的"副驾在跑"不能是一个从来没被翻回去的 true
         CopilotState.setServiceConnected(this, false)

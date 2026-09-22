@@ -483,3 +483,74 @@ data class ConsoleLinkDto(
     val url: String,
     @SerialName("expires_at") val expiresAt: String,
 )
+
+// ---------- 副驾(P5,06 §6.16) ----------
+
+/**
+ * 一条聊天消息。**`side` 只有 `me` / `other`** —— 服务端不猜,别的值会被丢掉并计数。
+ *
+ * 和 [IngestEvent] 长得不像是有意的:那条是"上报一件发生过的事",
+ * 这条是"这次分析的素材"。**这条一行都不落库**(ADR-038)。
+ */
+@Serializable
+data class CopilotMsgBody(val side: String, val text: String)
+
+@Serializable
+data class CopilotAnalyzeBody(
+    @SerialName("device_id") val deviceId: String,
+    val app: String,
+    val title: String = "",
+    val messages: List<CopilotMsgBody>,
+    val history: List<CopilotMsgBody> = emptyList(),
+    @SerialName("capture_note") val captureNote: String = "",
+)
+
+/**
+ * 判断那一次的结果。**全是枚举、布尔和分数,一个自由文本字段都没有。**
+ *
+ * 这不是省字段,是 ADR-037 那条结构性防线:三次模型调用里只有起草那次
+ * 能产出会进输入框的文本。**往这里加一个 String 之前先读那条 ADR** ——
+ * 服务端有一条用例盯着它(`test_judgement_has_no_free_text_field`),
+ * 但那条守不住客户端。
+ */
+@Serializable
+data class CopilotJudgement(
+    val literal: Boolean = true,
+    @SerialName("true_intent") val trueIntent: String = "unknown",
+    @SerialName("intent_confidence") val intentConfidence: Double = 0.0,
+    @SerialName("danger_level") val dangerLevel: Int = 0,
+    val needs: String = "unknown",
+    @SerialName("best_action") val bestAction: String = "unknown",
+    @SerialName("should_reply_now") val shouldReplyNow: Boolean = true,
+    @SerialName("tension_resolved") val tensionResolved: Boolean = false,
+)
+
+@Serializable
+data class CopilotCandidate(
+    val text: String,
+    val rank: Int = 0,
+    val share: Double = 0.0,
+)
+
+@Serializable
+data class CopilotContext(
+    @SerialName("facts_used") val factsUsed: Int = 0,
+    @SerialName("history_used") val historyUsed: Int = 0,
+)
+
+/**
+ * 固定形状:每个键都在(06 §6.16)。
+ *
+ * **"少一个键"和"这个值是 0"在客户端看起来一样**,而前者是服务端出了问题、
+ * 后者是这次真的没有 —— 所以这里每个字段都有默认值,而 [degraded] 用 null
+ * 表示"没降级",不是空字符串。
+ */
+@Serializable
+data class CopilotAnalyzeResult(
+    val judgement: CopilotJudgement = CopilotJudgement(),
+    val candidates: List<CopilotCandidate> = emptyList(),
+    val context: CopilotContext = CopilotContext(),
+    @SerialName("capture_note") val captureNote: String = "",
+    val degraded: String? = null,
+    val dropped: Int = 0,
+)

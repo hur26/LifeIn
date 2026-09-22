@@ -241,6 +241,34 @@ class LifeInApi(
         json.decodeFromString(ConsoleLinkDto.serializer(), bearerPost(PATH_CONSOLE_LINK, it, "{}"))
     }
 
+    // ---------- 副驾(P5,06 §6.16) ----------
+
+    /**
+     * 读一屏对话,换回判断与三条候选。
+     *
+     * **走查询端凭据,不是采集端**(铁律 12):它是一次问答,不是一次上报。
+     * 请求体一行都不落库 —— 服务端只写一条不含内容的审计(ADR-038)。
+     *
+     * **用 [copilotClient] 而不是 [shared]。** 那个客户端的读超时是 20 秒,
+     * 而这一条请求在服务端要打三次模型。20 秒超时的表现不是"慢",
+     * 是**用户每次都拿到失败,而服务端那三次调用照样花了钱**。
+     */
+    fun copilotAnalyze(body: CopilotAnalyzeBody): CopilotAnalyzeResult = authed { token ->
+        val text = execute(
+            Request.Builder()
+                .url(enrollment.baseUrl.trimEnd('/') + PATH_COPILOT)
+                .header("Authorization", "Bearer $token")
+                .post(
+                    json.encodeToString(CopilotAnalyzeBody.serializer(), body)
+                        .toByteArray()
+                        .toRequestBody(JSON)
+                )
+                .build(),
+            using = copilotClient,
+        )
+        json.decodeFromString(CopilotAnalyzeResult.serializer(), text)
+    }
+
     // ---------- 内部 ----------
 
     /**
@@ -367,8 +395,8 @@ class LifeInApi(
                 .build()
         )
 
-    private fun execute(request: Request): String {
-        client.newCall(request).execute().use { response ->
+    private fun execute(request: Request, using: OkHttpClient = client): String {
+        using.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 // 401 的响应体是空的,这是服务端有意的(06 §6.11)——
@@ -400,6 +428,7 @@ class LifeInApi(
         const val PATH_STOP_COLLECT = "/app/collector/stop"
         const val PATH_COLLECTED = "/app/data/collected"
         const val PATH_CONSOLE_LINK = "/app/console/link"
+        const val PATH_COPILOT = "/app/copilot/analyze"
 
         private const val RENEW_MARGIN_MS = 5 * 60 * 1000L
 
@@ -414,6 +443,21 @@ class LifeInApi(
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
+            .build()
+
+        /**
+         * 副驾那一条请求专用。**读超时长得多,因为服务端要打三次模型。**
+         *
+         * 连接池和 [shared] 共用(OkHttp 的 `newBuilder` 会继承),所以这不是
+         * 第二套连接 —— 只是同一套连接上的另一组超时。
+         *
+         * 45 秒比架构 §8.7 说的"十秒算坏"宽得多,这是有意的:**那十秒是给用户
+         * 看的,不是给网络看的。** 悬浮窗要在几百毫秒内先出来说"在想了",
+         * 真正的等待由那个界面承担 —— 而在它后面把请求掐死只会换来
+         * "每次都失败,而且账单照记"。
+         */
+        val copilotClient: OkHttpClient = shared.newBuilder()
+            .readTimeout(45, TimeUnit.SECONDS)
             .build()
     }
 }

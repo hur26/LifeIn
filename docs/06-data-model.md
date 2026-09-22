@@ -1628,9 +1628,17 @@ POST /enroll/claim            ← 不带任何认证。它换的就是认证
     {"text": "我这就看,半小时内回你", "rank": 3, "share": 0.17}
   ],
   "context": {"facts_used": 3, "history_used": 12},
-  "degraded": null
+  "capture_note": "",
+  "degraded": null,
+  "dropped": 0
 }
 ```
+
+`capture_note` 把请求里那个值原样回来,好让悬浮窗在面板上说明这一屏是怎么读的。
+
+`dropped` 是被丢掉的坏消息条数。**给出来而不是静默丢** ——
+手机端适配器把 `side` 判反了的表现就是这个数一直不为零,
+而那是唯一能被发现的地方。
 
 **七条规则,都不是可选的:**
 
