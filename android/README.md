@@ -9,15 +9,23 @@
 
 ## 怎么编
 
-需要 JDK 17、Android SDK(compileSdk 见 `app/build.gradle.kts`)、Gradle 8.9。
-已经在 Windows 上真编过,`assembleDebug` 与 `testDebugUnitTest` 都过。
+需要 JDK 17、Android SDK(compileSdk 见 `app/build.gradle.kts`)。
+**Gradle 不用自己装** —— 用仓库里的 wrapper,它会去下对的那一版。
 
 ```bash
 export JAVA_HOME=<你的 JDK 17>
 export ANDROID_HOME=<你的 Android SDK>
 cd android
-"$GRADLE_HOME/bin/gradle" assembleDebug testDebugUnitTest
+./gradlew assembleDebug testDebugUnitTest
 ```
+
+**`gradlew`、`gradlew.bat` 和 `gradle/wrapper/gradle-wrapper.jar` 都在版本库里,
+这是有意的**(2026-09-22 补上,此前只有 `.properties`)。
+少了那个 jar,`./gradlew` 就是一个跑不起来的脚本,而克隆下来的人要先猜
+"该装哪一版 Gradle" —— 而那个版本号本来就写在
+`gradle/wrapper/gradle-wrapper.properties` 里,只是没人执行得了它。
+**版本钉死这件事和 `build.gradle.kts` 里那句"版本都钉死在这里"是同一条**:
+出问题时第一件要能回答的事是"当初编的是哪几个版本"。
 
 **这份文档里不写具体路径。** 这个项目在不止一台机器上开发,而写死的路径
 在别的机器上不是"改一下就好" —— 它会让人以为那是要求,然后去建一个同名目录。
@@ -29,10 +37,15 @@ cd android
 
 产物在 `app/build/outputs/apk/debug/app-debug.apk`。
 
-**单元测试只有纯逻辑那几个**(签名、白名单、验证码),不需要模拟器。
+**单元测试只有纯逻辑那几个**(签名、白名单、验证码、小票、副驾那几块),
+不需要模拟器。
 其中签名那一组是**跨端黄金向量**:同一组值服务端 `tests/test_api_auth.py`
 也测一遍 —— 两边算得不一样的表现是所有请求 401 且服务端不说原因,
 这是唯一能不联网就发现它的办法。
+
+副驾那一组里有一条不是在测逻辑,是在**盯着一条不许被写出来的代码**:
+`CopilotNeverSendsTest` 扫源码,确认副驾包里只有 `CopilotFill.kt` 能对节点
+做动作,而且只能对输入框做。理由见 01 §8 —— 发送键永远是人按的。
 
 ## 装好之后的三步
 
